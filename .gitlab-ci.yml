@@ -7,6 +7,8 @@ pages:
       - .cache/pip
   script:
     - pip install --cache-dir .cache/pip mkdocs mkdocs-material mkdocs-jupyter
+    - mkdir -p docs/examples
+    - cp examples/*.ipynb docs/examples/
     - mkdocs build --site-dir public
   artifacts:
     paths:
