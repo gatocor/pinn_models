@@ -1,0 +1,46 @@
+site_name: PINNS Documentation
+site_description: Physics-Informed Neural Networks Library
+repo_url: https://github.com/your-repo/pinn_models
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - toc.integrate
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+
+nav:
+  - Home: index.md
+  - Getting Started: getting_started.md
+  - API Reference:
+    - Overview: api/index.md
+    - Domain: api/domain.md
+    - Networks: api/networks.md
+    - Problem: api/problem.md
+    - Trainer: api/trainer.md
+    - Functional: api/functional.md
+  - Examples:
+    - Overview: examples/index.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.arithmatex:
+      generic: true
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://polyfill.io/v3/polyfill.min.js?features=es6
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js

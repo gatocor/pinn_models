@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pinns"
+version = "0.1.0"
+description = "Physics-Informed Neural Networks (PINN) and Finite Basis PINN (FBPINN) library"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = ["pinn", "physics-informed", "neural-networks", "deep-learning", "pytorch", "pde"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.21.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+]
+examples = [
+    "matplotlib>=3.5.0",
+    "jupyter>=1.0.0",
+]
+all = [
+    "pinns[dev,examples]",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/pinns"
+Documentation = "https://github.com/yourusername/pinns#readme"
+Repository = "https://github.com/yourusername/pinns"
+Issues = "https://github.com/yourusername/pinns/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pinns*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --cov=pinns --cov-report=term-missing"
