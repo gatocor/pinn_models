@@ -2,11 +2,14 @@ image: python:3.10
 
 pages:
   stage: deploy
+  cache:
+    paths:
+      - .cache/pip
   script:
-    - pip install mkdocs mkdocs-material
+    - pip install --cache-dir .cache/pip mkdocs mkdocs-material
     - mkdocs build --site-dir public
   artifacts:
     paths:
       - public
   only:
-    - main  # or master
+    - main
