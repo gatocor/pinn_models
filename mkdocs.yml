@@ -25,9 +25,15 @@ nav:
     - Functional: api/functional.md
   - Examples:
     - Overview: examples/index.md
+    - Heat Equation: examples/heat_equation.ipynb
+    - 1D Oscillator: examples/1D_overdamped_oscillator.ipynb
+    - Laser Ablation: examples/1+1_laser_ablations.ipynb
 
 plugins:
   - search
+  - mkdocs-jupyter:
+      include_source: true
+      execute: false  # Don't re-execute notebooks
 
 markdown_extensions:
   - pymdownx.highlight:

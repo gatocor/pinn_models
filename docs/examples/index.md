@@ -4,21 +4,31 @@ This section contains example notebooks demonstrating how to use PINNS for vario
 
 ## Available Examples
 
-### Basic Examples
+| Example | Description | Notebook |
+|---------|-------------|----------|
+| Heat Equation | 1D heat diffusion with analytical solution | [heat_equation.ipynb](../../examples/heat_equation.ipynb) |
+| 1D Overdamped Oscillator | Simple ODE with PINN | [1D_overdamped_oscillator.ipynb](../../examples/1D_overdamped_oscillator.ipynb) |
+| 1+1D Laser Ablation | Multi-physics with symmetry, FBPINN, hard constraints | [1+1_laser_ablations.ipynb](../../examples/1+1_laser_ablations.ipynb) |
 
-| Example | Description |
-|---------|-------------|
-| [1D Overdamped Oscillator (PINN)](pinn_oscillator.md) | Simple ODE with PINN |
-| [1D Overdamped Oscillator (FBPINN)](fbpinn_oscillator.md) | Same problem with FBPINN |
-| [Heat Equation](heat_equation.md) | 1D heat diffusion |
+---
 
-### Advanced Examples
+## Viewing Notebooks
 
-| Example | Description |
-|---------|-------------|
-| [Laser Ablation](laser_ablation.md) | 1+1D multi-physics with symmetry |
-| [Hard Constraints](hard_constraints.md) | Encoding BCs in the network |
-| [Custom Sampling](custom_sampling.md) | Non-uniform domain sampling |
+The example notebooks are located in the `examples/` directory of the repository:
+
+```
+examples/
+├── heat_equation.ipynb           # Basic PINN tutorial
+├── 1D_overdamped_oscillator.ipynb # Simple ODE example
+└── 1+1_laser_ablations.ipynb      # Advanced FBPINN example
+```
+
+To run them locally:
+
+```bash
+cd examples
+jupyter notebook
+```
 
 ---
 
@@ -183,6 +193,5 @@ U = u_pred.reshape(T_grid.shape)
 The example notebooks are located in the `examples/` directory:
 
 - `heat_equation.ipynb` - 1D heat diffusion with analytical comparison
-- `1D_overdamped_oscillator_pinn.ipynb` - Simple ODE with standard PINN
-- `1D_overdamped_oscillator_fbpinn.ipynb` - Same problem with FBPINN
+- `1D_overdamped_oscillator.ipynb` - Simple ODE with PINN
 - `1+1_laser_ablations.ipynb` - Advanced: multi-physics with symmetry and hard constraints

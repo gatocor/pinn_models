@@ -6,7 +6,7 @@ pages:
     paths:
       - .cache/pip
   script:
-    - pip install --cache-dir .cache/pip mkdocs mkdocs-material
+    - pip install --cache-dir .cache/pip mkdocs mkdocs-material mkdocs-jupyter
     - mkdocs build --site-dir public
   artifacts:
     paths:
