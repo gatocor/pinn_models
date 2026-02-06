@@ -26,36 +26,52 @@ pip install -e ".[all]"
 
 ## Quick Start
 
+Solve the 1D heat equation: $\frac{\partial u}{\partial t} = \alpha \frac{\partial^2 u}{\partial x^2}$
+
 ```python
+import pinns
 import numpy as np
-import torch
-from pinns.domain import DomainCubicPartition
-from pinns.networks import FNN, FBPINN
 
-# 1. Define the domain partition (bounds derived from grid_positions)
-partition = DomainCubicPartition(
-    grid_positions=[np.linspace(0, 1, 10), np.linspace(0, 1, 5)],
-    overlap=0.5  # 50% overlap between subdomains
+# 1. Define the domain
+domain = pinns.DomainCubic(xmin=[0, 0], xmax=[1, 1])
+
+# 2. Add boundary conditions
+domain.add_dirichlet((0, None), value=0.0, component=0, name="left")      # u(0,t) = 0
+domain.add_dirichlet((1, None), value=0.0, component=0, name="right")     # u(1,t) = 0
+domain.add_dirichlet((None, 0), value=lambda x: np.sin(np.pi * x[:, 0:1]), 
+                     component=0, name="initial")  # u(x,0) = sin(πx)
+
+# 3. Define the PDE residual
+def heat_equation(X, V, params):
+    alpha = params["fixed"]["alpha"]
+    u_t = pinns.derivative(V, X, component=0, order=(1,))     # ∂u/∂t
+    u_xx = pinns.derivative(V, X, component=0, order=(0, 0))  # ∂²u/∂x²
+    return u_t - alpha * u_xx
+
+# 4. Create the problem
+problem = pinns.Problem(
+    domain=domain,
+    pde_fn=heat_equation,
+    input_names=["x", "t"],
+    output_names=["u"],
+    params={"alpha": 0.01}
 )
 
-# 2. Add boundary conditions directly to the domain
-partition.add_dirichlet(boundary=(0, None), value=0.0, component=0, name="left_bc")
-partition.add_dirichlet(boundary=(1, None), value=1.0, component=0, name="right_bc")
-partition.add_neumann(boundary=(None, 0), value=0.0, component=0, name="bottom_flux")
+# 5. Create network and trainer
+network = pinns.FNN([2, 64, 64, 64, 1], activation="tanh")
+trainer = pinns.Trainer(problem, network)
 
-# 3. Create the FBPINN model
-network = FNN([2, 64, 64, 1], activation='tanh')
-model = FBPINN(
-    domain=partition,
-    networks=network
+# 6. Train
+trainer.compile(
+    train_samples={"pde": 5000, "left": 200, "right": 200, "initial": 500},
+    weights={"pde": 1.0, "left": 10.0, "right": 10.0, "initial": 50.0},
+    optimizer="adam",
+    learning_rate=1e-3,
+    epochs=10000,
+    print_each=500,
+    show_plots=True
 )
-
-# 4. Sample points
-x_interior = partition.sample_interior_torch(10000, mode='uniform')
-x_boundary = partition.sample_boundary_torch(1000, boundary_dim=0, boundary_side=0)
-
-# 5. Forward pass
-y = model(x_interior)
+trainer.train()
 ```
 
 ## Features
