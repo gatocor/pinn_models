@@ -33,7 +33,11 @@ plugins:
   - search
   - mkdocs-jupyter:
       include_source: true
-      execute: false  # Don't re-execute notebooks
+      execute: false
+      allow_errors: false
+      ignore_h1_titles: true
+      show_input: true
+      no_input: false
 
 markdown_extensions:
   - pymdownx.highlight:
@@ -48,5 +52,4 @@ markdown_extensions:
 
 extra_javascript:
   - javascripts/mathjax.js
-  - https://polyfill.io/v3/polyfill.min.js?features=es6
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
