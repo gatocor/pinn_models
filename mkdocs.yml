@@ -1,5 +1,6 @@
 site_name: PINNS Documentation
 site_description: Physics-Informed Neural Networks Library
+site_url: https://grp-torres-sanchez.pages.embl.org/pinn_models/
 repo_url: https://github.com/your-repo/pinn_models
 
 theme:
