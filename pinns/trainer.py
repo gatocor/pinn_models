@@ -194,6 +194,7 @@ class Trainer:
         optimizer: str = None,
         learning_rate: float = None,
         epochs: int = 1000,
+        batch_size: int = None,
         print_each: int = 100,
         show_plots: bool = False,
         save_plots: str = None,
@@ -234,6 +235,19 @@ class Trainer:
             plot_n_points (int): Number of points per dimension for plots. For 2D problems,
                                 creates a grid of n x n points. Default 200.
             profile (bool): Print timing breakdown after training.
+            batch_size (int): Maximum mini-batch size for gradient accumulation. If None, 
+                             processes all samples in a single forward/backward pass. When set,
+                             the number of batches is determined by the largest sample count
+                             (PDE or any BC) divided by batch_size. All sample types (PDE and BCs)
+                             are then distributed evenly across these batches, ensuring no single
+                             batch exceeds batch_size for any sample type. This reduces peak GPU 
+                             memory usage by freeing computation graphs after each batch's backward
+                             pass. Gradients are accumulated across all batches before the optimizer
+                             step. Default: None (no mini-batching).
+                             
+                             Example: With batch_size=500, pde=1000, bc=5000:
+                               - n_batches = ceil(5000/500) = 10
+                               - PDE: 100 samples/batch, BC: 500 samples/batch
             
         Note:
             Interior sampling method and transform are configured on the DomainCubic class.
@@ -305,6 +319,7 @@ class Trainer:
         self._plot_regions = plot_regions if plot_regions is not None else []
         self._plot_n_points = plot_n_points
         self._profile = profile
+        self._batch_size = batch_size
         
         self._compiled = True
     
@@ -1536,19 +1551,108 @@ class Trainer:
                 self.optimizer.step(closure)
                 loss, losses = self._compute_total_loss(x_interior, x_bcs, internal)
             else:
-                # Adam, SGD - timed version
+                # Adam, SGD - with optional mini-batching
+                batch_size = self._batch_size
+                
                 t0 = time.perf_counter()
                 self.optimizer.zero_grad()
                 timings['zero_grad'] += time.perf_counter() - t0
                 
-                # Forward + loss computation (broken down)
-                t0 = time.perf_counter()
-                loss, losses = self._compute_total_loss_timed(timings, internal) if profile else self._compute_total_loss(internal=internal)
-                timings['forward'] += time.perf_counter() - t0 if not profile else 0
-                
-                t0 = time.perf_counter()
-                loss.backward()
-                timings['backward'] += time.perf_counter() - t0
+                if batch_size is None:
+                    # No mini-batching: process all samples at once (original behavior)
+                    t0 = time.perf_counter()
+                    loss, losses = self._compute_total_loss_timed(timings, internal) if profile else self._compute_total_loss(internal=internal)
+                    timings['forward'] += time.perf_counter() - t0 if not profile else 0
+                    
+                    t0 = time.perf_counter()
+                    loss.backward()
+                    timings['backward'] += time.perf_counter() - t0
+                else:
+                    # Mini-batch gradient accumulation
+                    # Sample all points once per epoch
+                    t0 = time.perf_counter()
+                    x_interior_full = self._sample_interior(self.train_samples[0]) if self.train_samples[0] > 0 else None
+                    x_bcs_full = []
+                    for i, bc in enumerate(self.problem.boundary_conditions):
+                        n_samples = self.train_samples[i + 1]
+                        if n_samples > 0:
+                            x_bcs_full.append(self._sample_boundary(bc, n_samples))
+                        else:
+                            x_bcs_full.append(None)
+                    timings['forward'] += time.perf_counter() - t0
+                    
+                    # Process PDE samples in batches
+                    # Determine number of batches based on the LARGEST sample count
+                    n_pde = self.train_samples[0]
+                    max_samples = n_pde
+                    for i, x_bc in enumerate(x_bcs_full):
+                        if x_bc is not None:
+                            max_samples = max(max_samples, x_bc.shape[0])
+                    
+                    n_batches = max(1, (max_samples + batch_size - 1) // batch_size)
+                    
+                    total_loss = 0.0
+                    accumulated_losses = None
+                    
+                    for batch_idx in range(n_batches):
+                        # Get batch of interior points (proportional to n_batches)
+                        if x_interior_full is not None and n_pde > 0:
+                            pde_batch_size = max(1, (n_pde + n_batches - 1) // n_batches)
+                            start_idx = batch_idx * pde_batch_size
+                            end_idx = min(start_idx + pde_batch_size, n_pde)
+                            x_interior_batch = x_interior_full[start_idx:end_idx]
+                        else:
+                            x_interior_batch = None
+                        
+                        # For BCs, distribute samples across n_batches
+                        x_bcs_batch = []
+                        for i, x_bc in enumerate(x_bcs_full):
+                            if x_bc is not None:
+                                n_bc = x_bc.shape[0]
+                                bc_batch_size = max(1, (n_bc + n_batches - 1) // n_batches)
+                                bc_start = batch_idx * bc_batch_size
+                                bc_end = min(bc_start + bc_batch_size, n_bc)
+                                if bc_start < n_bc:
+                                    x_bcs_batch.append(x_bc[bc_start:bc_end])
+                                else:
+                                    # This batch has no samples for this BC (already exhausted)
+                                    x_bcs_batch.append(x_bc[0:1])  # Use 1 sample to avoid empty tensor
+                            else:
+                                x_bcs_batch.append(None)
+                        
+                        t0 = time.perf_counter()
+                        batch_loss, batch_losses = self._compute_total_loss(x_interior_batch, x_bcs_batch, internal)
+                        # Scale loss by 1/n_batches for correct gradient accumulation
+                        batch_weight = 1.0 / n_batches
+                        scaled_loss = batch_loss * batch_weight
+                        timings['forward'] += time.perf_counter() - t0
+                        
+                        t0 = time.perf_counter()
+                        scaled_loss.backward()
+                        timings['backward'] += time.perf_counter() - t0
+                        
+                        # Accumulate for reporting
+                        total_loss += batch_loss.item() * batch_weight
+                        if accumulated_losses is None:
+                            accumulated_losses = {
+                                'pde': batch_losses['pde'].item() * batch_weight,
+                                'pde_individual': [l.item() * batch_weight for l in batch_losses.get('pde_individual', [batch_losses['pde']])],
+                                'bcs': [l.item() * batch_weight for l in batch_losses['bcs']]
+                            }
+                        else:
+                            accumulated_losses['pde'] += batch_losses['pde'].item() * batch_weight
+                            for j, l in enumerate(batch_losses.get('pde_individual', [batch_losses['pde']])):
+                                accumulated_losses['pde_individual'][j] += l.item() * batch_weight
+                            for j, l in enumerate(batch_losses['bcs']):
+                                accumulated_losses['bcs'][j] += l.item() * batch_weight
+                    
+                    # Convert accumulated losses to tensor format for compatibility
+                    loss = torch.tensor(total_loss, device=self.device)
+                    losses = {
+                        'pde': torch.tensor(accumulated_losses['pde'], device=self.device),
+                        'pde_individual': [torch.tensor(l, device=self.device) for l in accumulated_losses['pde_individual']],
+                        'bcs': [torch.tensor(l, device=self.device) for l in accumulated_losses['bcs']]
+                    }
                 
                 t0 = time.perf_counter()
                 self.optimizer.step()

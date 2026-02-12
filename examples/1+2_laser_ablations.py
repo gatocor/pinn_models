@@ -23,8 +23,8 @@ lam   = 1.0
 gamma = 1.0
 
 t_max = 0.1
-x_border = 1.0
-y_border = 1.0
+x_border = 10.0
+y_border = 10.0
 
 cut_border_x = 0.10
 cut_border_y = 0.04
@@ -220,6 +220,7 @@ trainer.compile(
     optimizer="adam",
     learning_rate=1e-5,
     epochs=50000,
+    batch_size=3000,  # Mini-batch to reduce GPU memory usage
     print_each=500,
     show_plots=True,
     show_subdomains=False,
