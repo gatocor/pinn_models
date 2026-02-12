@@ -223,15 +223,40 @@ class Trainer:
             epochs (int): Number of training epochs for next train() call.
             print_each (int): Print progress every N epochs.
             show_plots (bool): Whether to display plots.
-            save_plots (str): Base path to save plots.
+            save_plots (str): Path for saving plots. Behavior depends on value:
+                - None (default): In notebooks, displays inline. In scripts with show_plots=True,
+                  auto-saves to './pinn_progress_X.png' where X is auto-incremented to avoid
+                  overwriting previous runs (updated each print_each epochs).
+                - String path (e.g., './results'): Saves epoch-suffixed files like
+                  'results_epoch00500.png' for training history.
             show_subdomains (bool or dict): For FBPINN, show subdomain predictions.
                 Can be bool (applies to all) or dict with keys 'solution', 'residuals', 'zoom'.
             show_sampling_points (bool or dict): Show training/test sampling points on plots.
                 Can be bool (applies to all) or dict with keys 'solution', 'residuals', 'zoom'.
-            plot_regions (list): List of zoom regions to show additional plots.
-                                Each region is a tuple of ((xmin, xmax), (ymin, ymax)) for 2D,
-                                or (xmin, xmax) for 1D. Use None to use full domain range.
-                                Example: [((-.1, .1), None)] zooms x to [-0.1, 0.1], full t range.
+            plot_regions (list): List of regions to show as additional plots.
+                                Each region is an N-element tuple (one per input dimension).
+                                Each element can be:
+                                  - None: use full domain range (free dimension for plotting)
+                                  - (min, max): specific range (free dimension, zoomed)
+                                  - scalar: fix dimension at this value (slice)
+                                The resulting plot is 1D or 2D based on the number of free dimensions.
+                                
+                                Examples for 1D problem:
+                                  [(0.0, 0.5)] - zoom to x in [0, 0.5]
+                                
+                                Examples for 2D problem:
+                                  [((-.1, .1), None)] - zoom x to [-.1, .1], full y range
+                                  
+                                Examples for 3D problem (x, y, t):
+                                  [(None, None, 0.05)] - x-y plane at t=0.05
+                                  [(0.0, None, None)] - y-t plane at x=0.0
+                                  [((-0.5, 0.5), None, 0.1)] - zoomed x, full y, at t=0.1
+                                
+                                Examples for 4D+ problems:
+                                  [(None, None, 0.5, 0.0)] - 2D slice fixing dims 2 and 3
+                                  [(None, 0.0, 0.0, 0.0)] - 1D slice fixing dims 1, 2, 3
+                                
+                                For N>=3D, if no plot_regions specified, only loss curves are shown.
             plot_n_points (int): Number of points per dimension for plots. For 2D problems,
                                 creates a grid of n x n points. Default 200.
             profile (bool): Print timing breakdown after training.
@@ -989,6 +1014,147 @@ class Trainer:
             # Restore zoom x-limits after plotting (sampling points are from full domain)
             ax.set_xlim(xmin, xmax)
     
+    def _parse_region_nd(self, region):
+        """Parse an N-dimensional region specification.
+        
+        Args:
+            region: Tuple with one element per dimension. Each element can be:
+                - None: use full range for this dimension (free dimension)
+                - (min, max): range for this dimension (free dimension, zoomed)
+                - scalar: fix this dimension at that value (sliced dimension)
+                
+        Returns:
+            tuple: (free_dims, free_ranges, fixed_dims, fixed_values)
+                - free_dims: list of dimension indices that are free
+                - free_ranges: list of (min, max) tuples for free dimensions
+                - fixed_dims: list of dimension indices that are fixed
+                - fixed_values: list of scalar values for fixed dimensions
+        """
+        n_dims = self.problem.n_dims
+        
+        # Default: all dimensions free with full range
+        if region is None:
+            region = [None] * n_dims
+        
+        free_dims = []
+        free_ranges = []
+        fixed_dims = []
+        fixed_values = []
+        
+        for i, spec in enumerate(region):
+            if spec is None:
+                # Full range for this dimension
+                free_dims.append(i)
+                free_ranges.append((self.problem.xmin[i], self.problem.xmax[i]))
+            elif isinstance(spec, (list, tuple)) and len(spec) == 2:
+                # Range specified
+                free_dims.append(i)
+                free_ranges.append((spec[0], spec[1]))
+            else:
+                # Scalar value - fixed dimension
+                fixed_dims.append(i)
+                fixed_values.append(float(spec))
+        
+        return free_dims, free_ranges, fixed_dims, fixed_values
+    
+    def _plot_region_nd(self, ax, output_idx, region, n_points=50):
+        """Plot a region of an N-dimensional solution as 1D or 2D.
+        
+        Args:
+            ax: Matplotlib axes
+            output_idx: Which output to plot
+            region: N-element tuple specifying the region (see _parse_region_nd)
+            n_points: Number of points per free dimension
+        """
+        free_dims, free_ranges, fixed_dims, fixed_values = self._parse_region_nd(region)
+        n_free = len(free_dims)
+        
+        if n_free == 0:
+            # No free dimensions - just show the single point value
+            x_point = np.zeros((1, self.problem.n_dims))
+            for i, val in zip(fixed_dims, fixed_values):
+                x_point[0, i] = val
+            y = self.predict(x_point)
+            ax.text(0.5, 0.5, f'u={y[0, output_idx]:.4f}',
+                   ha='center', va='center', transform=ax.transAxes, fontsize=14)
+            ax.set_title(self._get_output_name(output_idx))
+            return
+        
+        elif n_free == 1:
+            # 1D plot
+            dim = free_dims[0]
+            x_range = free_ranges[0]
+            x_vals = np.linspace(x_range[0], x_range[1], n_points)
+            
+            # Build full input array
+            x_full = np.zeros((n_points, self.problem.n_dims))
+            x_full[:, dim] = x_vals
+            for i, val in zip(fixed_dims, fixed_values):
+                x_full[:, i] = val
+            
+            y = self.predict(x_full)
+            
+            ax.plot(x_vals, y[:, output_idx], linewidth=2)
+            ax.set_xlabel(self._get_input_name(dim))
+            ax.set_ylabel(self._get_output_name(output_idx))
+            
+            # Build title showing fixed dimensions
+            title_parts = [self._get_output_name(output_idx)]
+            if fixed_dims:
+                fixed_str = ', '.join([f'{self._get_input_name(d)}={v:.3g}' 
+                                       for d, v in zip(fixed_dims, fixed_values)])
+                title_parts.append(f'at {fixed_str}')
+            ax.set_title(' '.join(title_parts))
+            ax.grid(True, alpha=0.3)
+            
+        elif n_free == 2:
+            # 2D plot
+            dim0, dim1 = free_dims[0], free_dims[1]
+            x0_range, x1_range = free_ranges[0], free_ranges[1]
+            
+            x0 = np.linspace(x0_range[0], x0_range[1], n_points)
+            x1 = np.linspace(x1_range[0], x1_range[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            
+            # Build full input array
+            n_total = X0.size
+            x_full = np.zeros((n_total, self.problem.n_dims))
+            x_full[:, dim0] = X0.ravel()
+            x_full[:, dim1] = X1.ravel()
+            for i, val in zip(fixed_dims, fixed_values):
+                x_full[:, i] = val
+            
+            y = self.predict(x_full)
+            Y = y[:, output_idx].reshape(X0.shape)
+            
+            # Plot as heatmap
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            cmap = self._get_colormap(output_idx)
+            im = ax.imshow(Y, extent=extent, origin='lower', aspect='auto', cmap=cmap)
+            cbar = plt.colorbar(im, ax=ax)
+            self._colorbars.append(cbar)
+            
+            ax.set_xlabel(self._get_input_name(dim0))
+            ax.set_ylabel(self._get_input_name(dim1))
+            
+            # Build title showing fixed dimensions
+            output_name = self._get_output_name(output_idx)
+            if fixed_dims:
+                fixed_str = ', '.join([f'{self._get_input_name(d)}={v:.3g}' 
+                                       for d, v in zip(fixed_dims, fixed_values)])
+                ax.set_title(f'{output_name} at {fixed_str}')
+            else:
+                ax.set_title(output_name)
+        else:
+            # More than 2 free dimensions - cannot visualize
+            ax.text(0.5, 0.5, f'Cannot plot {n_free}D (max 2D)',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(self._get_output_name(output_idx))
+    
+    def _plot_solution_3d_slice(self, ax, output_idx, region, n_points=50):
+        """Plot 2D slice of 3D solution (legacy wrapper for _plot_region_nd)."""
+        self._plot_region_nd(ax, output_idx, region, n_points)
+    
     def _plot_solution_2d_region(self, ax, output_idx, region, n_points=50):
         """Plot 2D solution in a zoomed region."""
         # Parse region: ((x0min, x0max), (x1min, x1max)) for 2D
@@ -1180,6 +1346,113 @@ class Trainer:
         ax.set_xlabel(self._get_input_name(0))
         ax.set_ylabel(self._get_input_name(1))
     
+    def _plot_residuals_nd(self, ax, output_idx, region, n_points=50):
+        """Plot PDE residuals on a 1D or 2D slice of an N-dimensional problem.
+        
+        Args:
+            ax: Matplotlib axes
+            output_idx: Which PDE equation residual to plot
+            region: N-element tuple specifying the region (see _parse_region_nd)
+            n_points: Number of points per free dimension
+        """
+        free_dims, free_ranges, fixed_dims, fixed_values = self._parse_region_nd(region)
+        n_free = len(free_dims)
+        
+        if n_free == 0:
+            ax.text(0.5, 0.5, 'No free dimensions',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'Residual {output_idx}')
+            return
+        
+        elif n_free == 1:
+            # 1D residual plot
+            dim = free_dims[0]
+            x_range = free_ranges[0]
+            x_vals = np.linspace(x_range[0], x_range[1], n_points)
+            
+            # Build full input array
+            x_full = np.zeros((n_points, self.problem.n_dims))
+            x_full[:, dim] = x_vals
+            for i, val in zip(fixed_dims, fixed_values):
+                x_full[:, i] = val
+            
+            # Use batched residual computation
+            residual = self.compute_residuals(x_full)
+            
+            if isinstance(residual, list):
+                if output_idx < len(residual):
+                    res = residual[output_idx]
+                else:
+                    res = np.zeros(n_points)
+            else:
+                res = residual
+            
+            ax.plot(x_vals, np.abs(res), 'm-', linewidth=2)
+            ax.set_xlabel(self._get_input_name(dim))
+            ax.set_ylabel(f'|Residual|')
+            
+            # Build title showing fixed dimensions
+            output_name = self._get_output_name(output_idx)
+            if fixed_dims:
+                fixed_str = ', '.join([f'{self._get_input_name(d)}={v:.3g}' 
+                                       for d, v in zip(fixed_dims, fixed_values)])
+                ax.set_title(f'Residual {output_name} at {fixed_str}')
+            else:
+                ax.set_title(f'Residual ({output_name})')
+            ax.grid(True, alpha=0.3)
+            
+        elif n_free == 2:
+            # 2D residual plot
+            dim0, dim1 = free_dims[0], free_dims[1]
+            x0_range, x1_range = free_ranges[0], free_ranges[1]
+            
+            x0 = np.linspace(x0_range[0], x0_range[1], n_points)
+            x1 = np.linspace(x1_range[0], x1_range[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            
+            # Build full input array
+            n_total = X0.size
+            x_full = np.zeros((n_total, self.problem.n_dims))
+            x_full[:, dim0] = X0.ravel()
+            x_full[:, dim1] = X1.ravel()
+            for i, val in zip(fixed_dims, fixed_values):
+                x_full[:, i] = val
+            
+            # Use batched residual computation
+            residual = self.compute_residuals(x_full)
+            
+            if isinstance(residual, list):
+                if output_idx < len(residual):
+                    res = residual[output_idx]
+                else:
+                    res = np.zeros(n_total)
+            else:
+                res = residual
+            
+            Res = np.abs(res).reshape(X0.shape)
+            
+            # Plot as heatmap
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            im = ax.imshow(Res, extent=extent, origin='lower', aspect='auto', cmap='viridis')
+            cbar = plt.colorbar(im, ax=ax, label='|Residual|')
+            self._colorbars.append(cbar)
+            
+            ax.set_xlabel(self._get_input_name(dim0))
+            ax.set_ylabel(self._get_input_name(dim1))
+            
+            # Build title showing fixed dimensions
+            output_name = self._get_output_name(output_idx)
+            if fixed_dims:
+                fixed_str = ', '.join([f'{self._get_input_name(d)}={v:.3g}' 
+                                       for d, v in zip(fixed_dims, fixed_values)])
+                ax.set_title(f'Residual {output_name} at {fixed_str}')
+            else:
+                ax.set_title(f'Residual ({output_name})')
+        else:
+            ax.text(0.5, 0.5, f'Cannot plot {n_free}D (max 2D)',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'Residual {output_idx}')
+    
     def _get_plottable_bcs(self):
         """Get list of Dirichlet and Neumann BCs that can be plotted."""
         plottable_bcs = []
@@ -1295,11 +1568,23 @@ class Trainer:
         # Layout: 1 row for losses spanning all columns, 
         # then for each output: [true solution], predicted solution, residuals, [error], [zoom regions]
         # For 2D: one row per BC with 2 columns (value + error)
+        # For N>=3D without plot_regions: only show losses
         has_solution = self.problem.solution is not None
         n_zoom_regions = len(getattr(self, '_plot_regions', []))
         plottable_bcs = self._get_plottable_bcs() if n_dims == 2 else []
         
-        if has_solution:
+        # Special case: N>=3D without plot_regions - only show loss curve
+        if n_dims >= 3 and n_zoom_regions == 0:
+            fig = plt.figure(figsize=(10, 4))
+            axes = {}
+            axes['losses'] = fig.add_subplot(1, 1, 1)
+            self._colorbars = []
+            return fig, axes
+        
+        # For N>=3D with slices: each region gets 2 columns (solution + residuals)
+        if n_dims >= 3:
+            n_sol_cols = 2 * n_zoom_regions  # solution + residuals for each region
+        elif has_solution:
             if n_dims >= 2:
                 n_sol_cols = 4 + n_zoom_regions  # true, predicted, residuals, error, + zoom regions
             else:
@@ -1332,20 +1617,29 @@ class Trainer:
         # Solution, residuals, and error for each output
         for i in range(n_outputs):
             col_idx = 0
-            if has_solution and n_dims >= 2:
-                axes[f'true_{i}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
+            if n_dims >= 3:
+                # For N>=3D: each region gets solution + residuals columns
+                for r in range(n_zoom_regions):
+                    axes[f'region_sol_{i}_{r}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
+                    col_idx += sol_span
+                    axes[f'region_res_{i}_{r}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
+                    col_idx += sol_span
+            else:
+                # For 1D/2D: standard layout
+                if has_solution and n_dims >= 2:
+                    axes[f'true_{i}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
+                    col_idx += sol_span
+                axes[f'sol_{i}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
                 col_idx += sol_span
-            axes[f'sol_{i}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
-            col_idx += sol_span
-            axes[f'res_{i}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
-            col_idx += sol_span
-            if has_solution:
-                axes[f'err_{i}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
+                axes[f'res_{i}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
                 col_idx += sol_span
-            # Add zoom region axes
-            for r in range(n_zoom_regions):
-                axes[f'zoom_{i}_{r}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
-                col_idx += sol_span
+                if has_solution:
+                    axes[f'err_{i}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
+                    col_idx += sol_span
+                # Add zoom region axes
+                for r in range(n_zoom_regions):
+                    axes[f'zoom_{i}_{r}'] = fig.add_subplot(gs[1 + i, col_idx:col_idx + sol_span])
+                    col_idx += sol_span
         
         # Add BC plot axes: one row per BC, each spanning bc_span columns
         for bc_row_idx, (i, bc) in enumerate(plottable_bcs):
@@ -1388,38 +1682,55 @@ class Trainer:
         
         # Plot solutions, residuals, and errors
         self.network.eval()
+        
+        # Special case: N>=3 without plot_regions - only losses are shown
+        if n_dims >= 3 and not plot_regions:
+            fig.tight_layout()
+            return
+        
         for i in range(n_outputs):
-            sol_ax = axes[f'sol_{i}']
-            res_ax = axes[f'res_{i}']
-            err_ax = axes.get(f'err_{i}', None)
-            true_ax = axes.get(f'true_{i}', None)
-            
-            if n_dims == 1:
-                self._plot_solution_1d(sol_ax, i, n_points=n_points)
-                self._plot_residuals_1d(res_ax, i, n_points=n_points)
-                if err_ax is not None:
-                    self._plot_error_1d(err_ax, i, n_points=n_points)
-                # Plot zoom regions
+            if n_dims >= 3:
+                # For N>=3D: each region has its own solution + residuals columns
                 for r, region in enumerate(plot_regions):
-                    zoom_ax = axes.get(f'zoom_{i}_{r}', None)
-                    if zoom_ax is not None:
-                        self._plot_solution_1d_region(zoom_ax, i, region, n_points=n_points)
-            elif n_dims == 2:
-                if true_ax is not None:
-                    self._plot_true_solution_2d(true_ax, i, n_points=n_points)
-                self._plot_solution_2d(sol_ax, i, n_points=n_points)
-                self._plot_residuals_2d(res_ax, i, n_points=n_points)
-                if err_ax is not None:
-                    self._plot_error_2d(err_ax, i, n_points=n_points)
-                # Plot zoom regions
-                for r, region in enumerate(plot_regions):
-                    zoom_ax = axes.get(f'zoom_{i}_{r}', None)
-                    if zoom_ax is not None:
-                        self._plot_solution_2d_region(zoom_ax, i, region, n_points=n_points)
+                    sol_ax = axes.get(f'region_sol_{i}_{r}', None)
+                    res_ax = axes.get(f'region_res_{i}_{r}', None)
+                    if sol_ax is not None:
+                        self._plot_region_nd(sol_ax, i, region, n_points=n_points)
+                    if res_ax is not None:
+                        self._plot_residuals_nd(res_ax, i, region, n_points=n_points)
             else:
-                sol_ax.text(0.5, 0.5, f'Cannot plot {n_dims}D solution',
-                           ha='center', va='center', transform=sol_ax.transAxes)
-                sol_ax.set_title(f'Output {i}')
+                # For 1D/2D: standard layout
+                sol_ax = axes.get(f'sol_{i}', None)
+                res_ax = axes.get(f'res_{i}', None)
+                err_ax = axes.get(f'err_{i}', None)
+                true_ax = axes.get(f'true_{i}', None)
+                
+                # Skip if axes don't exist
+                if sol_ax is None:
+                    continue
+                
+                if n_dims == 1:
+                    self._plot_solution_1d(sol_ax, i, n_points=n_points)
+                    self._plot_residuals_1d(res_ax, i, n_points=n_points)
+                    if err_ax is not None:
+                        self._plot_error_1d(err_ax, i, n_points=n_points)
+                    # Plot zoom regions
+                    for r, region in enumerate(plot_regions):
+                        zoom_ax = axes.get(f'zoom_{i}_{r}', None)
+                        if zoom_ax is not None:
+                            self._plot_solution_1d_region(zoom_ax, i, region, n_points=n_points)
+                elif n_dims == 2:
+                    if true_ax is not None:
+                        self._plot_true_solution_2d(true_ax, i, n_points=n_points)
+                    self._plot_solution_2d(sol_ax, i, n_points=n_points)
+                    self._plot_residuals_2d(res_ax, i, n_points=n_points)
+                    if err_ax is not None:
+                        self._plot_error_2d(err_ax, i, n_points=n_points)
+                    # Plot zoom regions
+                    for r, region in enumerate(plot_regions):
+                        zoom_ax = axes.get(f'zoom_{i}_{r}', None)
+                        if zoom_ax is not None:
+                            self._plot_solution_2d_region(zoom_ax, i, region, n_points=n_points)
         
         # Plot boundary conditions for 2D problems
         if n_dims == 2:
@@ -1519,6 +1830,28 @@ class Trainer:
                 self._fig, self._axes = self._create_figure()
         
         start_epoch = self._global_epoch
+        
+        # Determine auto-save filename for script mode (find next available pinn_progress_X.png)
+        auto_save_path = None
+        if show_plots and not save_plots and not _is_notebook():
+            import glob
+            import os
+            existing = glob.glob('./pinn_progress_*.png')
+            if existing:
+                # Extract numbers from filenames like pinn_progress_0.png
+                nums = []
+                for f in existing:
+                    base = os.path.basename(f)
+                    # Handle both pinn_progress_X.png and pinn_progress_X_epochYYYYY.png
+                    parts = base.replace('pinn_progress_', '').replace('.png', '').split('_')
+                    try:
+                        nums.append(int(parts[0]))
+                    except ValueError:
+                        pass
+                next_num = max(nums) + 1 if nums else 0
+            else:
+                next_num = 0
+            auto_save_path = f'./pinn_progress_{next_num}.png'
         
         # For LBFGS: sample points ONCE before the loop and keep them fixed
         if self.optimizer_name == "lbfgs":
@@ -1698,7 +2031,15 @@ class Trainer:
                 # Generate plots
                 t0 = time.perf_counter()
                 if show_plots or save_plots:
-                    plot_path = f"{save_plots}_epoch{epoch:05d}.png" if save_plots else None
+                    if save_plots:
+                        # User-specified path: create epoch-suffixed files for history
+                        plot_path = f"{save_plots}_epoch{epoch:05d}.png"
+                    elif auto_save_path:
+                        # Script mode with show_plots: auto-save to single updating file
+                        plot_path = auto_save_path
+                    else:
+                        # Notebook mode: display inline (no save)
+                        plot_path = None
                     _, _, self._display_handle = self.plot_progress(
                         save_path=plot_path, n_points=self._plot_n_points,
                         fig=self._fig, axes=self._axes, 
@@ -1766,22 +2107,116 @@ class Trainer:
         
         return total, losses
     
-    def predict(self, x: np.ndarray) -> np.ndarray:
+    def predict(self, x: np.ndarray, batch_size: int = None) -> np.ndarray:
         """
         Make predictions with the trained network.
         
         Args:
             x: Input points of shape (n_points, n_dims).
+            batch_size: If provided, process in batches to reduce memory usage.
             
         Returns:
             Predictions of shape (n_points, n_outputs).
         """
         self.network.eval()
+        
+        if batch_size is None:
+            batch_size = getattr(self, '_batch_size', None)
+        
         with torch.no_grad():
-            x_tensor = torch.tensor(x, device=self.device, dtype=self.dtype)
-            params = self._build_params()
-            y = self.network(x_tensor, params)
-            return y.cpu().numpy()
+            if batch_size is None or batch_size >= len(x):
+                # Process all at once
+                x_tensor = torch.tensor(x, device=self.device, dtype=self.dtype)
+                params = self._build_params()
+                y = self.network(x_tensor, params)
+                result = y.cpu().numpy()
+                del x_tensor, y
+                if self.device == 'cuda':
+                    torch.cuda.empty_cache()
+                return result
+            else:
+                # Process in batches
+                n_points = len(x)
+                results = []
+                params = self._build_params()
+                for start in range(0, n_points, batch_size):
+                    end = min(start + batch_size, n_points)
+                    x_batch = torch.tensor(x[start:end], device=self.device, dtype=self.dtype)
+                    y_batch = self.network(x_batch, params)
+                    results.append(y_batch.cpu().numpy())
+                    del x_batch, y_batch
+                if self.device == 'cuda':
+                    torch.cuda.empty_cache()
+                return np.vstack(results)
+    
+    def compute_residuals(self, x: np.ndarray, batch_size: int = None) -> np.ndarray:
+        """
+        Compute PDE residuals at given points.
+        
+        Args:
+            x: Input points of shape (n_points, n_dims).
+            batch_size: If provided, process in batches to reduce memory usage.
+            
+        Returns:
+            Residuals as numpy array. Shape depends on PDE (single or list of residuals).
+        """
+        import torch
+        
+        self.network.eval()
+        
+        if batch_size is None:
+            batch_size = getattr(self, '_batch_size', None)
+        
+        n_points = len(x)
+        params = self._build_params()
+        
+        if batch_size is None or batch_size >= n_points:
+            # Process all at once
+            x_tensor = torch.tensor(x, device=self.device, dtype=self.dtype, requires_grad=True)
+            y_tensor = self.network(x_tensor, params)
+            residual = self.problem.pde_fn(x_tensor, y_tensor, params)
+            
+            if isinstance(residual, (list, tuple)):
+                result = [r.detach().cpu().numpy().flatten() for r in residual]
+            else:
+                result = residual.detach().cpu().numpy().flatten()
+            
+            # Clean up
+            del x_tensor, y_tensor, residual
+            if self.device == 'cuda':
+                torch.cuda.empty_cache()
+            return result
+        else:
+            # Process in batches
+            all_residuals = None
+            for start in range(0, n_points, batch_size):
+                end = min(start + batch_size, n_points)
+                x_batch = torch.tensor(x[start:end], device=self.device, dtype=self.dtype, requires_grad=True)
+                y_batch = self.network(x_batch, params)
+                residual = self.problem.pde_fn(x_batch, y_batch, params)
+                
+                if isinstance(residual, (list, tuple)):
+                    batch_res = [r.detach().cpu().numpy().flatten() for r in residual]
+                    if all_residuals is None:
+                        all_residuals = [[] for _ in batch_res]
+                    for i, r in enumerate(batch_res):
+                        all_residuals[i].append(r)
+                else:
+                    batch_res = residual.detach().cpu().numpy().flatten()
+                    if all_residuals is None:
+                        all_residuals = []
+                    all_residuals.append(batch_res)
+                
+                # Clean up each batch to free GPU memory
+                del x_batch, y_batch, residual
+                if self.device == 'cuda':
+                    torch.cuda.empty_cache()
+            
+            if isinstance(all_residuals[0], list):
+                # List of residuals
+                return [np.concatenate(r) for r in all_residuals]
+            else:
+                return np.concatenate(all_residuals)
     
     def get_history(self) -> Dict:
         """Get training history."""

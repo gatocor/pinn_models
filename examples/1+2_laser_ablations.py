@@ -28,7 +28,7 @@ y_border = 10.0
 
 cut_border_x = 0.10
 cut_border_y = 0.04
-sigma_border = 0.005
+cut_border_sigma = 0.005
 
 w = 0.2
 sigma_cut_sampling = 0.2
@@ -46,16 +46,12 @@ def sampler(X, params):
     n = int(np.round(X.shape[0] * w))
 
     x1 = sp.uniform.ppf(X[:n, 0:1], loc=-x_border, scale=2 * x_border)
-    u_x = np.clip(X[n:, 0:1], 1e-6, 1.0 - 1e-6)
-    x2 = sp.norm.ppf(u_x, scale=sigma_cut_sampling)
+    x2 = sp.norm.ppf(X[n:, 0:1], scale=sigma_cut_sampling)
     x = np.vstack((x1, x2))
-    x = np.clip(x, -x_border, x_border)
 
     y1 = sp.uniform.ppf(X[:n, 1:2], loc=-y_border, scale=2 * y_border)
-    u_y = np.clip(X[n:, 1:2], 1e-6, 1.0 - 1e-6)
-    y2 = sp.norm.ppf(u_y, scale=sigma_cut_sampling)
+    y2 = sp.norm.ppf(X[n:, 1:2], scale=sigma_cut_sampling)
     y = np.vstack((y1, y2))
-    y = np.clip(y, -y_border, y_border)
 
     t = t_max * X[:, 2:3]
 
@@ -134,7 +130,9 @@ problem = pinns.Problem(
         "w": w,
         "x_border": x_border,
         "y_border": y_border,
-        "sigma_border": sigma_border,
+        "cut_border_x": cut_border_x,
+        "cut_border_y": cut_border_y,
+        "cut_border_sigma": cut_border_sigma,
         "sigma_cut_sampling": sigma_cut_sampling,
         "t_max": t_max,
     },
@@ -151,9 +149,9 @@ def input_transform(X: torch.Tensor, params: dict):
 def output_transform(X_in: torch.Tensor, Y: torch.Tensor, params: dict):
 
     p = params["fixed"]
-    x_border = p["x_border"]
-    y_border = p["y_border"]
-    sigma = p["sigma_border"]
+    x_border = p["cut_border_x"]
+    y_border = p["cut_border_y"]
+    sigma = p["cut_border_sigma"]
 
     x = X_in[:, 0:1]
     y = X_in[:, 1:2]
@@ -163,13 +161,15 @@ def output_transform(X_in: torch.Tensor, Y: torch.Tensor, params: dict):
     vx_hat = Y[:, 1:2]
     vy_hat = Y[:, 2:3]
 
-    s1 = torch.sigmoid((x + x_border) / sigma)  # left edge
-    s2 = torch.sigmoid((x_border - x) / sigma)  # right edge
-    f_x = 1 - s1 * s2
-    s1 = torch.sigmoid((y + y_border) / sigma)  # left edge
-    s2 = torch.sigmoid((y_border - y) / sigma)  # right edge
-    f_y = 1 - s1 * s2
-    f_cut = f_x * f_y
+    s1_x = torch.sigmoid((x + x_border) / sigma)  # left edge
+    s2_x = torch.sigmoid((x_border - x) / sigma)  # right edge
+    inside_x = s1_x * s2_x
+    
+    s1_y = torch.sigmoid((y + y_border) / sigma)  # bottom edge
+    s2_y = torch.sigmoid((y_border - y) / sigma)  # top edge
+    inside_y = s1_y * s2_y
+    
+    f_cut = 1 - inside_x * inside_y
 
     h = f_cut + t * h_hat
 
@@ -203,7 +203,7 @@ trainer = pinns.Trainer(problem, network)
 
 trainer.compile(
     train_samples={
-        "pde": 10000,
+        "pde": 1000,
         "vx_xmin": 1000, "vx_xmax": 1000, "vx_ymin": 1000, "vx_ymax": 1000,
         "vy_xmin": 1000, "vy_xmax": 1000, "vy_ymin": 1000, "vy_ymax": 1000,
     },
@@ -221,12 +221,16 @@ trainer.compile(
     learning_rate=1e-5,
     epochs=50000,
     batch_size=3000,  # Mini-batch to reduce GPU memory usage
-    print_each=500,
+    print_each=100,
     show_plots=True,
     show_subdomains=False,
     show_sampling_points=False,
-    plot_regions=None,
-    plot_n_points=0,
+    # 3D slices: plot x-y plane at different t values
+    plot_regions=[
+        ((-1.0,1.0), (-1.0,1.0), 0.0),   # t=0.0 (initial)
+        (None, None, t_max),   # t=t_max (final)
+    ],
+    plot_n_points=100,
     profile=False,
 )
 
