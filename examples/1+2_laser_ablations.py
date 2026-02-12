@@ -106,16 +106,6 @@ def pde_ablation_2d(X: torch.Tensor, V: torch.Tensor, params: dict):
 
     return (r_h, r_vx, r_vy)
 
-domain.add_dirichlet((0, None, None), value=0.0, component=1, name="vx_xmin")
-domain.add_dirichlet((1, None, None), value=0.0, component=1, name="vx_xmax")
-domain.add_dirichlet((None, 0, None), value=0.0, component=1, name="vx_ymin")
-domain.add_dirichlet((None, 1, None), value=0.0, component=1, name="vx_ymax")
-
-domain.add_dirichlet((0, None, None), value=0.0, component=2, name="vy_xmin")
-domain.add_dirichlet((1, None, None), value=0.0, component=2, name="vy_xmax")
-domain.add_dirichlet((None, 0, None), value=0.0, component=2, name="vy_ymin")
-domain.add_dirichlet((None, 1, None), value=0.0, component=2, name="vy_ymax")
-
 problem = pinns.Problem(
     domain=domain,
     pde_fn=pde_ablation_2d,
@@ -177,8 +167,11 @@ def output_transform(X_in: torch.Tensor, Y: torch.Tensor, params: dict):
     s_y = torch.sign(y)
     sym_x = s_x * torch.tanh(x) ** 2
     sym_y = s_y * torch.tanh(y) ** 2
-    vx = t * sym_x * vx_hat
-    vy = t * sym_y * vy_hat
+    # This just if you really want to force the velocity to be zero at t=0, I prefer to just let the network learn that by itself.
+    # vx = t * sym_x * vx_hat
+    # vy = t * sym_y * vy_hat
+    vx = sym_x * vx_hat
+    vy = sym_y * vy_hat
 
     return torch.hstack((h, vx, vy))
 
@@ -203,19 +196,13 @@ trainer = pinns.Trainer(problem, network)
 
 trainer.compile(
     train_samples={
-        "pde": 1000,
-        "vx_xmin": 1000, "vx_xmax": 1000, "vx_ymin": 1000, "vx_ymax": 1000,
-        "vy_xmin": 1000, "vy_xmax": 1000, "vy_ymin": 1000, "vy_ymax": 1000,
+        "pde": 1000
     },
     test_samples={
-        "pde": 2000,
-        "vx_xmin": 200, "vx_xmax": 200, "vx_ymin": 200, "vx_ymax": 200,
-        "vy_xmin": 200, "vy_xmax": 200, "vy_ymin": 200, "vy_ymax": 200,
+        "pde": 2000
     },
     weights={
-        "pde": 1.0,
-        "vx_xmin": 1.0, "vx_xmax": 1.0, "vx_ymin": 1.0, "vx_ymax": 1.0,
-        "vy_xmin": 1.0, "vy_xmax": 1.0, "vy_ymin": 1.0, "vy_ymax": 1.0,
+        "pde": 1.0
     },
     optimizer="adam",
     learning_rate=1e-5,
