@@ -23,8 +23,8 @@ lam   = 1.0
 gamma = 1.0
 
 t_max = 0.1
-x_border = 5.0
-y_border = 5.0
+x_border = 1.0
+y_border = 1.0
 
 cut_border_x = 0.10
 cut_border_y = 0.04
@@ -63,9 +63,11 @@ def sampler(X, params):
 
 x_subdomains = [-10, -5.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.25, -0.1, -0.05,
                 0.0, 0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 10]
+x_subdomains = [i for i in x_subdomains if np.abs(i) <= x_border]
 y_subdomains = [-10, -5.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.25, -0.1, -0.05,
                 0.0, 0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 10]
-t_subdomains = np.linspace(0, t_max, 5)
+y_subdomains = [i for i in y_subdomains if np.abs(i) <= y_border]
+t_subdomains = np.linspace(0, t_max, 2)
 
 domain = pinns.DomainCubicPartition(
     [x_subdomains, y_subdomains, t_subdomains],
@@ -132,6 +134,7 @@ problem = pinns.Problem(
         "w": w,
         "x_border": x_border,
         "y_border": y_border,
+        "sigma_border": sigma_border,
         "sigma_cut_sampling": sigma_cut_sampling,
         "t_max": t_max,
     },
@@ -141,39 +144,50 @@ def input_transform(X: torch.Tensor, params: dict):
     x = X[:, 0:1]
     y = X[:, 1:2]
     t = X[:, 2:3]
-    s = torch.sign(x)
     x_abs = torch.abs(x)
-    return torch.hstack((x_abs, y, t, s))
+    y_abs = torch.abs(y)
+    return torch.hstack((x_abs, y_abs, t))
 
 def output_transform(X_in: torch.Tensor, Y: torch.Tensor, params: dict):
-    x_abs = X_in[:, 0:1]
-    y     = X_in[:, 1:2]
-    t     = X_in[:, 2:3]
-    s     = X_in[:, 3:4]
+
+    p = params["fixed"]
+    x_border = p["x_border"]
+    y_border = p["y_border"]
+    sigma = p["sigma_border"]
+
+    x = X_in[:, 0:1]
+    y = X_in[:, 1:2]
+    t = X_in[:, 2:3]
 
     h_hat  = Y[:, 0:1]
     vx_hat = Y[:, 1:2]
     vy_hat = Y[:, 2:3]
 
-    inside_x = 0.5 * (1.0 - torch.tanh((x_abs - cut_border_x) / sigma_border))
-    inside_y = 0.5 * (1.0 - torch.tanh((torch.abs(y) - cut_border_y) / sigma_border))
-    inside = inside_x * inside_y
+    s1 = torch.sigmoid((x + x_border) / sigma)  # left edge
+    s2 = torch.sigmoid((x_border - x) / sigma)  # right edge
+    f_x = 1 - s1 * s2
+    s1 = torch.sigmoid((y + y_border) / sigma)  # left edge
+    s2 = torch.sigmoid((y_border - y) / sigma)  # right edge
+    f_y = 1 - s1 * s2
+    f_cut = f_x * f_y
 
-    f_cut = h_star * (1.0 - inside)
     h = f_cut + t * h_hat
 
-    sym_x = s * torch.tanh(x_abs) ** 2
+    s_x = torch.sign(x)
+    s_y = torch.sign(y)
+    sym_x = s_x * torch.tanh(x) ** 2
+    sym_y = s_y * torch.tanh(y) ** 2
     vx = t * sym_x * vx_hat
-    vy = t * sym_x * vy_hat
+    vy = t * sym_y * vy_hat
 
     return torch.hstack((h, vx, vy))
 
 baseNetwork = pinns.FNN(
-    [4, 64, 64, 64, 3],
+    [3, 64, 3],
     activation="tanh"
 )
 
-active_mask = [sd.xmin[0] >= 0.0 for sd in domain.subdomains]
+active_mask = [sd.xmin[0] >= 0.0 and sd.xmin[1] >= 0.0 for sd in domain.subdomains]
 
 network = pinns.FBPINN(
     domain,
@@ -207,7 +221,7 @@ trainer.compile(
     learning_rate=1e-5,
     epochs=50000,
     print_each=500,
-    show_plots=False,
+    show_plots=True,
     show_subdomains=False,
     show_sampling_points=False,
     plot_regions=None,
