@@ -9,11 +9,17 @@
     v_x = t * sign(x) * tanh(|x|)^2 * v̂_x
     v_y = t * sign(x) * tanh(|x|)^2 * v̂_y
 - PDE exactly as specified
+
+JAX BACKEND VERSION
 """
+
+import os
+os.environ['PINNS_BACKEND'] = 'jax'
 
 import numpy as np
 import scipy.stats as sp
-import torch
+import jax
+import jax.numpy as jnp
 import pinns
 
 k_p   = 1.0
@@ -71,7 +77,11 @@ domain = pinns.DomainCubicPartition(
     sampling_transform=sampler
 )
 
-def pde_ablation_2d(X: torch.Tensor, V: torch.Tensor, params: dict):
+# JAX version: add 4th argument 'derivative' for JIT compilation
+def pde_ablation_2d(X, V, params, derivative=None):
+    if derivative is None:
+        derivative = pinns.derivative
+    
     p = params["fixed"]
     k_p   = p["k_p"]
     k_d   = p["k_d"]
@@ -83,23 +93,23 @@ def pde_ablation_2d(X: torch.Tensor, V: torch.Tensor, params: dict):
     vx = V[:, 1:2]
     vy = V[:, 2:3]
 
-    h_t  = pinns.derivative(V, X, component=0, order=(2,))
-    h_x  = pinns.derivative(V, X, component=0, order=(0,))
-    h_y  = pinns.derivative(V, X, component=0, order=(1,))
+    h_t  = derivative(V, X, component=0, order=(2,))
+    h_x  = derivative(V, X, component=0, order=(0,))
+    h_y  = derivative(V, X, component=0, order=(1,))
 
-    vx_x = pinns.derivative(V, X, component=1, order=(0,))
-    vy_y = pinns.derivative(V, X, component=2, order=(1,))
+    vx_x = derivative(V, X, component=1, order=(0,))
+    vy_y = derivative(V, X, component=2, order=(1,))
 
     div_hv = (h_x * vx + h * vx_x) + (h_y * vy + h * vy_y)
     r_h = h_t + div_hv - (k_p - k_d * h)
 
-    vx_xx = pinns.derivative(V, X, component=1, order=(0, 0))
-    vx_yy = pinns.derivative(V, X, component=1, order=(1, 1))
-    vy_xx = pinns.derivative(V, X, component=2, order=(0, 0))
-    vy_yy = pinns.derivative(V, X, component=2, order=(1, 1))
+    vx_xx = derivative(V, X, component=1, order=(0, 0))
+    vx_yy = derivative(V, X, component=1, order=(1, 1))
+    vy_xx = derivative(V, X, component=2, order=(0, 0))
+    vy_yy = derivative(V, X, component=2, order=(1, 1))
 
-    vy_xy = pinns.derivative(V, X, component=2, order=(0, 1))
-    vx_xy = pinns.derivative(V, X, component=1, order=(0, 1))
+    vy_xy = derivative(V, X, component=2, order=(0, 1))
+    vx_xy = derivative(V, X, component=1, order=(0, 1))
 
     r_vx = (mu / 2.0) * (2.0 * vx_xx + vx_yy + vy_xy) + lam * h_x - gamma * vx
     r_vy = (mu / 2.0) * (vx_xy + vy_xx + 2.0 * vy_yy) + lam * h_y - gamma * vy
@@ -128,16 +138,17 @@ problem = pinns.Problem(
     },
 )
 
-def input_transform(X: torch.Tensor, params: dict):
+# JAX version: use jnp instead of torch
+def input_transform(X, params):
     x = X[:, 0:1]
     y = X[:, 1:2]
     t = X[:, 2:3]
-    x_abs = torch.abs(x)
-    y_abs = torch.abs(y)
-    return torch.hstack((x_abs, y_abs, t))
+    x_abs = jnp.abs(x)
+    y_abs = jnp.abs(y)
+    return jnp.hstack((x_abs, y_abs, t))
 
-def output_transform(X_in: torch.Tensor, Y: torch.Tensor, params: dict):
-
+# JAX version: use jnp instead of torch
+def output_transform(X_in, Y, params):
     p = params["fixed"]
     x_border = p["cut_border_x"]
     y_border = p["cut_border_y"]
@@ -151,29 +162,27 @@ def output_transform(X_in: torch.Tensor, Y: torch.Tensor, params: dict):
     vx_hat = Y[:, 1:2]
     vy_hat = Y[:, 2:3]
 
-    s1_x = torch.sigmoid((x + x_border) / sigma)  # left edge
-    s2_x = torch.sigmoid((x_border - x) / sigma)  # right edge
+    s1_x = jax.nn.sigmoid((x + x_border) / sigma)  # left edge
+    s2_x = jax.nn.sigmoid((x_border - x) / sigma)  # right edge
     inside_x = s1_x * s2_x
     
-    s1_y = torch.sigmoid((y + y_border) / sigma)  # bottom edge
-    s2_y = torch.sigmoid((y_border - y) / sigma)  # top edge
+    s1_y = jax.nn.sigmoid((y + y_border) / sigma)  # bottom edge
+    s2_y = jax.nn.sigmoid((y_border - y) / sigma)  # top edge
     inside_y = s1_y * s2_y
     
     f_cut = 1 - inside_x * inside_y
 
     h = f_cut + t * h_hat
 
-    s_x = torch.sign(x)
-    s_y = torch.sign(y)
-    sym_x = s_x * torch.tanh(x) ** 2
-    sym_y = s_y * torch.tanh(y) ** 2
-    #This just if you really want to force the velocity to be zero at t=0, I prefer to just let the network learn that by itself.
+    s_x = jnp.sign(x)
+    s_y = jnp.sign(y)
+    sym_x = s_x * jnp.tanh(x) ** 2
+    sym_y = s_y * jnp.tanh(y) ** 2
+    # This just if you really want to force the velocity to be zero at t=0
     vx = t * sym_x * vx_hat
     vy = t * sym_y * vy_hat
-    # vx = sym_x * vx_hat
-    # vy = sym_y * vy_hat
 
-    return torch.hstack((h, vx, vy))
+    return jnp.hstack((h, vx, vy))
 
 baseNetwork = pinns.FNN(
     [3, 64, 3],
@@ -214,12 +223,11 @@ trainer.compile(
     show_sampling_points=False,
     # 3D slices: plot x-y plane at different t values
     plot_regions=[
-        ((-1.0,1.0), (-1.0,1.0), 0.0),   # t=0.0 (initial)
-        ((-1.0,1.0), (-1.0,1.0), t_max),   # t=0.0 (initial)
+        ((-1.0, 1.0), (-1.0, 1.0), 0.0),   # t=0.0 (initial)
+        ((-1.0, 1.0), (-1.0, 1.0), t_max),  # t=t_max (final)
     ],
     plot_n_points=100,
     profile=False,
 )
 
 trainer.train()
-

@@ -1013,6 +1013,22 @@ class DomainCubicPartition(DomainCubic):
             remaining //= n
         return tuple(reversed(indices))
     
+    def to_numpy(self):
+        """
+        Get subdomain centers and widths as NumPy arrays.
+        
+        Returns:
+            tuple: (centers, widths_lower, widths_upper)
+                   - centers: shape (n_subdomains, n_dims)
+                   - widths_lower: shape (n_subdomains, n_dims) - for lower (xmin) boundaries
+                   - widths_upper: shape (n_subdomains, n_dims) - for upper (xmax) boundaries
+        """
+        import numpy as np
+        centers = np.array(self._subdomain_centers, dtype=np.float32)
+        widths_lower = np.array(self._subdomain_widths_lower, dtype=np.float32)
+        widths_upper = np.array(self._subdomain_widths_upper, dtype=np.float32)
+        return centers, widths_lower, widths_upper
+    
     def to_torch(self, device='cpu', dtype=torch.float32):
         """
         Get subdomain centers and widths as PyTorch tensors.
