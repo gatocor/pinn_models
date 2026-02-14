@@ -42,12 +42,6 @@ class Trainer(BaseTrainer):
         """
         # Initialize base class (handles network.to(), normalization, defaults)
         super().__init__(problem, network, device)
-        
-        # Sparse FBPINN precomputation
-        self._use_sparse_fbpinn = True  # Enable by default for FBPINN
-        self._sparse_threshold = 1e-6
-        self._precomputed_pde = None
-        self._precomputed_bcs = {}
     
     # ==================== Device Detection ====================
     
@@ -85,14 +79,15 @@ class Trainer(BaseTrainer):
         """Precompute sparse training data for FBPINN."""
         params_dict = self._build_params()
         
-        # Precompute for PDE data
+        # Precompute for PDE data - use sparse indices (supports derivatives)
         if 'pde' in self._train_data:
             x_pde = self._train_data['pde']
-            self._precomputed_pde = self.network.precompute_training_data_jit(
+            # Store sparse indices for differentiable PDE computation
+            self._precomputed_pde = self.network.precompute_sparse_indices_jit(
                 x_pde, threshold=self._sparse_threshold, params_dict=params_dict
             )
         
-        # Precompute for each BC
+        # Precompute for each BC - use full precomputation (no derivatives needed)
         self._precomputed_bcs = {}
         for name, x_bc in self._train_data.items():
             if name != 'pde':
@@ -190,18 +185,28 @@ class Trainer(BaseTrainer):
         def model_apply_with_params(params, x):
             return self.network.apply(params, x, params_dict)
         
-        # Check if we should use sparse FBPINN for Dirichlet BCs
+        # Check if we should use sparse FBPINN
         use_sparse = (self._use_sparse_fbpinn and 
                       isinstance(self.network, FBPINN) and 
                       self._precomputed_bcs)
         
+        # Check if we have sparse PDE indices for differentiable sparse forward
+        use_sparse_pde = (self._use_sparse_fbpinn and 
+                          isinstance(self.network, FBPINN) and 
+                          self._precomputed_pde is not None)
+        
         # Store precomputed data references for closure
         precomputed_bcs = self._precomputed_bcs if use_sparse else {}
+        precomputed_pde = self._precomputed_pde if use_sparse_pde else None
         network = self.network
         
         def model_apply_sparse(params, precomputed):
-            """Apply network using precomputed sparse data."""
+            """Apply network using precomputed sparse data (no derivatives)."""
             return network.apply_precomputed_jit(params, precomputed, params_dict)
+        
+        def model_apply_sparse_diff(params, x, sparse_indices):
+            """Apply network using sparse indices with derivative support."""
+            return network.apply_sparse_differentiable(params, x, sparse_indices, params_dict)
         
         sig = inspect.signature(pde_fn)
         pde_accepts_derivative = len(sig.parameters) >= 4
@@ -215,9 +220,18 @@ class Trainer(BaseTrainer):
             # ===== PDE Loss =====
             if 'pde' in train_data:
                 x_pde = train_data['pde']
-                y_pde = model_apply_with_params(params, x_pde)
                 
-                deriv_fn = make_derivative_fn(model_apply_with_params, params)
+                # Use sparse differentiable forward if available
+                if precomputed_pde is not None:
+                    # Sparse path with derivative support
+                    def sparse_apply(p, x):
+                        return model_apply_sparse_diff(p, x, precomputed_pde)
+                    y_pde = sparse_apply(params, x_pde)
+                    deriv_fn = make_derivative_fn(sparse_apply, params)
+                else:
+                    # Standard path
+                    y_pde = model_apply_with_params(params, x_pde)
+                    deriv_fn = make_derivative_fn(model_apply_with_params, params)
                 
                 if pde_accepts_derivative:
                     residual = pde_fn(x_pde, y_pde, params_dict, deriv_fn)

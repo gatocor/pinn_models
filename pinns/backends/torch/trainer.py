@@ -15,6 +15,7 @@ from ..base_trainer import BaseTrainer, is_notebook
 from pinns.problem import Problem
 from pinns.boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC
 from .functional import derivative
+from .networks import FBPINN
 
 
 class Trainer(BaseTrainer):
@@ -81,6 +82,36 @@ class Trainer(BaseTrainer):
         """PyTorch optimizers don't need separate state initialization."""
         pass
     
+    # ==================== Sparse FBPINN Precomputation ====================
+    
+    def _after_compile_hook(self):
+        """Sample data and precompute FBPINN sparse data if applicable."""
+        # Call parent to sample train/test data
+        super()._after_compile_hook()
+        
+        # Precompute sparse FBPINN data if network is FBPINN
+        if self._use_sparse_fbpinn and isinstance(self.network, FBPINN):
+            self._precompute_sparse_data()
+    
+    def _precompute_sparse_data(self):
+        """Precompute sparse training data for FBPINN."""
+        params_dict = self._build_params()
+        
+        # Precompute for PDE data
+        if 'pde' in self._train_data:
+            x_pde = self._train_data['pde']
+            self._precomputed_pde = self.network.precompute_training_data(
+                x_pde, threshold=self._sparse_threshold, params=params_dict
+            )
+        
+        # Precompute for each BC
+        self._precomputed_bcs = {}
+        for name, x_bc in self._train_data.items():
+            if name != 'pde':
+                self._precomputed_bcs[name] = self.network.precompute_training_data(
+                    x_bc, threshold=self._sparse_threshold, params=params_dict
+                )
+
     # ==================== Tensor Conversion ====================
     
     def _to_tensor(self, np_array: np.ndarray):

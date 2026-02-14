@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+from typing import Dict, Optional, List, Tuple
 from pinns.domain import DomainCubicPartition
 
 class FNN(nn.Module):
@@ -744,3 +745,110 @@ class FBPINN(nn.Module):
         predictions = torch.stack(predictions, dim=1)
         
         return predictions, windows, self._active_indices
+
+    def precompute_training_data(self, x: torch.Tensor, threshold: float = 1e-6,
+                                  params=None) -> Dict:
+        """
+        Precompute sparse training data for efficient forward passes.
+        
+        Computes which points are "active" (window > threshold) for each subdomain,
+        and precomputes scaled inputs and window weights. This data can be reused
+        across all training epochs since collocation points don't change.
+        
+        Args:
+            x: Input tensor of shape (batch_size, n_dims)
+            threshold: Minimum window value to consider a point active (default: 1e-6)
+            params: Optional dict passed to input transform
+        
+        Returns:
+            Dict containing precomputed data for forward_precomputed()
+        """
+        x_original = x
+        
+        # Apply input transform if present
+        if self.input_transform is not None:
+            x = self.input_transform(x, params)
+        
+        batch_size = x.shape[0]
+        
+        # Compute windows for all points: (batch_size, n_subdomains)
+        windows = self.compute_windows(x)
+        
+        # For each active subdomain, find points where window > threshold
+        precomputed = {
+            'batch_size': batch_size,
+            'x_original': x_original,
+            'subdomains': {},
+            'device': x.device,
+            'dtype': x.dtype,
+        }
+        
+        for net_idx, sub_idx in enumerate(self._active_indices):
+            w = windows[:, sub_idx]
+            mask = w > threshold
+            indices = torch.nonzero(mask, as_tuple=True)[0]
+            
+            if len(indices) > 0:
+                # Get active points and their window weights
+                x_active = x[indices]
+                weights_active = w[indices].unsqueeze(1)  # (n_active_pts, 1)
+                
+                # Pre-scale inputs for this subdomain
+                x_scaled = self.scale_input(x_active, sub_idx)
+                
+                precomputed['subdomains'][net_idx] = {
+                    'indices': indices,           # Which points to process
+                    'x_scaled': x_scaled,         # Pre-scaled inputs
+                    'weights': weights_active,    # Window weights
+                    'n_points': len(indices),
+                }
+        
+        return precomputed
+    
+    def forward_precomputed(self, precomputed: Dict, params=None) -> torch.Tensor:
+        """
+        Forward pass using precomputed sparse training data.
+        
+        Only evaluates points that have non-negligible window values for each
+        subdomain, significantly reducing computation for sparse window overlaps.
+        
+        Args:
+            precomputed: Output from precompute_training_data()
+            params: Optional dict passed to output transform
+        
+        Returns:
+            Output tensor of shape (batch_size, output_size)
+        """
+        batch_size = precomputed['batch_size']
+        x_original = precomputed['x_original']
+        device = precomputed['device']
+        dtype = precomputed['dtype']
+        
+        # Get output size from first network
+        output_size = self.networks[0].layers[-1].out_features
+        
+        # Initialize output
+        output = torch.zeros(batch_size, output_size, device=device, dtype=dtype)
+        
+        # Process each subdomain's active points
+        for net_idx, data in precomputed['subdomains'].items():
+            indices = data['indices']
+            x_scaled = data['x_scaled']
+            weights = data['weights']
+            
+            # Forward pass through this subdomain
+            network = self.networks[net_idx]
+            pred = network(x_scaled)
+            
+            # Weight by window and scatter back
+            weighted_pred = pred * weights
+            output.index_add_(0, indices, weighted_pred)
+        
+        # Unnormalize output
+        output = self._unnormalize_output(output)
+        
+        # Apply output transform
+        if self.output_transform is not None:
+            output = self.output_transform(x_original, output, params)
+        
+        return output

@@ -675,6 +675,178 @@ class FBPINN:
         y = self.forward(x_jax, params_dict)
         return np.array(y)
     
+    def precompute_sparse_indices_jit(self, x: jnp.ndarray, threshold: float = 1e-6,
+                                      params_dict: Optional[Dict] = None) -> Dict:
+        """
+        Precompute sparse index structure for efficient differentiable forward passes.
+        
+        Only precomputes INDICES (which points belong to which subdomain).
+        This is JIT-compatible and allows differentiation w.r.t. x since the
+        actual computation still traces through x.
+        
+        Args:
+            x: Input array of shape (batch_size, n_dims)
+            threshold: Minimum window value to consider a point active
+            params_dict: Optional dict passed to input transform
+        
+        Returns:
+            Dict with index arrays for apply_sparse_differentiable()
+        """
+        x_transformed = x
+        if self.input_transform is not None:
+            x_transformed = self.input_transform(x, params_dict)
+        
+        batch_size = x.shape[0]
+        n_dims = x.shape[1]
+        output_size = self.layer_sizes[-1]
+        n_active = len(self.active_indices)
+        
+        # Compute windows
+        windows = self.compute_windows(x_transformed)
+        
+        # Find max active points across all subdomains
+        max_pts_list = []
+        for sub_idx in self.active_indices:
+            mask = windows[:, sub_idx] > threshold
+            max_pts_list.append(int(jnp.sum(mask)))
+        max_pts = max(max_pts_list) if max_pts_list else 1
+        
+        # Precompute indices only (padded for JIT)
+        all_indices = jnp.zeros((n_active, max_pts), dtype=jnp.int32)
+        all_n_valid = jnp.zeros(n_active, dtype=jnp.int32)
+        
+        for i, sub_idx in enumerate(self.active_indices):
+            w = windows[:, sub_idx]
+            mask = w > threshold
+            indices = jnp.where(mask, size=max_pts, fill_value=0)[0]
+            n_valid = jnp.sum(mask)
+            
+            all_indices = all_indices.at[i].set(indices)
+            all_n_valid = all_n_valid.at[i].set(n_valid)
+        
+        return {
+            'batch_size': batch_size,
+            'output_size': output_size,
+            'max_pts': max_pts,
+            'n_active': n_active,
+            'all_indices': all_indices,  # (n_active, max_pts)
+            'all_n_valid': all_n_valid,  # (n_active,)
+            'threshold': threshold,
+        }
+    
+    def apply_sparse_differentiable(self, params: Dict, x: jnp.ndarray,
+                                    sparse_indices: Dict,
+                                    params_dict: Optional[Dict] = None) -> jnp.ndarray:
+        """
+        Sparse forward pass that maintains differentiability w.r.t. x.
+        
+        Uses precomputed indices to know which points belong to which subdomain,
+        but re-computes scaling and window values from x to maintain the gradient
+        trace for dy/dx (needed for PDE residuals).
+        
+        Args:
+            params: Network parameters from init()
+            x: Input array of shape (batch_size, n_dims)
+            sparse_indices: Output from precompute_sparse_indices_jit()
+            params_dict: Optional dict passed to transforms
+        
+        Returns:
+            Output array of shape (batch_size, n_outputs) with gradient trace
+        """
+        x_original = x
+        x_transformed = x
+        if self.input_transform is not None:
+            x_transformed = self.input_transform(x, params_dict)
+        
+        batch_size = sparse_indices['batch_size']
+        output_size = sparse_indices['output_size']
+        max_pts = sparse_indices['max_pts']
+        all_indices = sparse_indices['all_indices']
+        all_n_valid = sparse_indices['all_n_valid']
+        
+        # Recompute windows from x (to maintain gradient trace)
+        windows = self.compute_windows(x_transformed)
+        
+        # Get jax arrays for geometry
+        lower_bounds = jnp.array(self.lower_bounds)
+        upper_bounds = jnp.array(self.upper_bounds)
+        
+        # Stack params for vmap
+        subnet_params_list = [params[f'subnet_{sub_idx}'] for sub_idx in self.active_indices]
+        stacked_params = jax.tree_util.tree_map(
+            lambda *leaves: jnp.stack(leaves, axis=0),
+            *subnet_params_list
+        )
+        
+        # Create subnet module
+        subnet = FBPINNModule(
+            layer_sizes=self.layer_sizes,
+            activation=self.activation
+        )
+        
+        # For each subdomain, gather active points, scale, forward, weight
+        # Using vmap for efficiency
+        active_sub_indices = jnp.array(self.active_indices)
+        
+        def forward_one_subdomain(sub_local_idx, subnet_params, indices, n_valid):
+            """Process one subdomain (vmapped over subdomains)."""
+            sub_idx = active_sub_indices[sub_local_idx]
+            
+            # Gather points (indices are precomputed)
+            x_active = x_transformed[indices]  # (max_pts, n_dims)
+            
+            # Scale inputs (traced through x)
+            lb = lower_bounds[sub_idx]
+            ub = upper_bounds[sub_idx]
+            x_scaled = 2.0 * (x_active - lb) / (ub - lb + 1e-8) - 1.0
+            
+            # Forward through network
+            pred = subnet.apply(subnet_params, x_scaled)  # (max_pts, output)
+            
+            # Get window weights (traced through x)
+            w = windows[indices, sub_idx][:, None]  # (max_pts, 1)
+            
+            # Weight predictions
+            weighted = pred * w  # (max_pts, output)
+            
+            # Mask out padded entries
+            point_idx = jnp.arange(max_pts)
+            valid_mask = point_idx < n_valid
+            weighted = weighted * valid_mask[:, None]
+            
+            return weighted, indices
+        
+        # vmap over subdomains
+        n_active = len(self.active_indices)
+        sub_local_indices = jnp.arange(n_active)
+        
+        vmapped_forward = jax.vmap(
+            forward_one_subdomain,
+            in_axes=(0, 0, 0, 0)
+        )
+        
+        all_weighted, all_scatter_indices = vmapped_forward(
+            sub_local_indices, stacked_params, all_indices, all_n_valid
+        )  # (n_active, max_pts, output)
+        
+        # Scatter-add to output
+        output = jnp.zeros((batch_size, output_size))
+        
+        # Flatten for scatter
+        flat_indices = all_scatter_indices.reshape(-1)
+        flat_weighted = all_weighted.reshape(-1, output_size)
+        
+        output = output.at[flat_indices].add(flat_weighted)
+        
+        # Unnormalize output
+        output = self._unnormalize_output(output)
+        
+        # Apply output transform
+        if self.output_transform is not None:
+            output = self.output_transform(x_original, output, params_dict)
+        
+        return output
+
     def precompute_training_data(self, x: jnp.ndarray, threshold: float = 1e-6,
                                   params_dict: Optional[Dict] = None) -> Dict:
         """

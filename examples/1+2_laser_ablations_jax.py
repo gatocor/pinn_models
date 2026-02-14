@@ -227,7 +227,6 @@ trainer.compile(
         ((-1.0, 1.0), (-1.0, 1.0), t_max),  # t=t_max (final)
     ],
     plot_n_points=100,
-    profile=False,
 )
 
 trainer.train()

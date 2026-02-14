@@ -107,6 +107,12 @@ class BaseTrainer(ABC):
         self._train_data = None
         self._test_data = None
         
+        # Sparse FBPINN precomputation (common to all backends)
+        self._use_sparse_fbpinn = True
+        self._sparse_threshold = 1e-6
+        self._precomputed_pde = None
+        self._precomputed_bcs = {}
+        
         # Training configuration (set by compile)
         self._epochs = 1000
         self._print_each = 100
