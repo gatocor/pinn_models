@@ -64,14 +64,20 @@ class Trainer(BaseTrainer):
         if self.optimizer_name == "adam":
             return torch.optim.Adam(self.network.parameters(), lr=self.learning_rate)
         elif self.optimizer_name == "lbfgs":
+            # Use L-BFGS parameters from compile()
+            max_iter = getattr(self, '_lbfgs_max_iter', 5)
+            history_size = getattr(self, '_lbfgs_history_size', 50)
+            tolerance = getattr(self, '_lbfgs_tolerance', 1e-9)
+            line_search = getattr(self, '_lbfgs_line_search', 'strong_wolfe')
+            
             return torch.optim.LBFGS(
                 self.network.parameters(),
                 lr=self.learning_rate,
-                max_iter=5,
-                history_size=50,
-                line_search_fn="strong_wolfe",
-                tolerance_grad=1e-9,
-                tolerance_change=1e-12
+                max_iter=max_iter,
+                history_size=history_size,
+                line_search_fn=line_search,
+                tolerance_grad=tolerance,
+                tolerance_change=tolerance * 1e-3
             )
         elif self.optimizer_name == "sgd":
             return torch.optim.SGD(self.network.parameters(), lr=self.learning_rate)
@@ -90,8 +96,14 @@ class Trainer(BaseTrainer):
         super()._after_compile_hook()
         
         # Precompute sparse FBPINN data if network is FBPINN
-        if self._use_sparse_fbpinn and isinstance(self.network, FBPINN):
+        # Skip when batching is enabled (indices don't match batch slices)
+        use_batching = self._batch_size is not None and self._batch_size > 0
+        if self._use_sparse_fbpinn and isinstance(self.network, FBPINN) and not use_batching:
             self._precompute_sparse_data()
+        elif use_batching:
+            # Clear any precomputed sparse data when batching
+            self._precomputed_pde = None
+            self._precomputed_bcs = {}
     
     def _precompute_sparse_data(self):
         """Precompute sparse training data for FBPINN."""
@@ -153,19 +165,7 @@ class Trainer(BaseTrainer):
         
         self.network.train()
         
-        if show_plots and is_notebook():
-            n_zoom_regions = len(getattr(self, '_plot_regions', []))
-            needs_recreation = self._fig is None
-            if not needs_recreation and self._axes is not None and n_zoom_regions > 0:
-                if f'zoom_0_0' not in self._axes:
-                    needs_recreation = True
-            if needs_recreation:
-                self._fig, self._axes = self._create_figure()
-        
-        start_epoch = self._global_epoch
-        training_start_time = time.time()
-        
-        # Auto-save path for script mode
+        # Auto-save path for script mode (non-interactive file saving)
         auto_save_path = None
         if show_plots and not save_plots and not is_notebook():
             import glob
@@ -185,7 +185,26 @@ class Trainer(BaseTrainer):
                 next_num = 0
             auto_save_path = f'./pinn_progress_{next_num}.png'
         
-        print(f"Starting training for {epochs} epochs...")
+        if show_plots:
+            n_zoom_regions = len(getattr(self, '_plot_regions', []))
+            needs_recreation = self._fig is None
+            if not needs_recreation and self._axes is not None and n_zoom_regions > 0:
+                if f'zoom_0_0' not in self._axes:
+                    needs_recreation = True
+            if needs_recreation:
+                self._fig, self._axes = self._create_figure()
+        
+        start_epoch = self._global_epoch
+        training_start_time = time.time()
+        
+        # Calculate number of batches (mini-batching not used with L-BFGS)
+        n_batches = self._get_n_batches() if self.optimizer_name != "lbfgs" else 1
+        use_batching = n_batches > 1
+        
+        if use_batching:
+            print(f"Starting training for {epochs} epochs, {n_batches} batches/epoch...")
+        else:
+            print(f"Starting training for {epochs} epochs...")
         
         for local_epoch in range(epochs):
             epoch = start_epoch + local_epoch
@@ -202,6 +221,28 @@ class Trainer(BaseTrainer):
                 
                 self.optimizer.step(closure)
                 loss, losses = self._compute_total_loss(self._train_data, params_dict, weights_dict)
+            elif use_batching:
+                # Mini-batch training
+                epoch_loss = 0.0
+                for batch_idx in range(n_batches):
+                    # Create batch data
+                    batch_data = {}
+                    for name, data in self._train_data.items():
+                        n_points = len(data)
+                        start_idx, end_idx = self._get_batch_indices(n_points, batch_idx, n_batches)
+                        batch_data[name] = data[start_idx:end_idx]
+                    
+                    self.optimizer.zero_grad()
+                    batch_loss, batch_losses = self._compute_total_loss(batch_data, params_dict, weights_dict)
+                    batch_loss.backward()
+                    self.optimizer.step()
+                    
+                    epoch_loss += float(batch_loss.item())
+                
+                # Recompute on full data for metrics (detached)
+                with torch.no_grad():
+                    loss, losses = self._compute_total_loss(self._train_data, params_dict, weights_dict)
+                loss = torch.tensor(epoch_loss / n_batches)  # Report average batch loss
             else:
                 self.optimizer.zero_grad()
                 loss, losses = self._compute_total_loss(self._train_data, params_dict, weights_dict)

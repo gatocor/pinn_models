@@ -193,6 +193,11 @@ class BaseTrainer(ABC):
         show_sampling_points=False,
         plot_regions: List[tuple] = None,
         plot_n_points: int = 200,
+        # L-BFGS specific parameters
+        lbfgs_max_iter: int = 5,
+        lbfgs_history_size: int = 50,
+        lbfgs_tolerance: float = 1e-9,
+        lbfgs_line_search: str = "strong_wolfe",
     ):
         """
         Configure training parameters.
@@ -201,7 +206,7 @@ class BaseTrainer(ABC):
             train_samples: Number of samples for each loss term (list or dict).
             test_samples: Number of test samples for each loss term.
             weights: Weights for each loss term.
-            optimizer: Optimizer name ('adam', 'sgd', etc.).
+            optimizer: Optimizer name ('adam', 'sgd', 'lbfgs').
             learning_rate: Learning rate.
             epochs: Number of training epochs.
             batch_size: Batch size (if applicable).
@@ -212,9 +217,19 @@ class BaseTrainer(ABC):
             show_sampling_points: Show sampling points in plots.
             plot_regions: List of zoom regions for additional plots.
             plot_n_points: Number of points for plotting.
+            lbfgs_max_iter: Max iterations per L-BFGS step (default: 5).
+            lbfgs_history_size: History size for L-BFGS (default: 50).
+            lbfgs_tolerance: Tolerance for gradient convergence (default: 1e-9).
+            lbfgs_line_search: Line search method - 'strong_wolfe' or None (default: 'strong_wolfe').
         """
         n_bcs = len(self.problem.boundary_conditions)
         expected_len = 1 + n_bcs
+        
+        # Store L-BFGS parameters
+        self._lbfgs_max_iter = lbfgs_max_iter
+        self._lbfgs_history_size = lbfgs_history_size
+        self._lbfgs_tolerance = lbfgs_tolerance
+        self._lbfgs_line_search = lbfgs_line_search
         
         if train_samples is not None:
             train_samples = self._convert_dict_to_list(train_samples, 'train_samples')
@@ -506,26 +521,54 @@ class BaseTrainer(ABC):
         
         return total_loss, losses
     
-    def _compute_residuals(self, x_np: np.ndarray) -> List[np.ndarray]:
+    def _compute_residuals(self, x_np: np.ndarray, batch_size: Optional[int] = None) -> List[np.ndarray]:
         """
         Compute PDE residuals at given points.
         
         Args:
             x_np: Input points as numpy array of shape (n_points, n_inputs).
+            batch_size: Optional batch size for large inputs to avoid OOM.
             
         Returns:
             List of numpy arrays, one per residual equation.
         """
-        x = self._to_tensor(x_np)
-        params_dict = self._build_params()
-        y = self.network.forward(x, params_dict)
-        residual = self._get_pde_residual_tensor(x, y, params_dict)
+        if batch_size is None:
+            batch_size = getattr(self, '_batch_size', None)
         
-        # Convert to list of numpy arrays
-        if isinstance(residual, (list, tuple)):
-            return [self._to_numpy(r).flatten() for r in residual]
-        else:
-            return [self._to_numpy(residual).flatten()]
+        # If no batching needed, compute directly
+        if batch_size is None or batch_size >= len(x_np):
+            x = self._to_tensor(x_np)
+            params_dict = self._build_params()
+            y = self.network.forward(x, params_dict)
+            residual = self._get_pde_residual_tensor(x, y, params_dict)
+            
+            if isinstance(residual, (list, tuple)):
+                return [self._to_numpy(r).flatten() for r in residual]
+            else:
+                return [self._to_numpy(residual).flatten()]
+        
+        # Batched computation
+        params_dict = self._build_params()
+        all_residuals = None
+        
+        for start in range(0, len(x_np), batch_size):
+            end = min(start + batch_size, len(x_np))
+            x_batch = self._to_tensor(x_np[start:end])
+            y_batch = self.network.forward(x_batch, params_dict)
+            residual_batch = self._get_pde_residual_tensor(x_batch, y_batch, params_dict)
+            
+            if isinstance(residual_batch, (list, tuple)):
+                batch_res = [self._to_numpy(r).flatten() for r in residual_batch]
+            else:
+                batch_res = [self._to_numpy(residual_batch).flatten()]
+            
+            if all_residuals is None:
+                all_residuals = [[] for _ in batch_res]
+            
+            for i, r in enumerate(batch_res):
+                all_residuals[i].append(r)
+        
+        return [np.concatenate(res_list) for res_list in all_residuals]
     
     @abstractmethod
     def _to_numpy(self, tensor) -> np.ndarray:
@@ -627,6 +670,31 @@ class BaseTrainer(ABC):
             if n > 0:
                 np_data = self._sample_points_np(name, n)
                 self._test_data[name] = self._to_tensor(np_data)
+
+    def _get_n_batches(self) -> int:
+        """Get number of mini-batches based on PDE data size and batch_size."""
+        if self._batch_size is None or self._batch_size <= 0:
+            return 1
+        if 'pde' not in self._train_data:
+            return 1
+        n_pde = len(self._train_data['pde'])
+        return max(1, (n_pde + self._batch_size - 1) // self._batch_size)
+
+    def _get_batch_indices(self, n_points: int, batch_idx: int, n_batches: int):
+        """Get start and end indices for a given batch.
+        
+        Args:
+            n_points: Total number of points
+            batch_idx: Current batch index (0-based)
+            n_batches: Total number of batches
+            
+        Returns:
+            Tuple of (start_idx, end_idx)
+        """
+        batch_size = max(1, (n_points + n_batches - 1) // n_batches)
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, n_points)
+        return start_idx, end_idx
 
     # ==================== Utility Methods ====================
 
@@ -835,16 +903,19 @@ class BaseTrainer(ABC):
                 axes[f'region_{r}'] = fig.add_subplot(gs[1 + n_outputs + r, :])
         
         else:
-            # For 3D+: just loss plot and region slices
-            n_rows = 1 + n_regions
-            fig = plt.figure(figsize=(12, 4 * n_rows))
-            gs = fig.add_gridspec(n_rows, 1)
+            # For 3D+: loss plot + region slices for all outputs with residuals
+            n_cols = 2 * n_outputs  # Two columns per output (solution + residual)
+            n_rows = 1 + n_regions  # 1 for loss + one row per region
+            fig = plt.figure(figsize=(4 * n_cols, 4 * n_rows))
+            gs = fig.add_gridspec(n_rows, n_cols)
             
             axes = {}
-            axes['losses'] = fig.add_subplot(gs[0, 0])
+            axes['losses'] = fig.add_subplot(gs[0, :])
             
             for r in range(n_regions):
-                axes[f'region_{r}'] = fig.add_subplot(gs[1 + r, 0])
+                for i in range(n_outputs):
+                    axes[f'region_{r}_{i}'] = fig.add_subplot(gs[1 + r, 2*i])
+                    axes[f'region_res_{r}_{i}'] = fig.add_subplot(gs[1 + r, 2*i + 1])
         
         self._colorbars = []
         return fig, axes
@@ -937,7 +1008,7 @@ class BaseTrainer(ABC):
         
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
         cmap = self._get_colormap(output_idx)
-        im = ax.imshow(Y, extent=extent, origin='lower', aspect='auto', cmap=cmap)
+        im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', cmap=cmap)
         cbar = plt.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
         
@@ -967,7 +1038,7 @@ class BaseTrainer(ABC):
         
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
         cmap = self._get_colormap(output_idx)
-        im = ax.imshow(Y_true, extent=extent, origin='lower', aspect='auto', cmap=cmap)
+        im = ax.imshow(Y_true, extent=extent, origin='lower', aspect='equal', cmap=cmap)
         cbar = plt.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
         
@@ -1021,7 +1092,7 @@ class BaseTrainer(ABC):
         error = np.abs(y[:, output_idx] - y_true[:, output_idx]).reshape(X0.shape)
         
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
-        im = ax.imshow(error, extent=extent, origin='lower', aspect='auto', cmap='Reds')
+        im = ax.imshow(error, extent=extent, origin='lower', aspect='equal', cmap='Reds')
         cbar = plt.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
         
@@ -1092,7 +1163,7 @@ class BaseTrainer(ABC):
             
             extent = [x0.min(), x0.max(), x1.min(), x1.max()]
             cmap = self._get_colormap(output_idx)
-            im = ax.imshow(Y, extent=extent, origin='lower', aspect='auto', cmap=cmap)
+            im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', cmap=cmap)
             cbar = plt.colorbar(im, ax=ax)
             self._colorbars.append(cbar)
             
@@ -1110,6 +1181,96 @@ class BaseTrainer(ABC):
             ax.text(0.5, 0.5, f'Cannot plot {n_free}D (max 2D)',
                    ha='center', va='center', transform=ax.transAxes)
             ax.set_title(self._get_output_name(output_idx))
+    
+    def _plot_region_residuals_nd(self, ax, residual_idx, region, n_points=50):
+        """Plot residuals for a region of an N-dimensional problem as 1D or 2D."""
+        free_dims, free_ranges, fixed_dims, fixed_values = self._parse_region_nd(region)
+        n_free = len(free_dims)
+        
+        if n_free == 0:
+            # No free dimensions - just show the single point residual value
+            x_point = np.zeros((1, self.problem.n_dims))
+            for i, val in zip(fixed_dims, fixed_values):
+                x_point[0, i] = val
+            residuals = self._compute_residuals(x_point)
+            if residual_idx < len(residuals):
+                res_val = np.abs(residuals[residual_idx][0])
+            else:
+                res_val = 0.0
+            ax.text(0.5, 0.5, f'|R|={res_val:.4e}',
+                   ha='center', va='center', transform=ax.transAxes, fontsize=14)
+            ax.set_title(f'Residual eq{residual_idx+1}')
+            return
+        
+        elif n_free == 1:
+            # 1D plot
+            dim = free_dims[0]
+            x_range = free_ranges[0]
+            x_vals = np.linspace(x_range[0], x_range[1], n_points)
+            
+            x_full = np.zeros((n_points, self.problem.n_dims))
+            x_full[:, dim] = x_vals
+            for i, val in zip(fixed_dims, fixed_values):
+                x_full[:, i] = val
+            
+            residuals = self._compute_residuals(x_full)
+            if residual_idx < len(residuals):
+                res = np.abs(residuals[residual_idx])
+            else:
+                res = np.zeros(n_points)
+            
+            ax.plot(x_vals, res, 'm-', linewidth=2)
+            ax.set_xlabel(self._get_input_name(dim))
+            ax.set_ylabel(f'|Residual eq{residual_idx+1}|')
+            
+            title_parts = [f'Residual eq{residual_idx+1}']
+            if fixed_dims:
+                fixed_str = ', '.join([f'{self._get_input_name(d)}={v:.3g}' 
+                                       for d, v in zip(fixed_dims, fixed_values)])
+                title_parts.append(f'at {fixed_str}')
+            ax.set_title(' '.join(title_parts))
+            ax.grid(True, alpha=0.3)
+            
+        elif n_free == 2:
+            # 2D plot
+            dim0, dim1 = free_dims[0], free_dims[1]
+            x0_range, x1_range = free_ranges[0], free_ranges[1]
+            
+            x0 = np.linspace(x0_range[0], x0_range[1], n_points)
+            x1 = np.linspace(x1_range[0], x1_range[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            
+            n_total = X0.size
+            x_full = np.zeros((n_total, self.problem.n_dims))
+            x_full[:, dim0] = X0.ravel()
+            x_full[:, dim1] = X1.ravel()
+            for i, val in zip(fixed_dims, fixed_values):
+                x_full[:, i] = val
+            
+            residuals = self._compute_residuals(x_full)
+            if residual_idx < len(residuals):
+                Res = np.abs(residuals[residual_idx]).reshape(X0.shape)
+            else:
+                Res = np.zeros(X0.shape)
+            
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', cmap='viridis')
+            cbar = plt.colorbar(im, ax=ax, label='|Residual|')
+            self._colorbars.append(cbar)
+            
+            ax.set_xlabel(self._get_input_name(dim0))
+            ax.set_ylabel(self._get_input_name(dim1))
+            
+            if fixed_dims:
+                fixed_str = ', '.join([f'{self._get_input_name(d)}={v:.3g}' 
+                                       for d, v in zip(fixed_dims, fixed_values)])
+                ax.set_title(f'Res. eq{residual_idx+1} at {fixed_str}')
+            else:
+                ax.set_title(f'Residual eq{residual_idx+1}')
+        else:
+            ax.text(0.5, 0.5, f'Cannot plot {n_free}D (max 2D)',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'Residual eq{residual_idx+1}')
     
     def _update_figure(self, fig, axes, n_points=200):
         """Update existing figure with current data."""
@@ -1147,8 +1308,17 @@ class BaseTrainer(ABC):
         
         # Plot regions (for any dimension)
         regions = getattr(self, '_plot_regions', [])
+        n_outputs = self.problem.n_outputs
         for r, region in enumerate(regions):
-            if f'region_{r}' in axes:
+            # Check if we have per-output region axes (3D+ case)
+            if f'region_{r}_0' in axes:
+                for i in range(n_outputs):
+                    if f'region_{r}_{i}' in axes:
+                        self._plot_region_nd(axes[f'region_{r}_{i}'], i, region, n_points)
+                    if f'region_res_{r}_{i}' in axes:
+                        self._plot_region_residuals_nd(axes[f'region_res_{r}_{i}'], i, region, n_points)
+            elif f'region_{r}' in axes:
+                # 1D/2D case: single axis per region (plots first output)
                 self._plot_region_nd(axes[f'region_{r}'], 0, region, n_points)
         
         fig.tight_layout()
@@ -1175,14 +1345,13 @@ class BaseTrainer(ABC):
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
         
-        if is_notebook() and save_path is None:
+        if is_notebook():
             from IPython.display import display, update_display
             if display_handle is None:
                 display_handle = display(fig, display_id=True)
             else:
                 display_handle.update(fig)
-        elif save_path is None:
-            plt.show()
+        # Script mode: no interactive display, just save to file
         
         return fig, axes, display_handle
     
@@ -1225,7 +1394,7 @@ class BaseTrainer(ABC):
         
         Res = res.reshape(X0.shape)
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
-        im = ax.imshow(Res, extent=extent, origin='lower', aspect='auto', cmap='viridis')
+        im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', cmap='viridis')
         cbar = plt.colorbar(im, ax=ax, label='|Residual|')
         self._colorbars.append(cbar)
         

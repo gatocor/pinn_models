@@ -217,13 +217,15 @@ trainer.compile(
     learning_rate=1e-3,
     epochs=50000,
     batch_size=3000,  # Mini-batch to reduce GPU memory usage
-    print_each=100,
+    print_each=500,
     show_plots=True,
     show_subdomains=False,
     show_sampling_points=False,
     # 3D slices: plot x-y plane at different t values
     plot_regions=[
+        ((-x_border, x_border), (-y_border, y_border), 0.0),   # t=0.0 (initial)
         ((-1.0, 1.0), (-1.0, 1.0), 0.0),   # t=0.0 (initial)
+        ((-x_border, x_border), (-y_border, y_border), t_max),   # t=0.0 (initial)
         ((-1.0, 1.0), (-1.0, 1.0), t_max),  # t=t_max (final)
     ],
     plot_n_points=100,
