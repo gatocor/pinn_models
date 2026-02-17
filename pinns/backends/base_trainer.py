@@ -171,9 +171,125 @@ class BaseTrainer(ABC):
     
     def _after_compile_hook(self):
         """Sample initial training and test data. Override for additional behavior."""
-        self._sample_train_data()
+        resample_each = getattr(self, '_resample_each', 0)
+        pool_size = getattr(self, '_resample_pool_size', 10)
+        
+        if resample_each > 0 and pool_size > 1:
+            # Sample a larger pool for efficient resampling
+            self._sample_pool_data(pool_size)
+            # Select initial training data from pool
+            self._select_from_pool()
+        else:
+            self._sample_train_data()
+        
         if any(s > 0 for s in self.test_samples):
             self._sample_test_data()
+    
+    def _sample_pool_data(self, pool_multiplier: int):
+        """Sample a large pool for efficient resampling during training."""
+        self._train_pool = {}
+        samples_dict = self._list_to_dict_samples(self.train_samples)
+        for name, n in samples_dict.items():
+            if n > 0:
+                pool_n = n * pool_multiplier
+                np_data = self._sample_points_np(name, pool_n)
+                self._train_pool[name] = self._to_tensor(np_data)
+    
+    def _select_from_pool(self, rng=None):
+        """Select training data from pre-sampled pool (fast random indexing)."""
+        if not hasattr(self, '_train_pool') or self._train_pool is None:
+            # Fallback to full resampling
+            self._sample_train_data()
+            return
+        
+        if rng is None:
+            rng = self.rng
+        
+        self._train_data = {}
+        samples_dict = self._list_to_dict_samples(self.train_samples)
+        for name, n in samples_dict.items():
+            if n > 0 and name in self._train_pool:
+                pool = self._train_pool[name]
+                pool_size = len(pool)
+                # Random indices from pool
+                indices = rng.choice(pool_size, size=n, replace=False)
+                self._train_data[name] = self._index_tensor(pool, indices)
+    
+    @abstractmethod
+    def _index_tensor(self, tensor, indices):
+        """Index a tensor with numpy indices. Backend-specific."""
+        pass
+    
+    def _adaptive_resample(self, params_dict: Dict = None):
+        """
+        Perform adaptive resampling based on PDE residuals.
+        
+        Depending on adaptive_mode:
+        - "replace": Replace low-residual points with new points near high-residual locations.
+        - "add": Add new points near high-residual locations (growing sample count).
+        
+        Args:
+            params_dict: Parameters dict from _build_params(). If None, will be built.
+        """
+        if 'pde' not in self._train_data:
+            return
+        
+        if params_dict is None:
+            params_dict = self._build_params()
+        
+        # Get current PDE training points as numpy
+        x_pde = self._to_numpy(self._train_data['pde'])
+        n_points = len(x_pde)
+        
+        # For "add" mode, check if we've reached max samples
+        if self._adaptive_mode == "add" and self._adaptive_max_samples is not None:
+            if n_points >= self._adaptive_max_samples:
+                return  # Already at max, skip
+        
+        n_new = int(n_points * self._adaptive_ratio)
+        
+        # For "add" mode, cap n_new to not exceed max_samples
+        if self._adaptive_mode == "add" and self._adaptive_max_samples is not None:
+            n_new = min(n_new, self._adaptive_max_samples - n_points)
+        
+        if n_new < 1:
+            return
+        
+        # Compute residuals at current points
+        residuals = self._compute_residuals(x_pde, batch_size=self._batch_size)
+        
+        # Combine residuals from all equations (L2 norm)
+        total_residual = np.zeros(n_points)
+        for res in residuals:
+            total_residual += res.flatten() ** 2
+        total_residual = np.sqrt(total_residual)
+        
+        # Get indices of highest-residual points
+        high_res_indices = np.argsort(total_residual)[-n_new:]
+        high_res_points = x_pde[high_res_indices]
+        
+        # Compute sampling scale from domain size
+        domain = self.problem.domain
+        domain_scale = np.array([domain.xmax[d] - domain.xmin[d] for d in range(len(domain.xmin))])
+        std = self._adaptive_std * domain_scale
+        
+        # Sample new points near high-residual locations
+        new_points = high_res_points + self.rng.normal(0, std, size=high_res_points.shape)
+        
+        # Clip to domain bounds
+        for d in range(new_points.shape[1]):
+            new_points[:, d] = np.clip(new_points[:, d], domain.xmin[d], domain.xmax[d])
+        
+        if self._adaptive_mode == "add":
+            # Add new points to existing dataset
+            x_pde = np.concatenate([x_pde, new_points], axis=0)
+        else:
+            # Replace lowest-residual points with the new points
+            low_res_indices = np.argsort(total_residual)[:n_new]
+            x_pde[low_res_indices] = new_points
+        
+        # Update training data
+        self._train_data['pde'] = self._to_tensor(x_pde)
     
     # ==================== Compile ====================
     
@@ -193,6 +309,16 @@ class BaseTrainer(ABC):
         show_sampling_points=False,
         plot_regions: List[tuple] = None,
         plot_n_points: int = 200,
+        resample_each: int = 0,
+        resample_pool_size: int = 10,
+        pool_refresh_each: int = 0,
+        # Adaptive sampling parameters
+        adaptive_sampling: bool = False,
+        adaptive_each: int = 100,
+        adaptive_ratio: float = 0.5,
+        adaptive_std: float = 0.1,
+        adaptive_mode: str = "replace",
+        adaptive_max_samples: int = None,
         # L-BFGS specific parameters
         lbfgs_max_iter: int = 5,
         lbfgs_history_size: int = 50,
@@ -217,6 +343,15 @@ class BaseTrainer(ABC):
             show_sampling_points: Show sampling points in plots.
             plot_regions: List of zoom regions for additional plots.
             plot_n_points: Number of points for plotting.
+            resample_each: Resample collocation points every N epochs (0 = never).
+            resample_pool_size: Pool multiplier for efficient resampling (default 10 = pool is 10x training samples).
+            pool_refresh_each: Refresh entire pool with new samples every N epochs (0 = never). Use when pool_size * training_samples < epochs.
+            adaptive_sampling: Enable adaptive sampling based on residuals (default: False).
+            adaptive_each: Perform adaptive resampling every N epochs (default: 100).
+            adaptive_ratio: Fraction of points to add/replace with high-residual neighbors (default: 0.5).
+            adaptive_std: Standard deviation for sampling near high-residual points, as fraction of domain size (default: 0.1).
+            adaptive_mode: "replace" (replace low-residual points) or "add" (grow sample count). Default: "replace".
+            adaptive_max_samples: Maximum PDE samples when mode="add" (None = no limit). Prevents OOM.
             lbfgs_max_iter: Max iterations per L-BFGS step (default: 5).
             lbfgs_history_size: History size for L-BFGS (default: 50).
             lbfgs_tolerance: Tolerance for gradient convergence (default: 1e-9).
@@ -289,6 +424,17 @@ class BaseTrainer(ABC):
         self._plot_regions = plot_regions if plot_regions is not None else []
         self._plot_n_points = plot_n_points
         self._batch_size = batch_size
+        self._resample_each = resample_each
+        self._resample_pool_size = resample_pool_size
+        self._pool_refresh_each = pool_refresh_each
+        
+        # Adaptive sampling parameters
+        self._adaptive_sampling = adaptive_sampling
+        self._adaptive_each = adaptive_each
+        self._adaptive_ratio = adaptive_ratio
+        self._adaptive_std = adaptive_std
+        self._adaptive_mode = adaptive_mode
+        self._adaptive_max_samples = adaptive_max_samples
         
         # Backend-specific hook (e.g., presampling in JAX)
         self._after_compile_hook()
@@ -521,6 +667,75 @@ class BaseTrainer(ABC):
         
         return total_loss, losses
     
+    def _compute_total_loss_batched(self, data: Dict, params_dict: Dict[str, Any], 
+                                     weights_dict: Dict, batch_size: int = 1000):
+        """
+        Compute total weighted loss from data dict using batched evaluation.
+        
+        This avoids OOM when computing metrics on large datasets by chunking
+        the computation and averaging results.
+        
+        Args:
+            data: Dict with 'pde' and BC name keys mapping to input tensors
+            params_dict: Parameters dict from _build_params()
+            weights_dict: Dict mapping loss names to weights
+            batch_size: Size of each batch for evaluation
+            
+        Returns:
+            Tuple of (total_loss, losses_dict) as Python floats
+        """
+        # Check if batching is needed
+        max_size = max(len(v) for v in data.values()) if data else 0
+        if max_size <= batch_size:
+            # Small enough to compute directly
+            total, losses = self._compute_total_loss(data, params_dict, weights_dict)
+            return float(total), {k: float(v) if hasattr(v, '__float__') else v for k, v in losses.items()}
+        
+        # Batched computation: accumulate weighted sum of losses
+        n_batches = (max_size + batch_size - 1) // batch_size
+        accumulated_losses = {}
+        total_points_per_key = {}
+        
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, max_size)
+            
+            # Create batch data
+            batch_data = {}
+            for name, tensor in data.items():
+                n = len(tensor)
+                b_start = min(start_idx, n)
+                b_end = min(end_idx, n)
+                if b_end > b_start:
+                    batch_data[name] = self._index_tensor(tensor, list(range(b_start, b_end)))
+                    total_points_per_key[name] = total_points_per_key.get(name, 0) + (b_end - b_start)
+            
+            if not batch_data:
+                continue
+            
+            # Compute loss for this batch
+            batch_total, batch_losses = self._compute_total_loss(batch_data, params_dict, weights_dict)
+            
+            # Accumulate (weighted by batch size for proper averaging)
+            batch_n = end_idx - start_idx
+            for name, val in batch_losses.items():
+                if name == 'pde_individual' or name == 'bcs':
+                    continue  # Skip list/tuple values
+                if hasattr(val, '__float__'):
+                    if name not in accumulated_losses:
+                        accumulated_losses[name] = 0.0
+                    accumulated_losses[name] += float(val) * batch_n
+        
+        # Average by total points
+        final_losses = {}
+        total_loss = 0.0
+        for name, acc_val in accumulated_losses.items():
+            n_points = total_points_per_key.get('pde', max_size)  # Use PDE points for averaging
+            final_losses[name] = acc_val / n_points if n_points > 0 else 0.0
+            total_loss += final_losses[name]
+        
+        return total_loss, final_losses
+
     def _compute_residuals(self, x_np: np.ndarray, batch_size: Optional[int] = None) -> List[np.ndarray]:
         """
         Compute PDE residuals at given points.

@@ -37,7 +37,7 @@ cut_border_y = 0.04
 cut_border_sigma = 0.005
 
 w = 0.2
-sigma_cut_sampling = 0.2
+sigma_cut_sampling = 0.5
 
 h_star = k_p / k_d
 
@@ -179,8 +179,10 @@ def output_transform(X_in, Y, params):
     sym_x = s_x * jnp.tanh(x) ** 2
     sym_y = s_y * jnp.tanh(y) ** 2
     # This just if you really want to force the velocity to be zero at t=0
-    vx = t * sym_x * vx_hat
-    vy = t * sym_y * vy_hat
+    # vx = t * sym_x * vx_hat
+    # vy = t * sym_y * vy_hat
+    vx = sym_x * vx_hat
+    vy = sym_y * vy_hat
 
     return jnp.hstack((h, vx, vy))
 
@@ -205,7 +207,7 @@ trainer = pinns.Trainer(problem, network)
 
 trainer.compile(
     train_samples={
-        "pde": 10000
+        "pde": 100000
     },
     test_samples={
         "pde": 2000
@@ -216,7 +218,16 @@ trainer.compile(
     optimizer="adam",
     learning_rate=1e-3,
     epochs=50000,
-    batch_size=3000,  # Mini-batch to reduce GPU memory usage
+    batch_size=10000,             # Mini-batch to reduce GPU memory usage
+    resample_each=500,
+    resample_pool_size=1,
+    pool_refresh_each=500,
+    adaptive_sampling=False,       # Enable adaptive sampling
+    adaptive_mode="replace",      # "replace" (default): replace low-residual points with new samples
+    adaptive_each=100,             # Resample every 100 epochs
+    adaptive_ratio=0.2,           # Replace 20% of points with low residuals
+    adaptive_std=0.01,            # Sample near high-residual points (1% of domain size)
+    adaptive_max_samples=100000,  # Cap at 50k to prevent OOM
     print_each=500,
     show_plots=True,
     show_subdomains=False,

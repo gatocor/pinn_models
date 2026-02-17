@@ -85,16 +85,19 @@ class Trainer(BaseTrainer):
     
     def _after_compile_hook(self):
         """Sample data and precompute FBPINN sparse data if applicable."""
-        # Call parent to sample train/test data
+        # Call parent to sample train/test data (or pool)
         super()._after_compile_hook()
         
         # Precompute sparse FBPINN data if network is FBPINN
-        # Skip when batching is enabled (indices don't match batch slices)
+        # Skip when batching or resampling is enabled (indices change)
         use_batching = self._batch_size is not None and self._batch_size > 0
-        if self._use_sparse_fbpinn and isinstance(self.network, FBPINN) and not use_batching:
+        resample_each = getattr(self, '_resample_each', 0)
+        use_resampling = resample_each > 0
+        
+        if self._use_sparse_fbpinn and isinstance(self.network, FBPINN) and not use_batching and not use_resampling:
             self._precompute_sparse_data()
-        elif use_batching:
-            # Clear any precomputed sparse data when batching
+        elif use_batching or use_resampling:
+            # Clear any precomputed sparse data when batching or resampling
             self._precomputed_pde = None
             self._precomputed_bcs = {}
     
@@ -127,6 +130,10 @@ class Trainer(BaseTrainer):
     def _to_numpy(self, tensor) -> np.ndarray:
         """Convert JAX array to numpy."""
         return np.array(tensor)
+    
+    def _index_tensor(self, tensor, indices):
+        """Index a JAX tensor with numpy indices."""
+        return tensor[jnp.array(indices)]
 
     # ==================== Residual (Abstract Implementation) ====================
     
@@ -415,17 +422,61 @@ class Trainer(BaseTrainer):
             if needs_recreation:
                 self._fig, self._axes = self._create_figure()
         
+        # Initialize RNG key for shuffling
+        shuffle_key = jax.random.PRNGKey(self.rng.integers(0, 2**31))
+        
+        # Get resample interval and check if using pool
+        resample_each = getattr(self, '_resample_each', 0)
+        pool_refresh_each = getattr(self, '_pool_refresh_each', 0)
+        has_pool = hasattr(self, '_train_pool') and self._train_pool is not None
+        pool_size = getattr(self, '_resample_pool_size', 10)
+        
+        # Adaptive sampling parameters
+        adaptive_sampling = getattr(self, '_adaptive_sampling', False)
+        adaptive_each = getattr(self, '_adaptive_each', 100)
+        
         for epoch in range(epochs):
             epoch_start = time.time()
             global_epoch = start_epoch + epoch
             
+            # Refresh pool with fresh samples if interval reached
+            if pool_refresh_each > 0 and has_pool and epoch > 0 and epoch % pool_refresh_each == 0:
+                self._sample_pool_data(pool_size)
+            
+            # Resample collocation points if interval reached
+            if resample_each > 0 and epoch > 0 and epoch % resample_each == 0:
+                if has_pool:
+                    # Fast: select from pre-sampled pool
+                    self._select_from_pool()
+                else:
+                    # Slow: full resampling
+                    self._sample_train_data()
+                    if any(s > 0 for s in self.test_samples):
+                        self._sample_test_data()
+            
+            # Adaptive resampling based on residuals
+            if adaptive_sampling and epoch > 0 and epoch % adaptive_each == 0:
+                self._adaptive_resample(params_dict)
+                # Recalculate n_batches if dataset size changed (adaptive_mode="add")
+                if use_batching and getattr(self, '_adaptive_mode', 'replace') == 'add':
+                    n_batches = self._get_n_batches()
+            
             if use_batching:
+                # Shuffle data at the start of each epoch
+                shuffle_key, subkey = jax.random.split(shuffle_key)
+                shuffled_train_data = {}
+                for name, data in self._train_data.items():
+                    n_points = len(data)
+                    perm = jax.random.permutation(subkey, n_points)
+                    shuffled_train_data[name] = data[perm]
+                    subkey, _ = jax.random.split(subkey)  # New key for next data array
+                
                 # Mini-batch training
                 epoch_loss = 0.0
                 for batch_idx in range(n_batches):
                     # Create batch data
                     batch_data = {}
-                    for name, data in self._train_data.items():
+                    for name, data in shuffled_train_data.items():
                         n_points = len(data)
                         start_idx, end_idx = self._get_batch_indices(n_points, batch_idx, n_batches)
                         batch_data[name] = data[start_idx:end_idx]
@@ -457,20 +508,26 @@ class Trainer(BaseTrainer):
             if print_each > 0 and (epoch % print_each == 0 or epoch == epochs - 1):
                 elapsed = time.time() - start_time
                 
-                _, individual_losses = self._compute_total_loss(self._train_data, params_dict, weights)
+                # Compute losses on FULL training data for fair metrics (batched to avoid OOM)
+                metrics_batch_size = self._batch_size if self._batch_size and self._batch_size > 0 else 1000
+                full_train_loss, individual_losses = self._compute_total_loss_batched(
+                    self._train_data, params_dict, weights, batch_size=metrics_batch_size
+                )
                 pde_loss = float(individual_losses.get('pde', 0.0))
-                bc_losses = [float(individual_losses[name]) for name in self._train_data.keys() if name != 'pde']
+                bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde']
                 
                 self.history['epoch'].append(global_epoch)
-                self.history['train_loss'].append(float(loss))
-                self.history['loss'].append(float(loss))
+                self.history['train_loss'].append(float(full_train_loss))
+                self.history['loss'].append(float(full_train_loss))
                 self.history['loss_pde'].append(pde_loss)
                 self.history['loss_bcs'].append(bc_losses)
                 
                 # Test loss (if test data available)
                 if any(s > 0 for s in self.test_samples) and self._test_data:
                     test_weights = {k: 1.0 for k in self._test_data.keys()}
-                    test_total, _ = self._compute_total_loss(self._test_data, params_dict, test_weights)
+                    test_total, _ = self._compute_total_loss_batched(
+                        self._test_data, params_dict, test_weights, batch_size=metrics_batch_size
+                    )
                     self.history['test_loss'].append(float(test_total))
                 
                 if self.problem.solution is not None:
@@ -484,10 +541,12 @@ class Trainer(BaseTrainer):
                 )
                 
                 msg = (f"Epoch {epoch}/{epochs + start_epoch} | "
-                       f"Loss: {loss:.6f} | "
+                       f"Train Loss: {full_train_loss:.6f} | "
                        f"PDE: {pde_loss:.2e} | "
                        f"BCs: [{bc_losses_str}] | "
                        f"Time: {elapsed:.1f}s")
+                if self.history['test_loss']:
+                    msg += f" | Test Loss: {self.history['test_loss'][-1]:.2e}"
                 if self.problem.solution is not None:
                     msg += f" | Error: {self.history['solution_error'][-1]:.2e}"
                 print(msg)
@@ -586,9 +645,13 @@ class Trainer(BaseTrainer):
             if print_each > 0 and (epoch % print_each == 0 or epoch == epochs - 1):
                 elapsed = time.time() - start_time
                 
-                _, individual_losses = self._compute_total_loss(self._train_data, params_dict, weights)
+                # Use batched loss computation for individual losses (avoid OOM)
+                metrics_batch_size = 1000  # L-BFGS uses full batch but metrics can be batched
+                _, individual_losses = self._compute_total_loss_batched(
+                    self._train_data, params_dict, weights, batch_size=metrics_batch_size
+                )
                 pde_loss = float(individual_losses.get('pde', 0.0))
-                bc_losses = [float(individual_losses[name]) for name in self._train_data.keys() if name != 'pde']
+                bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde']
                 
                 self.history['epoch'].append(global_epoch)
                 self.history['train_loss'].append(float(loss))
@@ -599,7 +662,9 @@ class Trainer(BaseTrainer):
                 # Test loss
                 if any(s > 0 for s in self.test_samples) and self._test_data:
                     test_weights = {k: 1.0 for k in self._test_data.keys()}
-                    test_total, _ = self._compute_total_loss(self._test_data, params_dict, test_weights)
+                    test_total, _ = self._compute_total_loss_batched(
+                        self._test_data, params_dict, test_weights, batch_size=metrics_batch_size
+                    )
                     self.history['test_loss'].append(float(test_total))
                 
                 if self.problem.solution is not None:
@@ -613,10 +678,12 @@ class Trainer(BaseTrainer):
                 )
                 
                 msg = (f"Epoch {epoch}/{epochs + start_epoch} | "
-                       f"Loss: {loss:.6f} | "
+                       f"Train Loss: {loss:.6f} | "
                        f"PDE: {pde_loss:.2e} | "
                        f"BCs: [{bc_losses_str}] | "
                        f"Time: {elapsed:.1f}s")
+                if self.history['test_loss']:
+                    msg += f" | Test Loss: {self.history['test_loss'][-1]:.2e}"
                 if self.problem.solution is not None:
                     msg += f" | Error: {self.history['solution_error'][-1]:.2e}"
                 print(msg)
