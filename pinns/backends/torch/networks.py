@@ -1,8 +1,157 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Callable
 from pinns.domain import DomainCubicPartition
+
+
+class FourierFeatures:
+    """
+    Random Fourier Feature encoding to mitigate spectral bias.
+    
+    Maps input coordinates into high-frequency signals before passing through MLP.
+    Based on Tancik et al. "Fourier Features Let Networks Learn High Frequency
+    Functions in Low Dimensional Domains" (NeurIPS 2020).
+    
+    The encoding γ: R^d → R^(2m) is defined by:
+        γ(x) = [cos(2π B x), sin(2π B x)]
+    where B ∈ R^(m×d) has entries sampled from N(0, σ²).
+    
+    Example:
+        fourier = FourierFeatures(input_dim=3, n_features=128, sigma=10.0)
+        # Network input will be 2*128 = 256 features
+        model = FNN([256, 64, 1], feature_encoding=fourier)
+    
+    Attributes:
+        B: The random projection matrix of shape (n_features, input_dim)
+        output_dim: Dimension of encoded output (2*n_features or 2*n_features + input_dim)
+    """
+    
+    def __init__(self, 
+                 input_dim: int, 
+                 n_features: int, 
+                 sigma: float = 1.0, 
+                 seed: int = 0,
+                 include_input: bool = False):
+        """
+        Initialize Fourier feature encoding.
+        
+        Args:
+            input_dim: Dimension of input coordinates (e.g., 2 for 2D, 3 for 3D)
+            n_features: Number of Fourier features (output will be 2*n_features)
+            sigma: Standard deviation for sampling B matrix. Higher values = higher
+                   frequencies. Typical values: 1-10 for normalized inputs.
+            seed: Random seed for reproducible B matrix
+            include_input: If True, concatenate original input to Fourier features.
+                          Output dim becomes 2*n_features + input_dim.
+        """
+        self.input_dim = input_dim
+        self.n_features = n_features
+        self.sigma = sigma
+        self.include_input = include_input
+        
+        # Generate random B matrix: (n_features, input_dim)
+        # Entries sampled from N(0, σ²)
+        torch.manual_seed(seed)
+        self.B = torch.randn(n_features, input_dim) * sigma
+        self._device = 'cpu'
+        
+        # Output dimension
+        self.output_dim = 2 * n_features + (input_dim if include_input else 0)
+    
+    def to(self, device):
+        """Move B matrix to specified device."""
+        self.B = self.B.to(device)
+        self._device = device
+        return self
+    
+    def __call__(self, x: torch.Tensor, params: Optional[Dict] = None) -> torch.Tensor:
+        """
+        Apply Fourier feature encoding.
+        
+        Args:
+            x: Input tensor of shape (batch_size, input_dim)
+            params: Ignored (for API compatibility with input_transform)
+        
+        Returns:
+            Encoded tensor of shape (batch_size, output_dim)
+        """
+        # Ensure B is on same device as x
+        if self.B.device != x.device:
+            self.B = self.B.to(x.device)
+        
+        # x: (batch, input_dim)
+        # B: (n_features, input_dim)
+        # Bx = x @ B.T: (batch, n_features)
+        Bx = x @ self.B.T
+        
+        # γ(x) = [cos(2π Bx), sin(2π Bx)]
+        cos_features = torch.cos(2 * np.pi * Bx)
+        sin_features = torch.sin(2 * np.pi * Bx)
+        features = torch.cat([cos_features, sin_features], dim=-1)
+        
+        # Optionally include original input
+        if self.include_input:
+            features = torch.cat([x, features], dim=-1)
+        
+        return features
+    
+    def transform(self, x: torch.Tensor, params: Optional[Dict] = None) -> torch.Tensor:
+        """Alias for __call__ for explicit usage."""
+        return self.__call__(x, params)
+
+
+class LinearRWF(nn.Module):
+    """
+    Linear layer with Random Weight Factorization (RWF).
+    
+    Implements W = diag(exp(s)) · V where s and V are trainable.
+    Based on Wang et al. "On the eigenvector bias of Fourier feature networks".
+    
+    Args:
+        in_features: Number of input features
+        out_features: Number of output features
+        rwf_mu: Mean for initializing s from N(mu, sigma*I). Recommended: 0.5 or 1.0
+        rwf_sigma: Std for initializing s from N(mu, sigma*I). Recommended: 0.1
+    """
+    
+    def __init__(self, in_features: int, out_features: int, 
+                 rwf_mu: float = 0.5, rwf_sigma: float = 0.1):
+        super(LinearRWF, self).__init__()
+        
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rwf_mu = rwf_mu
+        self.rwf_sigma = rwf_sigma
+        
+        # V matrix: (out_features, in_features) - initialized with Glorot
+        self.V = nn.Parameter(torch.empty(out_features, in_features))
+        
+        # s vector: (out_features,) - initialized from N(mu, sigma*I)
+        self.s = nn.Parameter(torch.empty(out_features))
+        
+        # Bias
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        
+        self._reset_parameters()
+    
+    def _reset_parameters(self):
+        """Initialize parameters."""
+        # V: Glorot/Xavier initialization
+        nn.init.xavier_normal_(self.V)
+        
+        # s: N(mu, sigma*I)
+        nn.init.normal_(self.s, mean=self.rwf_mu, std=self.rwf_sigma)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass: y = (diag(exp(s)) · V) @ x + b"""
+        # Compute W = diag(exp(s)) · V
+        # exp(s): (out_features,) -> (out_features, 1) for broadcasting
+        W = torch.exp(self.s).unsqueeze(1) * self.V  # (out_features, in_features)
+        
+        # Linear transform: y = x @ W.T + b
+        return torch.nn.functional.linear(x, W, self.bias)
+
 
 class FNN(nn.Module):
     """
@@ -13,38 +162,20 @@ class FNN(nn.Module):
     
     Args:
         layer_sizes (list): List of integers specifying the size of each layer.
-                           First element is input size, last element is output size.
-                           Example: [2, 64, 64, 32, 1] creates a network with:
-                           - Input layer: 2 features
-                           - Hidden layers: 64, 64, 32 neurons
-                           - Output layer: 1 feature
-        activation (nn.Module or str): Activation function to use between layers.
-                                       Can be a string ('relu', 'tanh', 'sigmoid', 'gelu', 'silu')
-                                       or an nn.Module instance.
-                                       Default: 'tanh'
-        output_activation (nn.Module or None): Optional activation for the output layer.
-                                               Default: None (no activation)
-        normalize_input (bool): Whether to normalize inputs. Bounds set by Trainer. Default: True
-        unnormalize_output (bool): Whether to unnormalize outputs. Bounds set by Trainer. Default: True
+        activation (nn.Module or str): Activation function. Default: 'tanh'
+        output_activation (nn.Module or None): Optional activation for output layer. Default: None
+        normalize_input (bool): Whether to normalize inputs. Default: True
+        unnormalize_output (bool): Whether to unnormalize outputs. Default: True
         input_transform (callable or None): Optional transformation applied BEFORE normalization.
-                                            Function signature: f(x) -> x_transformed
-                                            where x is the input tensor.
-                                            Useful for enforcing symmetries (e.g., f(x) = |x| for even functions).
-                                            Example: lambda x: torch.abs(x)  # Even symmetry
-                                            Default: None
         output_transform (callable or None): Optional transformation applied after unnormalization.
-                                             Function signature: f(x, y, params) -> y_transformed
-                                             where x is the original input, y is the network output,
-                                             and params is a dict passed during forward.
-                                             Useful for implementing hard constraints.
-                                             Example: lambda x, y, p: x[:, 0:1] * y  # y=0 at x=0
-                                             Default: None
-        seed (int): Random seed for weight initialization. If None, uses current RNG state. Default: None
+        feature_encoding: Optional feature encoding (e.g., FourierFeatures)
+        seed (int): Random seed for weight initialization. Default: None
     """
     
     def __init__(self, layer_sizes, activation='tanh', output_activation=None,
                  normalize_input=True, unnormalize_output=True, 
-                 input_transform=None, output_transform=None, seed=None):
+                 input_transform=None, output_transform=None, 
+                 feature_encoding=None, seed=None):
         super(FNN, self).__init__()
         
         if len(layer_sizes) < 2:
@@ -57,6 +188,7 @@ class FNN(nn.Module):
         self.unnormalize_output = unnormalize_output
         self.input_transform = input_transform
         self.output_transform = output_transform
+        self.feature_encoding = feature_encoding
         self.seed = seed
         
         # Input normalization parameters (set by Trainer)
@@ -152,6 +284,10 @@ class FNN(nn.Module):
         # Normalize input
         x = self._normalize_input(x)
         
+        # Apply feature encoding (e.g., Fourier features) after normalization
+        if self.feature_encoding is not None:
+            x = self.feature_encoding(x, params)
+        
         for i, layer in enumerate(self.layers[:-1]):
             x = layer(x)
             x = self.activation(x)
@@ -188,6 +324,414 @@ class FNN(nn.Module):
                                    dtype=next(self.parameters()).dtype)
             y = self.forward(x_tensor, params_dict)
             return y.cpu().numpy()
+
+
+class WFFNN(nn.Module):
+    """
+    Weight-Factorized Fully-connected Neural Network for PyTorch.
+    
+    Uses Random Weight Factorization (RWF): W = diag(exp(s)) · V
+    Based on Wang et al. "On the eigenvector bias of Fourier feature networks".
+    
+    Recommended settings: rwf_mu=0.5 or 1.0, rwf_sigma=0.1
+    
+    Args:
+        layer_sizes (list): List of integers specifying the size of each layer.
+        activation (nn.Module or str): Activation function. Default: 'tanh'
+        output_activation (nn.Module or None): Optional output activation. Default: None
+        normalize_input (bool): Whether to normalize inputs. Default: True
+        unnormalize_output (bool): Whether to unnormalize outputs. Default: True
+        input_transform (callable or None): Optional transformation before normalization.
+        output_transform (callable or None): Optional transformation after unnormalization.
+        feature_encoding: Optional feature encoding (e.g., FourierFeatures)
+        rwf_mu (float): Mean for RWF s initialization. Recommended: 0.5 or 1.0
+        rwf_sigma (float): Std for RWF s initialization. Recommended: 0.1
+        seed (int): Random seed for weight initialization. Default: None
+    """
+    
+    def __init__(self, layer_sizes, activation='tanh', output_activation=None,
+                 normalize_input=True, unnormalize_output=True, 
+                 input_transform=None, output_transform=None, 
+                 feature_encoding=None, rwf_mu=0.5, rwf_sigma=0.1, seed=None):
+        super(WFFNN, self).__init__()
+        
+        if len(layer_sizes) < 2:
+            raise ValueError("layer_sizes must have at least 2 elements (input and output sizes)")
+        
+        self.layer_sizes = layer_sizes
+        self.activation = self._get_activation(activation)
+        self.output_activation = self._get_activation(output_activation) if output_activation else None
+        self.normalize_input = normalize_input
+        self.unnormalize_output = unnormalize_output
+        self.input_transform = input_transform
+        self.output_transform = output_transform
+        self.feature_encoding = feature_encoding
+        self.rwf_mu = rwf_mu
+        self.rwf_sigma = rwf_sigma
+        self.seed = seed
+        
+        # Input normalization parameters (set by Trainer)
+        self.register_buffer('input_min', None)
+        self.register_buffer('input_max', None)
+        
+        # Output unnormalization parameters (set by Trainer)
+        self.register_buffer('output_min', None)
+        self.register_buffer('output_max', None)
+        
+        # Build layers with RWF
+        layers = []
+        for i in range(len(layer_sizes) - 1):
+            layers.append(LinearRWF(layer_sizes[i], layer_sizes[i + 1], 
+                                   rwf_mu=rwf_mu, rwf_sigma=rwf_sigma))
+        
+        self.layers = nn.ModuleList(layers)
+    
+    def set_input_range(self, xmin, xmax):
+        """Set input normalization range. Called by Trainer."""
+        self.input_min = torch.as_tensor(xmin, dtype=torch.float32, device=self.layers[0].V.device)
+        self.input_max = torch.as_tensor(xmax, dtype=torch.float32, device=self.layers[0].V.device)
+    
+    def set_output_range(self, ymin, ymax):
+        """Set output unnormalization range. Called by Trainer."""
+        self.output_min = torch.as_tensor(ymin, dtype=torch.float32, device=self.layers[0].V.device)
+        self.output_max = torch.as_tensor(ymax, dtype=torch.float32, device=self.layers[0].V.device)
+    
+    def _get_activation(self, activation):
+        """Convert activation string to nn.Module or return the module directly."""
+        if isinstance(activation, nn.Module):
+            return activation
+        
+        activation_dict = {
+            'relu': nn.ReLU(),
+            'tanh': nn.Tanh(),
+            'sigmoid': nn.Sigmoid(),
+            'gelu': nn.GELU(),
+            'silu': nn.SiLU(),
+            'leaky_relu': nn.LeakyReLU(),
+            'elu': nn.ELU(),
+            'softplus': nn.Softplus(),
+        }
+        
+        if isinstance(activation, str):
+            activation_lower = activation.lower()
+            if activation_lower in activation_dict:
+                return activation_dict[activation_lower]
+            else:
+                raise ValueError(f"Unknown activation: {activation}. "
+                               f"Available: {list(activation_dict.keys())}")
+        
+        raise ValueError(f"Activation must be a string or nn.Module, got {type(activation)}")
+    
+    def _normalize_input(self, x):
+        """Normalize input from [input_min, input_max] to [-1, 1]."""
+        if self.input_min is None or not self.normalize_input:
+            return x
+        return 2.0 * (x - self.input_min) / (self.input_max - self.input_min + 1e-8) - 1.0
+    
+    def _unnormalize_output(self, y):
+        """Unnormalize output from [-1, 1] to [output_min, output_max]."""
+        if self.output_min is None or not self.unnormalize_output:
+            return y
+        return (y + 1.0) / 2.0 * (self.output_max - self.output_min) + self.output_min
+    
+    def forward(self, x, params=None):
+        """Forward pass through the network."""
+        x_original = x
+        
+        # Apply input transform (e.g., symmetry)
+        if self.input_transform is not None:
+            x = self.input_transform(x, params)
+        
+        # Normalize input
+        x = self._normalize_input(x)
+        
+        # Apply feature encoding
+        if self.feature_encoding is not None:
+            x = self.feature_encoding(x, params)
+        
+        # Hidden layers with RWF
+        for layer in self.layers[:-1]:
+            x = self.activation(layer(x))
+        
+        # Output layer
+        x = self.layers[-1](x)
+        
+        # Output activation
+        if self.output_activation is not None:
+            x = self.output_activation(x)
+        
+        # Unnormalize output
+        x = self._unnormalize_output(x)
+        
+        # Apply output transform
+        if self.output_transform is not None:
+            x = self.output_transform(x_original, x, params)
+        
+        return x
+    
+    def predict(self, x_np, params=None):
+        """Predict with numpy I/O."""
+        self.eval()
+        with torch.no_grad():
+            x_tensor = torch.tensor(x_np, device=self.layers[0].V.device, 
+                                   dtype=self.layers[0].V.dtype)
+            y = self.forward(x_tensor, params)
+            return y.cpu().numpy()
+
+
+
+class PirateNetBlock(nn.Module):
+    """
+    Single residual block for PirateNet.
+    
+    Each block has 3 dense layers with gating operations:
+    f = σ(W1·x + b1)
+    z1 = f ⊙ U + (1-f) ⊙ V
+    g = σ(W2·z1 + b2)
+    z2 = g ⊙ U + (1-g) ⊙ V
+    h = σ(W3·z2 + b3)
+    x_next = α·h + (1-α)·x
+    """
+    
+    def __init__(self, hidden_dim: int, activation='tanh'):
+        super(PirateNetBlock, self).__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.activation = self._get_activation(activation)
+        
+        # Three dense layers per block
+        self.dense1 = nn.Linear(hidden_dim, hidden_dim)
+        self.dense2 = nn.Linear(hidden_dim, hidden_dim)
+        self.dense3 = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Trainable α parameter (initialized to 0 for identity at init)
+        self.alpha = nn.Parameter(torch.zeros(1))
+        
+        self._initialize_weights()
+    
+    def _get_activation(self, activation):
+        activation_dict = {
+            'relu': nn.ReLU(),
+            'tanh': nn.Tanh(),
+            'sigmoid': nn.Sigmoid(),
+            'gelu': nn.GELU(),
+            'silu': nn.SiLU(),
+        }
+        if isinstance(activation, str):
+            return activation_dict.get(activation.lower(), nn.Tanh())
+        return activation
+    
+    def _initialize_weights(self):
+        """Glorot initialization for weights, zero for biases."""
+        for layer in [self.dense1, self.dense2, self.dense3]:
+            nn.init.xavier_normal_(layer.weight)
+            nn.init.zeros_(layer.bias)
+    
+    def forward(self, x: torch.Tensor, U: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        """Forward pass through one residual block."""
+        # First dense + gating
+        f = self.activation(self.dense1(x))
+        z1 = f * U + (1 - f) * V
+        
+        # Second dense + gating
+        g = self.activation(self.dense2(z1))
+        z2 = g * U + (1 - g) * V
+        
+        # Third dense
+        h = self.activation(self.dense3(z2))
+        
+        # Adaptive residual connection
+        x_next = self.alpha * h + (1 - self.alpha) * x
+        
+        return x_next
+
+
+class PirateNet(nn.Module):
+    """
+    Physics-Informed Residual AdapTivE Network (PirateNet) for PyTorch.
+    
+    A novel architecture that addresses initialization issues in PINNs by using
+    adaptive residual connections with trainable α parameters initialized to 0.
+    At initialization, the network acts as a linear combination of input embeddings.
+    
+    Based on Wang et al. "PirateNets: Physics-informed Deep Learning 
+    with Residual Adaptive Networks".
+    
+    Architecture:
+    1. Optional input embedding via feature_encoding (e.g., FourierFeatures)
+    2. Gate encodings: U = σ(W1·x + b1), V = σ(W2·x + b2)
+    3. L residual blocks, each with 3 dense layers and gating operations
+    4. Output layer
+    
+    Args:
+        input_dim: Dimension of input coordinates (before any feature encoding)
+        output_dim: Dimension of output
+        hidden_dim: Width of all hidden layers (must be consistent)
+        n_blocks: Number of residual blocks (default: 3). Total depth = 3*n_blocks.
+        activation: Activation function name (default: 'tanh')
+        normalize_input: Whether to normalize inputs to [-1, 1]
+        unnormalize_output: Whether to unnormalize outputs
+        input_transform: Optional symmetry transform
+        output_transform: Optional hard constraint transform
+        feature_encoding: Optional feature encoding (e.g., FourierFeatures)
+        seed: Random seed for initialization
+    
+    Example:
+        # Without Fourier features
+        model = PirateNet(input_dim=2, output_dim=1, hidden_dim=64, n_blocks=3)
+        
+        # With Fourier features (input_dim is original dimension, not encoded)
+        fourier = FourierFeatures(input_dim=2, n_features=64, sigma=1.0)
+        model = PirateNet(input_dim=2, output_dim=1, hidden_dim=64,
+                         feature_encoding=fourier)
+    """
+    
+    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int,
+                 n_blocks: int = 3, activation: str = 'tanh',
+                 normalize_input: bool = True, unnormalize_output: bool = True,
+                 input_transform=None, output_transform=None,
+                 feature_encoding=None, seed: int = None):
+        super(PirateNet, self).__init__()
+        
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+        self.n_blocks = n_blocks
+        self.normalize_input = normalize_input
+        self.unnormalize_output = unnormalize_output
+        self.input_transform = input_transform
+        self.output_transform = output_transform
+        self.feature_encoding = feature_encoding
+        self.seed = seed
+        
+        # Determine actual input dimension after feature encoding
+        if feature_encoding is not None and hasattr(feature_encoding, 'output_dim'):
+            actual_input_dim = feature_encoding.output_dim
+        else:
+            actual_input_dim = input_dim
+        
+        # For compatibility with FNN interface
+        self.layer_sizes = [input_dim, hidden_dim, output_dim]
+        
+        # Set seed if provided
+        if seed is not None:
+            torch.manual_seed(seed)
+        
+        # Input normalization parameters (set by Trainer)
+        self.register_buffer('input_min', None)
+        self.register_buffer('input_max', None)
+        self.register_buffer('output_min', None)
+        self.register_buffer('output_max', None)
+        
+        # U and V gate layers (use actual_input_dim after encoding)
+        self.U_layer = nn.Linear(actual_input_dim, hidden_dim)
+        self.V_layer = nn.Linear(actual_input_dim, hidden_dim)
+        
+        # Input projection to hidden_dim
+        self.input_projection = nn.Linear(actual_input_dim, hidden_dim)
+        
+        # Residual blocks
+        self.blocks = nn.ModuleList([
+            PirateNetBlock(hidden_dim, activation) for _ in range(n_blocks)
+        ])
+        
+        # Output layer
+        self.output_layer = nn.Linear(hidden_dim, output_dim)
+        
+        # Activation for U, V
+        self.activation = self._get_activation(activation)
+        
+        self._initialize_weights()
+    
+    def _get_activation(self, activation):
+        activation_dict = {
+            'relu': nn.ReLU(),
+            'tanh': nn.Tanh(),
+            'sigmoid': nn.Sigmoid(),
+            'gelu': nn.GELU(),
+            'silu': nn.SiLU(),
+        }
+        if isinstance(activation, str):
+            return activation_dict.get(activation.lower(), nn.Tanh())
+        return activation
+    
+    def _initialize_weights(self):
+        """Glorot initialization for weights, zero for biases."""
+        for layer in [self.U_layer, self.V_layer, self.input_projection, self.output_layer]:
+            nn.init.xavier_normal_(layer.weight)
+            nn.init.zeros_(layer.bias)
+    
+    def set_input_range(self, xmin, xmax):
+        """Set input normalization range. Called by Trainer."""
+        device = self.output_layer.weight.device
+        self.input_min = torch.as_tensor(xmin, dtype=torch.float32, device=device)
+        self.input_max = torch.as_tensor(xmax, dtype=torch.float32, device=device)
+    
+    def set_output_range(self, ymin, ymax):
+        """Set output unnormalization range. Called by Trainer."""
+        device = self.output_layer.weight.device
+        self.output_min = torch.as_tensor(ymin, dtype=torch.float32, device=device)
+        self.output_max = torch.as_tensor(ymax, dtype=torch.float32, device=device)
+    
+    def _normalize_input(self, x):
+        """Normalize input from [input_min, input_max] to [-1, 1]."""
+        if self.input_min is None or not self.normalize_input:
+            return x
+        return 2.0 * (x - self.input_min) / (self.input_max - self.input_min + 1e-8) - 1.0
+    
+    def _unnormalize_output(self, y):
+        """Unnormalize output from [-1, 1] to [output_min, output_max]."""
+        if self.output_min is None or not self.unnormalize_output:
+            return y
+        return (y + 1.0) / 2.0 * (self.output_max - self.output_min) + self.output_min
+    
+    def forward(self, x, params=None):
+        """Forward pass through PirateNet."""
+        x_original = x
+        
+        # Apply input transform (e.g., symmetry)
+        if self.input_transform is not None:
+            x = self.input_transform(x, params)
+        
+        # Normalize input
+        x = self._normalize_input(x)
+        
+        # Apply feature encoding if provided
+        if self.feature_encoding is not None:
+            x = self.feature_encoding(x, params)
+        
+        # Compute U and V gates
+        U = self.activation(self.U_layer(x))
+        V = self.activation(self.V_layer(x))
+        
+        # Project to hidden_dim
+        h = self.input_projection(x)
+        
+        # Apply residual blocks
+        for block in self.blocks:
+            h = block(h, U, V)
+        
+        # Output layer
+        y = self.output_layer(h)
+        
+        # Unnormalize output
+        y = self._unnormalize_output(y)
+        
+        # Apply output transform
+        if self.output_transform is not None:
+            y = self.output_transform(x_original, y, params)
+        
+        return y
+    
+    def predict(self, x_np, params=None):
+        """Predict with numpy I/O."""
+        self.eval()
+        with torch.no_grad():
+            x_tensor = torch.tensor(x_np, device=self.output_layer.weight.device,
+                                   dtype=self.output_layer.weight.dtype)
+            y = self.forward(x_tensor, params)
+            return y.cpu().numpy()
+
 
 class FBPINN(nn.Module):
     """

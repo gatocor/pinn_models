@@ -19,6 +19,12 @@ try:
 except ImportError:
     HAS_JAXOPT = False
 
+try:
+    from soap_jax import soap as soap_optimizer
+    HAS_SOAP = True
+except ImportError:
+    HAS_SOAP = False
+
 from ..base_trainer import BaseTrainer, is_notebook
 from .functional import set_context, clear_context, make_derivative_fn
 from .networks import FBPINN, FNN
@@ -58,12 +64,21 @@ class Trainer(BaseTrainer):
     # ==================== Optimizer ====================
     
     def _create_optimizer(self):
-        """Create the optimizer."""
+        """Create the optimizer with injectable hyperparameters for LR scheduling."""
+        lr_scheduler = getattr(self, '_lr_scheduler', None)
+        
         if self.optimizer_name == "adam":
+            if lr_scheduler is not None:
+                # Use inject_hyperparams to allow LR updates during training
+                return optax.inject_hyperparams(optax.adam)(learning_rate=self.learning_rate)
             return optax.adam(self.learning_rate)
         elif self.optimizer_name == "sgd":
+            if lr_scheduler is not None:
+                return optax.inject_hyperparams(optax.sgd)(learning_rate=self.learning_rate)
             return optax.sgd(self.learning_rate)
         elif self.optimizer_name == "rmsprop":
+            if lr_scheduler is not None:
+                return optax.inject_hyperparams(optax.rmsprop)(learning_rate=self.learning_rate)
             return optax.rmsprop(self.learning_rate)
         elif self.optimizer_name == "lbfgs":
             if not HAS_JAXOPT:
@@ -72,6 +87,24 @@ class Trainer(BaseTrainer):
                 )
             # Return None - L-BFGS solver is created per training run
             return None
+        elif self.optimizer_name == "soap":
+            if not HAS_SOAP:
+                raise ImportError(
+                    "SOAP requires soap_jax. Install with: pip install git+https://github.com/haydn-jones/SOAP_JAX"
+                )
+            # Get SOAP-specific parameters with defaults
+            soap_params = getattr(self, '_soap_params', {})
+            return soap_optimizer(
+                learning_rate=self.learning_rate,
+                b1=soap_params.get('b1', 0.95),
+                b2=soap_params.get('b2', 0.95),
+                shampoo_beta=soap_params.get('shampoo_beta', -1),
+                eps=soap_params.get('eps', 1e-8),
+                weight_decay=soap_params.get('weight_decay', 0.0),
+                precondition_frequency=soap_params.get('precondition_frequency', 10),
+                max_precond_dim=soap_params.get('max_precond_dim', 10000),
+                precondition_1d=soap_params.get('precondition_1d', False),
+            )
         else:
             raise ValueError(f"Unknown optimizer: {self.optimizer_name}")
     
@@ -435,9 +468,21 @@ class Trainer(BaseTrainer):
         adaptive_sampling = getattr(self, '_adaptive_sampling', False)
         adaptive_each = getattr(self, '_adaptive_each', 100)
         
+        # Learning rate scheduler
+        lr_scheduler = getattr(self, '_lr_scheduler', None)
+        
         for epoch in range(epochs):
             epoch_start = time.time()
             global_epoch = start_epoch + epoch
+            
+            # Update learning rate if scheduler is provided
+            if lr_scheduler is not None and self.optimizer_name != "lbfgs":
+                new_lr = lr_scheduler.lr(self.learning_rate, global_epoch)
+                # Update the hyperparameter in opt_state (inject_hyperparams stores it there)
+                # InjectHyperparamsState is immutable, so we need to create a new state
+                new_hyperparams = dict(self.opt_state.hyperparams)
+                new_hyperparams['learning_rate'] = new_lr
+                self.opt_state = self.opt_state._replace(hyperparams=new_hyperparams)
             
             # Refresh pool with fresh samples if interval reached
             if pool_refresh_each > 0 and has_pool and epoch > 0 and epoch % pool_refresh_each == 0:

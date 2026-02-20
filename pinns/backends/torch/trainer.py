@@ -220,11 +220,20 @@ class Trainer(BaseTrainer):
         adaptive_sampling = getattr(self, '_adaptive_sampling', False)
         adaptive_each = getattr(self, '_adaptive_each', 100)
         
+        # Learning rate scheduler
+        lr_scheduler = getattr(self, '_lr_scheduler', None)
+        
         for local_epoch in range(epochs):
             epoch = start_epoch + local_epoch
             internal = {'global_step': epoch, 'step': local_epoch}
             weights_dict = self._list_to_dict_weights(self.weights)
             params_dict = self._build_params(internal)
+            
+            # Update learning rate if scheduler is provided
+            if lr_scheduler is not None and self.optimizer_name != "lbfgs":
+                new_lr = lr_scheduler.lr(self.learning_rate, epoch)
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = new_lr
             
             # Refresh pool with fresh samples if interval reached
             if pool_refresh_each > 0 and has_pool and local_epoch > 0 and local_epoch % pool_refresh_each == 0:

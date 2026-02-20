@@ -37,6 +37,9 @@ _backend_classes = {}
 from .domain import DomainCubic, DomainCubicPartition, SubdomainInfo, bump
 from .problem import Problem
 
+# Learning rate schedulers (backend-agnostic)
+from .backends import LRScheduler, ExponentialDecay
+
 
 def _load_backend(name):
     """Load backend-specific classes."""
@@ -47,7 +50,7 @@ def _load_backend(name):
     if name == 'jax':
         try:
             from .backends.jax import (
-                FNN, FBPINN, 
+                FNN, WFFNN, PirateNet, FBPINN, FourierFeatures, DenseRWF,
                 derivative, gradient, laplacian, divergence,
                 Trainer
             )
@@ -58,14 +61,21 @@ def _load_backend(name):
             )
     else:
         from .backends.torch import (
-            FNN, FBPINN,
+            FNN, WFFNN, PirateNet, FBPINN, FourierFeatures, LinearRWF,
             derivative, gradient, laplacian, divergence,
             Trainer
         )
     
+    # Use backend-specific RWF layer
+    RWFLayer = DenseRWF if name == 'jax' else LinearRWF
+    
     return {
         'FNN': FNN,
+        'WFFNN': WFFNN,
+        'PirateNet': PirateNet,
         'FBPINN': FBPINN,
+        'FourierFeatures': FourierFeatures,
+        'RWFLayer': RWFLayer,
         'derivative': derivative,
         'gradient': gradient,
         'laplacian': laplacian,
@@ -114,7 +124,11 @@ BACKEND = _BACKEND
 
 # Export backend-specific classes at module level
 FNN = _backend_classes['FNN']
+WFFNN = _backend_classes['WFFNN']
+PirateNet = _backend_classes['PirateNet']
 FBPINN = _backend_classes['FBPINN']
+FourierFeatures = _backend_classes['FourierFeatures']
+RWFLayer = _backend_classes['RWFLayer']
 derivative = _backend_classes['derivative']
 gradient = _backend_classes['gradient']
 laplacian = _backend_classes['laplacian']
@@ -135,7 +149,11 @@ __all__ = [
     "bump",
     # Networks
     "FNN",
+    "WFFNN",
+    "PirateNet",
     "FBPINN",
+    "FourierFeatures",
+    "RWFLayer",
     # Problems
     "Problem",
     # Functional
@@ -145,4 +163,7 @@ __all__ = [
     "divergence",
     # Training
     "Trainer",
+    # Learning rate schedulers
+    "LRScheduler",
+    "ExponentialDecay",
 ]

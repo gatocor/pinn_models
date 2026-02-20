@@ -28,8 +28,12 @@ from .functional import (
 
 from .networks import (
     FNN,
+    WFFNN,
+    PirateNet,
     FBPINN,
     FBPINNModule,
+    FourierFeatures,
+    DenseRWF,
     create_fnn,
     create_fbpinn,
     get_activation
@@ -49,8 +53,12 @@ __all__ = [
     'DifferentialOperators',
     # Networks
     'FNN',
+    'WFFNN',
+    'PirateNet',
     'FBPINN',
     'FBPINNModule',
+    'FourierFeatures',
+    'DenseRWF',
     'create_fnn',
     'create_fbpinn',
     'get_activation',

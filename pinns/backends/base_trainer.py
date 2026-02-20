@@ -26,6 +26,85 @@ def is_notebook():
         return False
 
 
+# ==================== Learning Rate Schedulers ====================
+
+class LRScheduler(ABC):
+    """
+    Abstract base class for learning rate schedulers.
+    
+    Subclasses must implement the `lr` method that computes
+    the new learning rate given the base learning rate and current step.
+    """
+    
+    @abstractmethod
+    def lr(self, base_lr: float, step: int) -> float:
+        """
+        Compute the learning rate for a given step.
+        
+        Args:
+            base_lr: The initial/base learning rate
+            step: Current training step (epoch)
+            
+        Returns:
+            The adjusted learning rate
+        """
+        pass
+
+
+class ExponentialDecay(LRScheduler):
+    """
+    Exponential decay learning rate scheduler.
+    
+    Reduces learning rate by a factor of gamma every N steps.
+    
+    Formula:
+        new_lr = base_lr * gamma^(step // each_n_steps)
+    
+    Example:
+        scheduler = ExponentialDecay(gamma=0.9, each_n_steps=1000)
+        trainer.compile(lr_scheduler=scheduler, ...)
+        
+        # At step 0: lr = base_lr * 0.9^0 = base_lr
+        # At step 1000: lr = base_lr * 0.9^1 = 0.9 * base_lr
+        # At step 2000: lr = base_lr * 0.9^2 = 0.81 * base_lr
+    
+    Attributes:
+        gamma: Decay factor (0 < gamma < 1 for decay)
+        each_n_steps: Number of steps between decay applications
+    """
+    
+    def __init__(self, gamma: float = 0.9, each_n_steps: int = 1000):
+        """
+        Initialize exponential decay scheduler.
+        
+        Args:
+            gamma: Decay factor. Learning rate is multiplied by gamma 
+                   every each_n_steps. Typical values: 0.9, 0.95, 0.99.
+            each_n_steps: Number of steps between each decay application.
+        """
+        if gamma <= 0:
+            raise ValueError("gamma must be positive")
+        if each_n_steps <= 0:
+            raise ValueError("each_n_steps must be positive")
+        
+        self.gamma = gamma
+        self.each_n_steps = each_n_steps
+    
+    def lr(self, base_lr: float, step: int) -> float:
+        """
+        Compute learning rate with exponential decay.
+        
+        Args:
+            base_lr: The initial/base learning rate
+            step: Current training step (epoch)
+            
+        Returns:
+            new_lr = base_lr * gamma^(step // each_n_steps)
+        """
+        decay_count = step // self.each_n_steps
+        return base_lr * (self.gamma ** decay_count)
+
+
 class BaseTrainer(ABC):
     """
     Abstract base class for PINN trainers.
@@ -319,11 +398,15 @@ class BaseTrainer(ABC):
         adaptive_std: float = 0.1,
         adaptive_mode: str = "replace",
         adaptive_max_samples: int = None,
+        # Learning rate scheduler
+        lr_scheduler: Optional[LRScheduler] = None,
         # L-BFGS specific parameters
         lbfgs_max_iter: int = 5,
         lbfgs_history_size: int = 50,
         lbfgs_tolerance: float = 1e-9,
         lbfgs_line_search: str = "strong_wolfe",
+        # SOAP specific parameters
+        soap_params: Optional[Dict[str, Any]] = None,
     ):
         """
         Configure training parameters.
@@ -352,10 +435,20 @@ class BaseTrainer(ABC):
             adaptive_std: Standard deviation for sampling near high-residual points, as fraction of domain size (default: 0.1).
             adaptive_mode: "replace" (replace low-residual points) or "add" (grow sample count). Default: "replace".
             adaptive_max_samples: Maximum PDE samples when mode="add" (None = no limit). Prevents OOM.
+            lr_scheduler: Learning rate scheduler (e.g., ExponentialDecay). If None, constant learning rate.
             lbfgs_max_iter: Max iterations per L-BFGS step (default: 5).
             lbfgs_history_size: History size for L-BFGS (default: 50).
             lbfgs_tolerance: Tolerance for gradient convergence (default: 1e-9).
             lbfgs_line_search: Line search method - 'strong_wolfe' or None (default: 'strong_wolfe').
+            soap_params: SOAP optimizer parameters (JAX only). Dict with keys:
+                - b1: Adam's beta1 (default: 0.95)
+                - b2: Adam's beta2 (default: 0.95)
+                - shampoo_beta: Beta for preconditioner (-1 uses b2)
+                - eps: Numerical stability (default: 1e-8)
+                - weight_decay: Weight decay (default: 0.0)
+                - precondition_frequency: How often to update preconditioner (default: 10)
+                - max_precond_dim: Max preconditioner dimension (default: 10000)
+                - precondition_1d: Whether to precondition 1D params (default: False)
         """
         n_bcs = len(self.problem.boundary_conditions)
         expected_len = 1 + n_bcs
@@ -365,6 +458,10 @@ class BaseTrainer(ABC):
         self._lbfgs_history_size = lbfgs_history_size
         self._lbfgs_tolerance = lbfgs_tolerance
         self._lbfgs_line_search = lbfgs_line_search
+        
+        # Store SOAP parameters
+        old_soap_params = getattr(self, '_soap_params', None)
+        self._soap_params = soap_params if soap_params is not None else {}
         
         if train_samples is not None:
             train_samples = self._convert_dict_to_list(train_samples, 'train_samples')
@@ -398,6 +495,16 @@ class BaseTrainer(ABC):
         
         if learning_rate is not None and learning_rate != self.learning_rate:
             self.learning_rate = learning_rate
+            optimizer_changed = True
+        
+        # Set lr_scheduler BEFORE creating optimizer (affects inject_hyperparams)
+        old_scheduler = getattr(self, '_lr_scheduler', None)
+        self._lr_scheduler = lr_scheduler
+        if (lr_scheduler is not None) != (old_scheduler is not None):
+            optimizer_changed = True  # Scheduler presence changed, rebuild optimizer
+        
+        # Check if SOAP params changed
+        if soap_params is not None and soap_params != old_soap_params:
             optimizer_changed = True
         
         if self.optimizer is None or optimizer_changed:

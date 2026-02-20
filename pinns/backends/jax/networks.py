@@ -31,6 +31,143 @@ def get_activation(name: str) -> Callable:
     return activations[name.lower()]
 
 
+class FourierFeatures:
+    """
+    Random Fourier Feature encoding to mitigate spectral bias.
+    
+    Maps input coordinates into high-frequency signals before passing through MLP.
+    Based on Tancik et al. "Fourier Features Let Networks Learn High Frequency
+    Functions in Low Dimensional Domains" (NeurIPS 2020).
+    
+    The encoding γ: R^d → R^(2m) is defined by:
+        γ(x) = [cos(2π B x), sin(2π B x)]
+    where B ∈ R^(m×d) has entries sampled from N(0, σ²).
+    
+    JIT-compatible: B matrix is a constant JAX array created at initialization.
+    
+    Example:
+        fourier = FourierFeatures(input_dim=3, n_features=128, sigma=10.0)
+        # Network input will be 2*128 = 256 features
+        model = FNN([256, 64, 1], feature_encoding=fourier)
+    
+    Attributes:
+        B: The random projection matrix of shape (n_features, input_dim)
+        output_dim: Dimension of encoded output (2*n_features or 2*n_features + input_dim)
+    """
+    
+    def __init__(self, 
+                 input_dim: int, 
+                 n_features: int, 
+                 sigma: float = 1.0, 
+                 seed: int = 0,
+                 include_input: bool = False):
+        """
+        Initialize Fourier feature encoding.
+        
+        Args:
+            input_dim: Dimension of input coordinates (e.g., 2 for 2D, 3 for 3D)
+            n_features: Number of Fourier features (output will be 2*n_features)
+            sigma: Standard deviation for sampling B matrix. Higher values = higher
+                   frequencies. Typical values: 1-10 for normalized inputs.
+            seed: Random seed for reproducible B matrix
+            include_input: If True, concatenate original input to Fourier features.
+                          Output dim becomes 2*n_features + input_dim.
+        """
+        self.input_dim = input_dim
+        self.n_features = n_features
+        self.sigma = sigma
+        self.include_input = include_input
+        
+        # Generate random B matrix: (n_features, input_dim)
+        # Entries sampled from N(0, σ²)
+        key = jax.random.PRNGKey(seed)
+        self.B = jax.random.normal(key, (n_features, input_dim)) * sigma
+        
+        # Output dimension
+        self.output_dim = 2 * n_features + (input_dim if include_input else 0)
+    
+    def __call__(self, x: jnp.ndarray, params_dict: Optional[Dict] = None) -> jnp.ndarray:
+        """
+        Apply Fourier feature encoding.
+        
+        Args:
+            x: Input array of shape (batch_size, input_dim)
+            params_dict: Ignored (for API compatibility with input_transform)
+        
+        Returns:
+            Encoded array of shape (batch_size, output_dim)
+        """
+        # x: (batch, input_dim)
+        # B: (n_features, input_dim)
+        # Bx = x @ B.T: (batch, n_features)
+        Bx = x @ self.B.T
+        
+        # γ(x) = [cos(2π Bx), sin(2π Bx)]
+        cos_features = jnp.cos(2 * jnp.pi * Bx)
+        sin_features = jnp.sin(2 * jnp.pi * Bx)
+        features = jnp.concatenate([cos_features, sin_features], axis=-1)
+        
+        # Optionally include original input
+        if self.include_input:
+            features = jnp.concatenate([x, features], axis=-1)
+        
+        return features
+    
+    def transform(self, x: jnp.ndarray, params_dict: Optional[Dict] = None) -> jnp.ndarray:
+        """Alias for __call__ for explicit usage."""
+        return self.__call__(x, params_dict)
+
+
+class DenseRWF(nn.Module):
+    """
+    Dense layer with Random Weight Factorization (RWF).
+    
+    Implements W = diag(exp(s)) · V where s and V are trainable.
+    Based on Wang et al. "On the eigenvector bias of Fourier feature networks".
+    
+    Attributes:
+        features: Number of output features
+        rwf_mu: Mean for initializing s from N(mu, sigma*I). Recommended: 0.5 or 1.0
+        rwf_sigma: Std for initializing s from N(mu, sigma*I). Recommended: 0.1
+    """
+    features: int
+    rwf_mu: float = 0.5
+    rwf_sigma: float = 0.1
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Forward pass: y = (diag(exp(s)) · V) @ x + b"""
+        input_features = x.shape[-1]
+        
+        # Initialize V using Glorot/Xavier
+        V = self.param(
+            'V',
+            nn.initializers.glorot_normal(),
+            (self.features, input_features)
+        )
+        
+        # Initialize s from N(mu, sigma*I)
+        s = self.param(
+            's',
+            lambda key, shape: self.rwf_mu + self.rwf_sigma * jax.random.normal(key, shape),
+            (self.features,)
+        )
+        
+        # Bias
+        b = self.param(
+            'b',
+            nn.initializers.zeros,
+            (self.features,)
+        )
+        
+        # Compute W = diag(exp(s)) · V
+        # exp(s): (features,) -> (features, 1) for broadcasting
+        W = jnp.exp(s)[:, None] * V  # (features, input_features)
+        
+        # Linear transform: y = x @ W.T + b
+        return x @ W.T + b
+
+
 class FNNModule(nn.Module):
     """
     Internal Flax module for FNN.
@@ -62,6 +199,40 @@ class FNNModule(nn.Module):
         return x
 
 
+class WFFNNModule(nn.Module):
+    """
+    Internal Flax module for Weight-Factorized FNN.
+    
+    Uses Random Weight Factorization (RWF) where W = diag(exp(s)) · V.
+    Based on Wang et al. "On the eigenvector bias of Fourier feature networks".
+    """
+    layer_sizes: Sequence[int]
+    activation: str = 'tanh'
+    output_activation: Optional[str] = None
+    rwf_mu: float = 0.5
+    rwf_sigma: float = 0.1
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Forward pass through the network (raw, no normalization)."""
+        act_fn = get_activation(self.activation)
+        
+        # Hidden layers with RWF
+        for i, size in enumerate(self.layer_sizes[1:-1]):
+            x = DenseRWF(size, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name=f'hidden_{i}')(x)
+            x = act_fn(x)
+        
+        # Output layer with RWF
+        x = DenseRWF(self.layer_sizes[-1], rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name='output')(x)
+        
+        # Output activation
+        if self.output_activation is not None:
+            out_act = get_activation(self.output_activation)
+            x = out_act(x)
+        
+        return x
+
+
 class FNN:
     """
     Fully-connected Neural Network for JAX.
@@ -81,18 +252,23 @@ class FNN:
                  normalize_input: bool = True,
                  unnormalize_output: bool = True,
                  input_transform: Optional[Callable] = None,
-                 output_transform: Optional[Callable] = None):
+                 output_transform: Optional[Callable] = None,
+                 feature_encoding: Optional[Callable] = None):
         """
         Initialize FNN wrapper.
         
         Args:
             layer_sizes: Network architecture [input, hidden..., output]
+                         Note: If using feature_encoding, layer_sizes[0] should match
+                         the encoding's output_dim, not the original input dimension.
             activation: Activation function name
             output_activation: Optional output activation
             normalize_input: Whether to normalize inputs to [-1, 1]
             unnormalize_output: Whether to unnormalize outputs
-            input_transform: Optional symmetry transform
+            input_transform: Optional symmetry transform (applied before normalization)
             output_transform: Optional hard constraint transform
+            feature_encoding: Optional feature encoding (e.g., FourierFeatures).
+                             Applied after normalization, before network forward pass.
         """
         self.layer_sizes = list(layer_sizes)
         self.activation = activation
@@ -101,6 +277,7 @@ class FNN:
         self.unnormalize_output = unnormalize_output
         self.input_transform = input_transform
         self.output_transform = output_transform
+        self.feature_encoding = feature_encoding
         
         # Bounds (set by trainer)
         self.input_min = None
@@ -152,6 +329,10 @@ class FNN:
         # Normalize input to [-1, 1]
         if self.normalize_input and self.input_min is not None:
             x = 2.0 * (x - self.input_min) / (self.input_max - self.input_min + 1e-8) - 1.0
+        
+        # Apply feature encoding (e.g., Fourier features)
+        if self.feature_encoding is not None:
+            x = self.feature_encoding(x, params_dict)
         
         # Forward through network
         y = self._module.apply(params, x)
@@ -224,6 +405,430 @@ class FNN:
         
         # Initialize parameters on the default device (JAX handles placement)
         dummy_input = jnp.ones((1, self.layer_sizes[0]), dtype=dtype)
+        self.params = self._module.init(jax.random.PRNGKey(seed), dummy_input)
+        
+        return self
+
+
+class WFFNN:
+    """
+    Weight-Factorized Fully-connected Neural Network for JAX.
+    
+    Uses Random Weight Factorization (RWF): W = diag(exp(s)) · V
+    Based on Wang et al. "On the eigenvector bias of Fourier feature networks".
+    
+    Recommended settings: rwf_mu=0.5 or 1.0, rwf_sigma=0.1
+    
+    Example:
+        model = WFFNN([2, 64, 64, 1], activation='tanh', rwf_mu=0.5, rwf_sigma=0.1)
+        params = model.init(jax.random.PRNGKey(0), jnp.ones((1, 2)))
+        y = model.apply(params, x)
+    """
+    
+    def __init__(self, 
+                 layer_sizes: Sequence[int],
+                 activation: str = 'tanh',
+                 output_activation: Optional[str] = None,
+                 normalize_input: bool = True,
+                 unnormalize_output: bool = True,
+                 input_transform: Optional[Callable] = None,
+                 output_transform: Optional[Callable] = None,
+                 feature_encoding: Optional[Callable] = None,
+                 rwf_mu: float = 0.5,
+                 rwf_sigma: float = 0.1):
+        """
+        Initialize Weight-Factorized FNN wrapper.
+        
+        Args:
+            layer_sizes: Network architecture [input, hidden..., output]
+            activation: Activation function name
+            output_activation: Optional output activation
+            normalize_input: Whether to normalize inputs to [-1, 1]
+            unnormalize_output: Whether to unnormalize outputs
+            input_transform: Optional symmetry transform
+            output_transform: Optional hard constraint transform
+            feature_encoding: Optional feature encoding (e.g., FourierFeatures)
+            rwf_mu: Mean for initializing s ~ N(mu, sigma*I). Recommended: 0.5 or 1.0
+            rwf_sigma: Std for initializing s ~ N(mu, sigma*I). Recommended: 0.1
+        """
+        self.layer_sizes = list(layer_sizes)
+        self.activation = activation
+        self.output_activation = output_activation
+        self.normalize_input = normalize_input
+        self.unnormalize_output = unnormalize_output
+        self.input_transform = input_transform
+        self.output_transform = output_transform
+        self.feature_encoding = feature_encoding
+        self.rwf_mu = rwf_mu
+        self.rwf_sigma = rwf_sigma
+        
+        # Bounds (set by trainer)
+        self.input_min = None
+        self.input_max = None
+        self.output_min = None
+        self.output_max = None
+        
+        # Internal Flax module with weight factorization
+        self._module = WFFNNModule(
+            layer_sizes=layer_sizes,
+            activation=activation,
+            output_activation=output_activation,
+            rwf_mu=rwf_mu,
+            rwf_sigma=rwf_sigma
+        )
+    
+    def init(self, rng: jax.random.PRNGKey, dummy_input: jnp.ndarray = None) -> Dict:
+        """Initialize network parameters."""
+        if dummy_input is None:
+            dummy_input = jnp.ones((1, self.layer_sizes[0]))
+        return self._module.init(rng, dummy_input)
+    
+    def set_input_range(self, xmin: np.ndarray, xmax: np.ndarray):
+        """Set input normalization range."""
+        self.input_min = jnp.array(xmin)
+        self.input_max = jnp.array(xmax)
+    
+    def set_output_range(self, ymin: np.ndarray, ymax: np.ndarray):
+        """Set output unnormalization range."""
+        self.output_min = jnp.array(ymin)
+        self.output_max = jnp.array(ymax)
+    
+    def apply(self, params: Dict, x: jnp.ndarray, params_dict: Optional[Dict] = None) -> jnp.ndarray:
+        """
+        Forward pass through the network.
+        
+        Args:
+            params: Network parameters from init()
+            x: Input tensor of shape (batch_size, n_inputs)
+            params_dict: Optional params passed to transforms
+        
+        Returns:
+            Output tensor of shape (batch_size, n_outputs)
+        """
+        x_original = x
+        
+        # Apply input transform (e.g., symmetry)
+        if self.input_transform is not None:
+            x = self.input_transform(x, params_dict)
+        
+        # Normalize input to [-1, 1]
+        if self.normalize_input and self.input_min is not None:
+            x = 2.0 * (x - self.input_min) / (self.input_max - self.input_min + 1e-8) - 1.0
+        
+        # Apply feature encoding (e.g., Fourier features)
+        if self.feature_encoding is not None:
+            x = self.feature_encoding(x, params_dict)
+        
+        # Forward through network
+        y = self._module.apply(params, x)
+        
+        # Unnormalize output
+        if self.unnormalize_output and self.output_min is not None:
+            y = (y + 1.0) / 2.0 * (self.output_max - self.output_min) + self.output_min
+        
+        # Apply output transform (e.g., hard constraints)
+        if self.output_transform is not None:
+            y = self.output_transform(x_original, y, params_dict)
+        
+        return y
+    
+    def forward(self, x: jnp.ndarray, params_dict: Optional[Dict] = None) -> jnp.ndarray:
+        """Forward pass using stored parameters."""
+        return self.apply(self.params, x, params_dict)
+    
+    def predict(self, x_np: np.ndarray, params_dict: Optional[Dict] = None) -> np.ndarray:
+        """Predict with numpy I/O."""
+        x_jax = jnp.array(x_np)
+        y = self.forward(x_jax, params_dict)
+        return np.array(y)
+    
+    def to(self, device: str = None, dtype=None, seed: int = 0) -> 'WFFNN':
+        """
+        Initialize parameters and move to specified device.
+        
+        Args:
+            device: Device string ('cpu', 'gpu', 'tpu'). Default: auto-detect.
+            dtype: Data type. Default: jnp.float32.
+            seed: Random seed for initialization.
+        
+        Returns:
+            self (for method chaining)
+        """
+        if device is None:
+            device = jax.devices()[0].platform
+        
+        if dtype is None:
+            dtype = jnp.float32
+        
+        self.device = device
+        self.dtype = dtype
+        
+        dummy_input = jnp.ones((1, self.layer_sizes[0]), dtype=dtype)
+        self.params = self._module.init(jax.random.PRNGKey(seed), dummy_input)
+        
+        return self
+
+
+class PirateNetBlock(nn.Module):
+    """
+    Single residual block for PirateNet.
+    
+    Each block has 3 dense layers with gating operations:
+    f = σ(W1·x + b1)
+    z1 = f ⊙ U + (1-f) ⊙ V
+    g = σ(W2·z1 + b2)
+    z2 = g ⊙ U + (1-g) ⊙ V
+    h = σ(W3·z2 + b3)
+    x_next = α·h + (1-α)·x
+    """
+    hidden_dim: int
+    activation: str = 'tanh'
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, U: jnp.ndarray, V: jnp.ndarray) -> jnp.ndarray:
+        """Forward pass through one residual block."""
+        act_fn = get_activation(self.activation)
+        
+        # Trainable α parameter (initialized to 0 for identity at init)
+        alpha = self.param('alpha', nn.initializers.zeros, ())
+        
+        # First dense + gating
+        f = act_fn(nn.Dense(self.hidden_dim, name='dense1')(x))
+        z1 = f * U + (1 - f) * V
+        
+        # Second dense + gating
+        g = act_fn(nn.Dense(self.hidden_dim, name='dense2')(z1))
+        z2 = g * U + (1 - g) * V
+        
+        # Third dense
+        h = act_fn(nn.Dense(self.hidden_dim, name='dense3')(z2))
+        
+        # Adaptive residual connection
+        x_next = alpha * h + (1 - alpha) * x
+        
+        return x_next
+
+
+class PirateNetModule(nn.Module):
+    """
+    Internal Flax module for PirateNet.
+    
+    Physics-Informed Residual AdapTivE Networks (PirateNet).
+    Based on Wang et al. "PirateNets: Physics-informed Deep Learning 
+    with Residual Adaptive Networks".
+    """
+    input_dim: int
+    output_dim: int
+    hidden_dim: int
+    n_blocks: int = 3
+    activation: str = 'tanh'
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Forward pass through PirateNet."""
+        act_fn = get_activation(self.activation)
+        
+        # Step 1: Compute U and V gates from input
+        U = act_fn(nn.Dense(self.hidden_dim, name='U_layer')(x))
+        V = act_fn(nn.Dense(self.hidden_dim, name='V_layer')(x))
+        
+        # Step 2: Project input to hidden_dim for residual blocks
+        h = nn.Dense(self.hidden_dim, name='input_projection')(x)
+        
+        # Step 3: Apply L residual blocks
+        for i in range(self.n_blocks):
+            h = PirateNetBlock(
+                hidden_dim=self.hidden_dim,
+                activation=self.activation,
+                name=f'block_{i}'
+            )(h, U, V)
+        
+        # Step 4: Final output layer
+        output = nn.Dense(self.output_dim, name='output')(h)
+        
+        return output
+
+
+class PirateNet:
+    """
+    Physics-Informed Residual AdapTivE Network (PirateNet) for JAX.
+    
+    A novel architecture that addresses initialization issues in PINNs by using
+    adaptive residual connections with trainable α parameters initialized to 0.
+    At initialization, the network acts as a linear combination of input embeddings.
+    
+    Based on Wang et al. "PirateNets: Physics-informed Deep Learning 
+    with Residual Adaptive Networks".
+    
+    Architecture:
+    1. Optional input embedding via feature_encoding (e.g., FourierFeatures)
+    2. Gate encodings: U = σ(W1·x + b1), V = σ(W2·x + b2)
+    3. L residual blocks, each with 3 dense layers and gating operations
+    4. Output layer
+    
+    Example:
+        # Without Fourier features
+        model = PirateNet(input_dim=2, output_dim=1, hidden_dim=64, n_blocks=3)
+        
+        # With Fourier features (input_dim is original dimension, not encoded)
+        fourier = FourierFeatures(input_dim=2, n_features=64, sigma=1.0)
+        model = PirateNet(input_dim=2, output_dim=1, hidden_dim=64, 
+                         feature_encoding=fourier)
+    """
+    
+    def __init__(self,
+                 input_dim: int,
+                 output_dim: int,
+                 hidden_dim: int,
+                 n_blocks: int = 3,
+                 activation: str = 'tanh',
+                 normalize_input: bool = True,
+                 unnormalize_output: bool = True,
+                 input_transform: Optional[Callable] = None,
+                 output_transform: Optional[Callable] = None,
+                 feature_encoding: Optional[Callable] = None):
+        """
+        Initialize PirateNet.
+        
+        Args:
+            input_dim: Dimension of input coordinates (before any feature encoding)
+            output_dim: Dimension of output
+            hidden_dim: Width of all hidden layers (must be consistent)
+            n_blocks: Number of residual blocks (default: 3). Total depth = 3*n_blocks.
+            activation: Activation function name (default: 'tanh')
+            normalize_input: Whether to normalize inputs to [-1, 1]
+            unnormalize_output: Whether to unnormalize outputs
+            input_transform: Optional symmetry transform (applied before normalization)
+            output_transform: Optional hard constraint transform
+            feature_encoding: Optional feature encoding (e.g., FourierFeatures).
+                             Applied after normalization, before network forward pass.
+        """
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+        self.n_blocks = n_blocks
+        self.activation = activation
+        self.normalize_input = normalize_input
+        self.unnormalize_output = unnormalize_output
+        self.input_transform = input_transform
+        self.output_transform = output_transform
+        self.feature_encoding = feature_encoding
+        
+        # Bounds (set by trainer)
+        self.input_min = None
+        self.input_max = None
+        self.output_min = None
+        self.output_max = None
+        
+        # For compatibility with FNN interface
+        self.layer_sizes = [input_dim, hidden_dim, output_dim]
+        
+        # Internal module
+        self._module = PirateNetModule(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            n_blocks=n_blocks,
+            activation=activation
+        )
+    
+    def init(self, rng: jax.random.PRNGKey, dummy_input: jnp.ndarray = None) -> Dict:
+        """Initialize network parameters."""
+        if dummy_input is None:
+            dummy_input = jnp.ones((1, self.input_dim))
+        
+        # Apply same transforms as in apply() to get correct input shape
+        if self.feature_encoding is not None:
+            dummy_input = self.feature_encoding(dummy_input, None)
+        
+        return self._module.init(rng, dummy_input)
+    
+    def set_input_range(self, xmin: np.ndarray, xmax: np.ndarray):
+        """Set input normalization range."""
+        self.input_min = jnp.array(xmin)
+        self.input_max = jnp.array(xmax)
+    
+    def set_output_range(self, ymin: np.ndarray, ymax: np.ndarray):
+        """Set output unnormalization range."""
+        self.output_min = jnp.array(ymin)
+        self.output_max = jnp.array(ymax)
+    
+    def apply(self, params: Dict, x: jnp.ndarray, params_dict: Optional[Dict] = None) -> jnp.ndarray:
+        """
+        Forward pass through the network.
+        
+        Args:
+            params: Network parameters from init()
+            x: Input tensor of shape (batch_size, input_dim)
+            params_dict: Optional params passed to transforms
+        
+        Returns:
+            Output tensor of shape (batch_size, output_dim)
+        """
+        x_original = x
+        
+        # Apply input transform (e.g., symmetry)
+        if self.input_transform is not None:
+            x = self.input_transform(x, params_dict)
+        
+        # Normalize input to [-1, 1]
+        if self.normalize_input and self.input_min is not None:
+            x = 2.0 * (x - self.input_min) / (self.input_max - self.input_min + 1e-8) - 1.0
+        
+        # Apply external feature encoding if provided
+        if self.feature_encoding is not None:
+            x = self.feature_encoding(x, params_dict)
+        
+        # Forward through network
+        y = self._module.apply(params, x)
+        
+        # Unnormalize output
+        if self.unnormalize_output and self.output_min is not None:
+            y = (y + 1.0) / 2.0 * (self.output_max - self.output_min) + self.output_min
+        
+        # Apply output transform (e.g., hard constraints)
+        if self.output_transform is not None:
+            y = self.output_transform(x_original, y, params_dict)
+        
+        return y
+    
+    def forward(self, x: jnp.ndarray, params_dict: Optional[Dict] = None) -> jnp.ndarray:
+        """Forward pass using stored parameters."""
+        return self.apply(self.params, x, params_dict)
+    
+    def predict(self, x_np: np.ndarray, params_dict: Optional[Dict] = None) -> np.ndarray:
+        """Predict with numpy I/O."""
+        x_jax = jnp.array(x_np)
+        y = self.forward(x_jax, params_dict)
+        return np.array(y)
+    
+    def to(self, device: str = None, dtype=None, seed: int = 0) -> 'PirateNet':
+        """
+        Initialize parameters and move to specified device.
+        
+        Args:
+            device: Device string ('cpu', 'gpu', 'tpu'). Default: auto-detect.
+            dtype: Data type. Default: jnp.float32.
+            seed: Random seed for initialization.
+        
+        Returns:
+            self (for method chaining)
+        """
+        if device is None:
+            device = jax.devices()[0].platform
+        
+        if dtype is None:
+            dtype = jnp.float32
+        
+        self.device = device
+        self.dtype = dtype
+        
+        dummy_input = jnp.ones((1, self.input_dim), dtype=dtype)
+        
+        # Apply same transforms as in apply() to get correct input shape
+        if self.feature_encoding is not None:
+            dummy_input = self.feature_encoding(dummy_input, None)
+        
         self.params = self._module.init(jax.random.PRNGKey(seed), dummy_input)
         
         return self

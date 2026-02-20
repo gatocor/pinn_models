@@ -34,7 +34,7 @@ y_border = 10.0
 
 cut_border_x = 0.10
 cut_border_y = 0.04
-cut_border_sigma = 0.005
+cut_border_sigma = 0.01
 
 w = 0.2
 sigma_cut_sampling = 0.5
@@ -186,28 +186,24 @@ def output_transform(X_in, Y, params):
 
     return jnp.hstack((h, vx, vy))
 
-baseNetwork = pinns.FNN(
-    [3, 64, 3],
-    activation="tanh"
-)
+fourier = pinns.FourierFeatures(input_dim=3, n_features=256, sigma=2.0)
 
-active_mask = [sd.xmin[0] >= 0.0 and sd.xmin[1] >= 0.0 for sd in domain.subdomains]
-
-network = pinns.FBPINN(
-    domain,
-    baseNetwork,
-    normalize_input=True,
-    unnormalize_output=True,
+network = pinns.FNN(
+    [fourier.output_dim, 256, 256, 256, 256, 3],
+    activation="tanh",
+    feature_encoding=fourier,
     input_transform=input_transform,
     output_transform=output_transform,
-    active_subdomains=active_mask
+    rwf_mu=0.5,
+    rwf_sigma=0.1,
 )
 
 trainer = pinns.Trainer(problem, network)
+lr_scheduler = pinns.ExponentialDecay(gamma=0.99, each_n_steps=2000)
 
 trainer.compile(
     train_samples={
-        "pde": 100000
+        "pde": 4096
     },
     test_samples={
         "pde": 2000
@@ -217,11 +213,12 @@ trainer.compile(
     },
     optimizer="adam",
     learning_rate=1e-3,
-    epochs=50000,
-    batch_size=5000,             # Mini-batch to reduce GPU memory usage
-    resample_each=500,
+    lr_scheduler=lr_scheduler,
+    epochs=1000000,
+    batch_size=4096,             # Mini-batch to reduce GPU memory usage
+    resample_each=1,
     resample_pool_size=1,
-    pool_refresh_each=500,
+    pool_refresh_each=1,
     adaptive_sampling=False,       # Enable adaptive sampling
     adaptive_mode="replace",      # "replace" (default): replace low-residual points with new samples
     adaptive_each=100,             # Resample every 100 epochs
