@@ -105,6 +105,139 @@ class ExponentialDecay(LRScheduler):
         return base_lr * (self.gamma ** decay_count)
 
 
+class ReduceLROnPlateau(LRScheduler):
+    """
+    Reduce learning rate when training loss plateaus.
+    
+    Uses exponential moving average (EMA) of the loss and detects plateau by
+    computing the relative slope over a window:
+    
+        relative_slope = |EMA_t - EMA_{t-W}| / EMA_{t-W}
+    
+    If relative_slope < epsilon, reduce LR by factor.
+    
+    Example:
+        scheduler = ReduceLROnPlateau(window=1000, epsilon=1e-3, factor=0.5)
+        trainer.compile(lr_scheduler=scheduler, ...)
+        
+    Attributes:
+        window: Number of steps to compute slope over (default: 1000)
+        epsilon: Threshold for relative change to trigger reduction (default: 1e-3)
+        factor: Factor to multiply LR when plateau detected (default: 0.5)
+        ema_alpha: Smoothing factor for EMA (default: 0.99)
+        min_lr: Minimum learning rate (default: 1e-8)
+        cooldown: Steps to wait after reduction before checking again (default: same as window)
+    """
+    
+    def __init__(self, 
+                 window: int = 1000, 
+                 epsilon: float = 1e-3, 
+                 factor: float = 0.5,
+                 ema_alpha: float = 0.99,
+                 min_lr: float = 1e-8,
+                 cooldown: int = None):
+        """
+        Initialize ReduceLROnPlateau scheduler.
+        
+        Args:
+            window: Number of steps to compute slope over. Larger = less sensitive to noise.
+            epsilon: Threshold for relative change. If |slope| < epsilon, plateau detected.
+            factor: Multiply LR by this when plateau detected (0 < factor < 1).
+            ema_alpha: EMA smoothing factor. Higher = smoother (0 < alpha < 1).
+            min_lr: Minimum learning rate floor.
+            cooldown: Steps to wait after reduction before checking again.
+        """
+        if window <= 0:
+            raise ValueError("window must be positive")
+        if epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+        if not 0 < factor < 1:
+            raise ValueError("factor must be between 0 and 1")
+        if not 0 < ema_alpha < 1:
+            raise ValueError("ema_alpha must be between 0 and 1")
+        
+        self.window = window
+        self.epsilon = epsilon
+        self.factor = factor
+        self.ema_alpha = ema_alpha
+        self.min_lr = min_lr
+        self.cooldown = cooldown if cooldown is not None else window
+        
+        # State
+        self._ema = None  # Current EMA
+        self._ema_history = []  # History of EMA values (circular buffer)
+        self._reduction_count = 0  # Number of times LR has been reduced
+        self._last_reduction_step = -float('inf')  # Step of last reduction
+        self._current_step = 0
+    
+    def step(self, loss: float, current_step: int = None):
+        """
+        Update the scheduler with the current loss value.
+        
+        Call this after each training step with the current loss.
+        
+        Args:
+            loss: Current training loss
+            current_step: Current step number (optional, auto-incremented if None)
+        """
+        if current_step is not None:
+            self._current_step = current_step
+        else:
+            self._current_step += 1
+        
+        # Update EMA
+        if self._ema is None:
+            self._ema = loss
+        else:
+            self._ema = self.ema_alpha * self._ema + (1 - self.ema_alpha) * loss
+        
+        # Store in history
+        self._ema_history.append(self._ema)
+        
+        # Keep only window + 1 entries
+        if len(self._ema_history) > self.window + 1:
+            self._ema_history.pop(0)
+        
+        # Check for plateau if we have enough history and past cooldown
+        if len(self._ema_history) > self.window:
+            steps_since_reduction = self._current_step - self._last_reduction_step
+            
+            if steps_since_reduction >= self.cooldown:
+                ema_old = self._ema_history[0]
+                ema_new = self._ema_history[-1]
+                
+                # Compute relative slope
+                if ema_old > 1e-10:  # Avoid division by zero
+                    relative_slope = abs(ema_new - ema_old) / ema_old
+                    
+                    if relative_slope < self.epsilon:
+                        # Plateau detected - reduce LR
+                        self._reduction_count += 1
+                        self._last_reduction_step = self._current_step
+    
+    def lr(self, base_lr: float, step: int) -> float:
+        """
+        Compute the current learning rate.
+        
+        Args:
+            base_lr: The initial/base learning rate
+            step: Current training step (epoch)
+            
+        Returns:
+            Learning rate after reductions
+        """
+        new_lr = base_lr * (self.factor ** self._reduction_count)
+        return max(new_lr, self.min_lr)
+    
+    def reset(self):
+        """Reset scheduler state."""
+        self._ema = None
+        self._ema_history = []
+        self._reduction_count = 0
+        self._last_reduction_step = -float('inf')
+        self._current_step = 0
+
+
 class BaseTrainer(ABC):
     """
     Abstract base class for PINN trainers.
@@ -306,6 +439,7 @@ class BaseTrainer(ABC):
         Depending on adaptive_mode:
         - "replace": Replace low-residual points with new points near high-residual locations.
         - "add": Add new points near high-residual locations (growing sample count).
+        - "rar": Residual-based Adaptive Resampling via importance sampling.
         
         Args:
             params_dict: Parameters dict from _build_params(). If None, will be built.
@@ -315,6 +449,11 @@ class BaseTrainer(ABC):
         
         if params_dict is None:
             params_dict = self._build_params()
+        
+        # Dispatch to RAR method if using importance sampling mode
+        if self._adaptive_mode == "rar":
+            self._adaptive_rar_resample(params_dict)
+            return
         
         # Get current PDE training points as numpy
         x_pde = self._to_numpy(self._train_data['pde'])
@@ -370,6 +509,63 @@ class BaseTrainer(ABC):
         # Update training data
         self._train_data['pde'] = self._to_tensor(x_pde)
     
+    def _adaptive_rar_resample(self, params_dict: Dict = None):
+        """
+        Perform Residual-based Adaptive Resampling (RAR) via importance sampling.
+        
+        Algorithm:
+        1. Sample factor * n_samples from the domain
+        2. Compute residuals for all samples
+        3. Compute weights: p = (r^k / mean(r^k)) + c
+        4. Normalize: p = p / sum(p)
+        5. Sample n_samples using these weights (importance sampling)
+        
+        Args:
+            params_dict: Parameters dict from _build_params(). If None, will be built.
+        """
+        if params_dict is None:
+            params_dict = self._build_params()
+        
+        # Get target number of PDE samples
+        n_target = self.train_samples[0]  # PDE samples is first element
+        factor = self._adaptive_factor
+        k = self._adaptive_k
+        c = self._adaptive_c
+        
+        # Sample factor * n_target points from domain (using _sample_interior_np to get params)
+        n_candidates = factor * n_target
+        x_candidates = self._sample_interior_np(n_candidates)
+        
+        # Compute residuals at candidate points
+        residuals = self._compute_residuals(x_candidates, batch_size=self._batch_size)
+        
+        # Combine residuals from all equations (L2 norm)
+        total_residual = np.zeros(n_candidates)
+        for res in residuals:
+            total_residual += res.flatten() ** 2
+        total_residual = np.sqrt(total_residual)
+        
+        # Compute importance weights: p = (r^k / mean(r^k)) + c
+        r_pow_k = np.power(np.abs(total_residual) + 1e-10, k)
+        weights = (r_pow_k / (np.mean(r_pow_k) + 1e-10)) + c
+        
+        # Normalize to get probabilities
+        weights = weights / np.sum(weights)
+        
+        # Sample n_target indices using importance weights (without replacement)
+        selected_indices = self.rng.choice(
+            n_candidates, 
+            size=n_target, 
+            replace=False, 
+            p=weights
+        )
+        
+        # Get selected points
+        x_pde = x_candidates[selected_indices]
+        
+        # Update training data
+        self._train_data['pde'] = self._to_tensor(x_pde)
+    
     # ==================== Compile ====================
     
     def compile(
@@ -398,6 +594,10 @@ class BaseTrainer(ABC):
         adaptive_std: float = 0.1,
         adaptive_mode: str = "replace",
         adaptive_max_samples: int = None,
+        # RAR (Residual-based Adaptive Resampling) parameters
+        adaptive_k: float = 1.0,
+        adaptive_c: float = 1.0,
+        adaptive_factor: int = 2,
         # Learning rate scheduler
         lr_scheduler: Optional[LRScheduler] = None,
         # L-BFGS specific parameters
@@ -433,8 +633,11 @@ class BaseTrainer(ABC):
             adaptive_each: Perform adaptive resampling every N epochs (default: 100).
             adaptive_ratio: Fraction of points to add/replace with high-residual neighbors (default: 0.5).
             adaptive_std: Standard deviation for sampling near high-residual points, as fraction of domain size (default: 0.1).
-            adaptive_mode: "replace" (replace low-residual points) or "add" (grow sample count). Default: "replace".
+            adaptive_mode: "replace" (replace low-residual points), "add" (grow sample count), or "rar" (importance sampling). Default: "replace".
             adaptive_max_samples: Maximum PDE samples when mode="add" (None = no limit). Prevents OOM.
+            adaptive_k: Power for residual weighting in RAR mode: p = (r^k / mean(r^k)) + c. Default: 1.0.
+            adaptive_c: Offset for uniform sampling in RAR mode. Higher c = more uniform. Default: 1.0.
+            adaptive_factor: Oversampling factor for RAR mode. Sample factor*n points, then select n. Default: 2.
             lr_scheduler: Learning rate scheduler (e.g., ExponentialDecay). If None, constant learning rate.
             lbfgs_max_iter: Max iterations per L-BFGS step (default: 5).
             lbfgs_history_size: History size for L-BFGS (default: 50).
@@ -542,6 +745,9 @@ class BaseTrainer(ABC):
         self._adaptive_std = adaptive_std
         self._adaptive_mode = adaptive_mode
         self._adaptive_max_samples = adaptive_max_samples
+        self._adaptive_k = adaptive_k
+        self._adaptive_c = adaptive_c
+        self._adaptive_factor = adaptive_factor
         
         # Backend-specific hook (e.g., presampling in JAX)
         self._after_compile_hook()

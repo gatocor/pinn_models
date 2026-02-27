@@ -571,7 +571,7 @@ class WFFNN:
 
 class PirateNetBlock(nn.Module):
     """
-    Single residual block for PirateNet.
+    Single residual block for PirateNet with Random Weight Factorization.
     
     Each block has 3 dense layers with gating operations:
     f = σ(W1·x + b1)
@@ -583,6 +583,8 @@ class PirateNetBlock(nn.Module):
     """
     hidden_dim: int
     activation: str = 'tanh'
+    rwf_mu: float = 0.5
+    rwf_sigma: float = 0.1
     
     @nn.compact
     def __call__(self, x: jnp.ndarray, U: jnp.ndarray, V: jnp.ndarray) -> jnp.ndarray:
@@ -592,16 +594,16 @@ class PirateNetBlock(nn.Module):
         # Trainable α parameter (initialized to 0 for identity at init)
         alpha = self.param('alpha', nn.initializers.zeros, ())
         
-        # First dense + gating
-        f = act_fn(nn.Dense(self.hidden_dim, name='dense1')(x))
+        # First dense + gating (using RWF)
+        f = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name='dense1')(x))
         z1 = f * U + (1 - f) * V
         
-        # Second dense + gating
-        g = act_fn(nn.Dense(self.hidden_dim, name='dense2')(z1))
+        # Second dense + gating (using RWF)
+        g = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name='dense2')(z1))
         z2 = g * U + (1 - g) * V
         
-        # Third dense
-        h = act_fn(nn.Dense(self.hidden_dim, name='dense3')(z2))
+        # Third dense (using RWF)
+        h = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name='dense3')(z2))
         
         # Adaptive residual connection
         x_next = alpha * h + (1 - alpha) * x
@@ -613,7 +615,7 @@ class PirateNetModule(nn.Module):
     """
     Internal Flax module for PirateNet.
     
-    Physics-Informed Residual AdapTivE Networks (PirateNet).
+    Physics-Informed Residual AdapTivE Networks (PirateNet) with Random Weight Factorization.
     Based on Wang et al. "PirateNets: Physics-informed Deep Learning 
     with Residual Adaptive Networks".
     """
@@ -622,29 +624,33 @@ class PirateNetModule(nn.Module):
     hidden_dim: int
     n_blocks: int = 3
     activation: str = 'tanh'
+    rwf_mu: float = 0.5
+    rwf_sigma: float = 0.1
     
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """Forward pass through PirateNet."""
         act_fn = get_activation(self.activation)
         
-        # Step 1: Compute U and V gates from input
-        U = act_fn(nn.Dense(self.hidden_dim, name='U_layer')(x))
-        V = act_fn(nn.Dense(self.hidden_dim, name='V_layer')(x))
+        # Step 1: Compute U and V gates from input (using RWF)
+        U = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name='U_layer')(x))
+        V = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name='V_layer')(x))
         
-        # Step 2: Project input to hidden_dim for residual blocks
-        h = nn.Dense(self.hidden_dim, name='input_projection')(x)
+        # Step 2: Project input to hidden_dim for residual blocks (using RWF)
+        h = DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name='input_projection')(x)
         
         # Step 3: Apply L residual blocks
         for i in range(self.n_blocks):
             h = PirateNetBlock(
                 hidden_dim=self.hidden_dim,
                 activation=self.activation,
+                rwf_mu=self.rwf_mu,
+                rwf_sigma=self.rwf_sigma,
                 name=f'block_{i}'
             )(h, U, V)
         
-        # Step 4: Final output layer
-        output = nn.Dense(self.output_dim, name='output')(h)
+        # Step 4: Final output layer (using RWF)
+        output = DenseRWF(self.output_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name='output')(h)
         
         return output
 
@@ -656,6 +662,7 @@ class PirateNet:
     A novel architecture that addresses initialization issues in PINNs by using
     adaptive residual connections with trainable α parameters initialized to 0.
     At initialization, the network acts as a linear combination of input embeddings.
+    Uses Random Weight Factorization (RWF) for improved spectral properties.
     
     Based on Wang et al. "PirateNets: Physics-informed Deep Learning 
     with Residual Adaptive Networks".
@@ -686,7 +693,9 @@ class PirateNet:
                  unnormalize_output: bool = True,
                  input_transform: Optional[Callable] = None,
                  output_transform: Optional[Callable] = None,
-                 feature_encoding: Optional[Callable] = None):
+                 feature_encoding: Optional[Callable] = None,
+                 rwf_mu: float = 0.5,
+                 rwf_sigma: float = 0.1):
         """
         Initialize PirateNet.
         
@@ -702,6 +711,8 @@ class PirateNet:
             output_transform: Optional hard constraint transform
             feature_encoding: Optional feature encoding (e.g., FourierFeatures).
                              Applied after normalization, before network forward pass.
+            rwf_mu: Mean for Random Weight Factorization s initialization (default: 0.5)
+            rwf_sigma: Std for Random Weight Factorization s initialization (default: 0.1)
         """
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -713,6 +724,8 @@ class PirateNet:
         self.input_transform = input_transform
         self.output_transform = output_transform
         self.feature_encoding = feature_encoding
+        self.rwf_mu = rwf_mu
+        self.rwf_sigma = rwf_sigma
         
         # Bounds (set by trainer)
         self.input_min = None
@@ -729,7 +742,9 @@ class PirateNet:
             output_dim=output_dim,
             hidden_dim=hidden_dim,
             n_blocks=n_blocks,
-            activation=activation
+            activation=activation,
+            rwf_mu=rwf_mu,
+            rwf_sigma=rwf_sigma
         )
     
     def init(self, rng: jax.random.PRNGKey, dummy_input: jnp.ndarray = None) -> Dict:

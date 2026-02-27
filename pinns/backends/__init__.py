@@ -10,7 +10,7 @@ import os
 BACKEND = os.environ.get('PINNS_BACKEND', 'torch').lower()
 
 # Import learning rate schedulers (backend-agnostic)
-from .base_trainer import LRScheduler, ExponentialDecay
+from .base_trainer import LRScheduler, ExponentialDecay, ReduceLROnPlateau
 
 def get_backend():
     """Return the current backend name."""

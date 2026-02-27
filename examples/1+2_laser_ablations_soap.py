@@ -199,11 +199,19 @@ network = pinns.WFFNN(
 )
 
 trainer = pinns.Trainer(problem, network)
-lr_scheduler = pinns.ExponentialDecay(gamma=0.99, each_n_steps=2000)
+# lr_scheduler = pinns.ExponentialDecay(gamma=0.9, each_n_steps=2000)
+lr_scheduler = pinns.ReduceLROnPlateau(
+    window=1000,      # Steps to compute slope over
+    epsilon=1e-3,     # Threshold: if relative_slope < epsilon, reduce LR
+    factor=0.5,       # Multiply LR by this factor on plateau
+    ema_alpha=0.99,   # EMA smoothing (higher = smoother)
+    min_lr=1e-8,      # Floor for learning rate
+    cooldown=1000,    # Steps to wait after reduction (default: same as window)
+)
 
 trainer.compile(
     train_samples={
-        "pde": 4096
+        "pde": 4096*2
     },
     test_samples={
         "pde": 2000
@@ -211,19 +219,27 @@ trainer.compile(
     weights={
         "pde": 1.0
     },
-    optimizer="adam",
+    optimizer="soap",
+    soap_params={
+        'b1': 0.95,           # Adam's beta1 (default: 0.95)
+        'b2': 0.95,           # Adam's beta2 (default: 0.95)
+        'weight_decay': 0.00, # Weight decay (default: 0.0)
+        'precondition_frequency': 10,  # How often to update preconditioner
+        'precondition_1d': False,      # Precondition 1D params
+    },
     learning_rate=1e-3,
     lr_scheduler=lr_scheduler,
     epochs=int(1e6),
-    batch_size=4096,             # Mini-batch to reduce GPU memory usage
+    batch_size=4096*2,             # Mini-batch to reduce GPU memory usage
     resample_each=1,
     resample_pool_size=1,
     pool_refresh_each=1,
-    adaptive_sampling=False,       # Enable adaptive sampling
-    adaptive_mode="replace",      # "replace" (default): replace low-residual points with new samples
+    adaptive_sampling=True,       # Enable adaptive sampling
+    adaptive_mode="rar",      # "replace" (default): replace low-residual points with new samples
     adaptive_each=100,             # Resample every 100 epochs
-    adaptive_ratio=0.2,           # Replace 20% of points with low residuals
-    adaptive_std=0.01,            # Sample near high-residual points (1% of domain size)
+    adaptive_factor=10,           # Replace 20% of points with low residuals
+    adaptive_k=1.0,            # Sample near high-residual points (1% of domain size)
+    adaptive_c=1.0,
     adaptive_max_samples=100000,  # Cap at 50k to prevent OOM
     print_each=500,
     show_plots=True,

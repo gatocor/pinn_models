@@ -476,13 +476,15 @@ class Trainer(BaseTrainer):
             global_epoch = start_epoch + epoch
             
             # Update learning rate if scheduler is provided
-            if lr_scheduler is not None and self.optimizer_name != "lbfgs":
+            # Skip for SOAP (has its own LR handling) and L-BFGS
+            if lr_scheduler is not None and self.optimizer_name not in ("lbfgs", "soap"):
                 new_lr = lr_scheduler.lr(self.learning_rate, global_epoch)
                 # Update the hyperparameter in opt_state (inject_hyperparams stores it there)
                 # InjectHyperparamsState is immutable, so we need to create a new state
-                new_hyperparams = dict(self.opt_state.hyperparams)
-                new_hyperparams['learning_rate'] = new_lr
-                self.opt_state = self.opt_state._replace(hyperparams=new_hyperparams)
+                if hasattr(self.opt_state, 'hyperparams'):
+                    new_hyperparams = dict(self.opt_state.hyperparams)
+                    new_hyperparams['learning_rate'] = new_lr
+                    self.opt_state = self.opt_state._replace(hyperparams=new_hyperparams)
             
             # Refresh pool with fresh samples if interval reached
             if pool_refresh_each > 0 and has_pool and epoch > 0 and epoch % pool_refresh_each == 0:
@@ -549,6 +551,10 @@ class Trainer(BaseTrainer):
             
             epoch_time = time.time() - epoch_start
             self.history['epoch_times'].append(epoch_time)
+            
+            # Update ReduceLROnPlateau scheduler with current loss
+            if lr_scheduler is not None and hasattr(lr_scheduler, 'step'):
+                lr_scheduler.step(float(loss), global_epoch)
             
             if print_each > 0 and (epoch % print_each == 0 or epoch == epochs - 1):
                 elapsed = time.time() - start_time

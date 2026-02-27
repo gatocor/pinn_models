@@ -482,7 +482,7 @@ class WFFNN(nn.Module):
 
 class PirateNetBlock(nn.Module):
     """
-    Single residual block for PirateNet.
+    Single residual block for PirateNet with Random Weight Factorization.
     
     Each block has 3 dense layers with gating operations:
     f = σ(W1·x + b1)
@@ -493,21 +493,22 @@ class PirateNetBlock(nn.Module):
     x_next = α·h + (1-α)·x
     """
     
-    def __init__(self, hidden_dim: int, activation='tanh'):
+    def __init__(self, hidden_dim: int, activation='tanh',
+                 rwf_mu: float = 0.5, rwf_sigma: float = 0.1):
         super(PirateNetBlock, self).__init__()
         
         self.hidden_dim = hidden_dim
         self.activation = self._get_activation(activation)
+        self.rwf_mu = rwf_mu
+        self.rwf_sigma = rwf_sigma
         
-        # Three dense layers per block
-        self.dense1 = nn.Linear(hidden_dim, hidden_dim)
-        self.dense2 = nn.Linear(hidden_dim, hidden_dim)
-        self.dense3 = nn.Linear(hidden_dim, hidden_dim)
+        # Three dense layers per block (using RWF)
+        self.dense1 = LinearRWF(hidden_dim, hidden_dim, rwf_mu=rwf_mu, rwf_sigma=rwf_sigma)
+        self.dense2 = LinearRWF(hidden_dim, hidden_dim, rwf_mu=rwf_mu, rwf_sigma=rwf_sigma)
+        self.dense3 = LinearRWF(hidden_dim, hidden_dim, rwf_mu=rwf_mu, rwf_sigma=rwf_sigma)
         
         # Trainable α parameter (initialized to 0 for identity at init)
         self.alpha = nn.Parameter(torch.zeros(1))
-        
-        self._initialize_weights()
     
     def _get_activation(self, activation):
         activation_dict = {
@@ -520,12 +521,6 @@ class PirateNetBlock(nn.Module):
         if isinstance(activation, str):
             return activation_dict.get(activation.lower(), nn.Tanh())
         return activation
-    
-    def _initialize_weights(self):
-        """Glorot initialization for weights, zero for biases."""
-        for layer in [self.dense1, self.dense2, self.dense3]:
-            nn.init.xavier_normal_(layer.weight)
-            nn.init.zeros_(layer.bias)
     
     def forward(self, x: torch.Tensor, U: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
         """Forward pass through one residual block."""
@@ -553,6 +548,7 @@ class PirateNet(nn.Module):
     A novel architecture that addresses initialization issues in PINNs by using
     adaptive residual connections with trainable α parameters initialized to 0.
     At initialization, the network acts as a linear combination of input embeddings.
+    Uses Random Weight Factorization (RWF) for improved spectral properties.
     
     Based on Wang et al. "PirateNets: Physics-informed Deep Learning 
     with Residual Adaptive Networks".
@@ -574,6 +570,8 @@ class PirateNet(nn.Module):
         input_transform: Optional symmetry transform
         output_transform: Optional hard constraint transform
         feature_encoding: Optional feature encoding (e.g., FourierFeatures)
+        rwf_mu: Mean for Random Weight Factorization s initialization (default: 0.5)
+        rwf_sigma: Std for Random Weight Factorization s initialization (default: 0.1)
         seed: Random seed for initialization
     
     Example:
@@ -590,7 +588,8 @@ class PirateNet(nn.Module):
                  n_blocks: int = 3, activation: str = 'tanh',
                  normalize_input: bool = True, unnormalize_output: bool = True,
                  input_transform=None, output_transform=None,
-                 feature_encoding=None, seed: int = None):
+                 feature_encoding=None, rwf_mu: float = 0.5, rwf_sigma: float = 0.1,
+                 seed: int = None):
         super(PirateNet, self).__init__()
         
         self.input_dim = input_dim
@@ -602,6 +601,8 @@ class PirateNet(nn.Module):
         self.input_transform = input_transform
         self.output_transform = output_transform
         self.feature_encoding = feature_encoding
+        self.rwf_mu = rwf_mu
+        self.rwf_sigma = rwf_sigma
         self.seed = seed
         
         # Determine actual input dimension after feature encoding
@@ -623,25 +624,23 @@ class PirateNet(nn.Module):
         self.register_buffer('output_min', None)
         self.register_buffer('output_max', None)
         
-        # U and V gate layers (use actual_input_dim after encoding)
-        self.U_layer = nn.Linear(actual_input_dim, hidden_dim)
-        self.V_layer = nn.Linear(actual_input_dim, hidden_dim)
+        # U and V gate layers (use actual_input_dim after encoding, using RWF)
+        self.U_layer = LinearRWF(actual_input_dim, hidden_dim, rwf_mu=rwf_mu, rwf_sigma=rwf_sigma)
+        self.V_layer = LinearRWF(actual_input_dim, hidden_dim, rwf_mu=rwf_mu, rwf_sigma=rwf_sigma)
         
-        # Input projection to hidden_dim
-        self.input_projection = nn.Linear(actual_input_dim, hidden_dim)
+        # Input projection to hidden_dim (using RWF)
+        self.input_projection = LinearRWF(actual_input_dim, hidden_dim, rwf_mu=rwf_mu, rwf_sigma=rwf_sigma)
         
         # Residual blocks
         self.blocks = nn.ModuleList([
-            PirateNetBlock(hidden_dim, activation) for _ in range(n_blocks)
+            PirateNetBlock(hidden_dim, activation, rwf_mu=rwf_mu, rwf_sigma=rwf_sigma) for _ in range(n_blocks)
         ])
         
-        # Output layer
-        self.output_layer = nn.Linear(hidden_dim, output_dim)
+        # Output layer (using RWF)
+        self.output_layer = LinearRWF(hidden_dim, output_dim, rwf_mu=rwf_mu, rwf_sigma=rwf_sigma)
         
         # Activation for U, V
         self.activation = self._get_activation(activation)
-        
-        self._initialize_weights()
     
     def _get_activation(self, activation):
         activation_dict = {
@@ -655,21 +654,15 @@ class PirateNet(nn.Module):
             return activation_dict.get(activation.lower(), nn.Tanh())
         return activation
     
-    def _initialize_weights(self):
-        """Glorot initialization for weights, zero for biases."""
-        for layer in [self.U_layer, self.V_layer, self.input_projection, self.output_layer]:
-            nn.init.xavier_normal_(layer.weight)
-            nn.init.zeros_(layer.bias)
-    
     def set_input_range(self, xmin, xmax):
         """Set input normalization range. Called by Trainer."""
-        device = self.output_layer.weight.device
+        device = self.output_layer.V.device
         self.input_min = torch.as_tensor(xmin, dtype=torch.float32, device=device)
         self.input_max = torch.as_tensor(xmax, dtype=torch.float32, device=device)
     
     def set_output_range(self, ymin, ymax):
         """Set output unnormalization range. Called by Trainer."""
-        device = self.output_layer.weight.device
+        device = self.output_layer.V.device
         self.output_min = torch.as_tensor(ymin, dtype=torch.float32, device=device)
         self.output_max = torch.as_tensor(ymax, dtype=torch.float32, device=device)
     
@@ -727,8 +720,8 @@ class PirateNet(nn.Module):
         """Predict with numpy I/O."""
         self.eval()
         with torch.no_grad():
-            x_tensor = torch.tensor(x_np, device=self.output_layer.weight.device,
-                                   dtype=self.output_layer.weight.dtype)
+            x_tensor = torch.tensor(x_np, device=self.output_layer.V.device,
+                                   dtype=self.output_layer.V.dtype)
             y = self.forward(x_tensor, params)
             return y.cpu().numpy()
 

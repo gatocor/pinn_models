@@ -38,7 +38,7 @@ from .domain import DomainCubic, DomainCubicPartition, SubdomainInfo, bump
 from .problem import Problem
 
 # Learning rate schedulers (backend-agnostic)
-from .backends import LRScheduler, ExponentialDecay
+from .backends import LRScheduler, ExponentialDecay, ReduceLROnPlateau
 
 
 def _load_backend(name):
@@ -166,4 +166,5 @@ __all__ = [
     # Learning rate schedulers
     "LRScheduler",
     "ExponentialDecay",
+    "ReduceLROnPlateau",
 ]

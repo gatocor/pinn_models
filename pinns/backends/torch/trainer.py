@@ -304,6 +304,11 @@ class Trainer(BaseTrainer):
                 loss.backward()
                 self.optimizer.step()
             
+            # Update ReduceLROnPlateau scheduler with current loss
+            if lr_scheduler is not None and hasattr(lr_scheduler, 'step'):
+                loss_val_for_scheduler = loss.item() if hasattr(loss, 'item') else float(loss)
+                lr_scheduler.step(loss_val_for_scheduler, epoch)
+            
             # Batch size for metrics computation (avoid OOM on large datasets)
             metrics_batch_size = self._batch_size if self._batch_size and self._batch_size > 0 else 1000
             
