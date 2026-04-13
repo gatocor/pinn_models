@@ -1,4 +1,6 @@
 examples/*.png
+examples/*.pdf
+examples/*.mp4
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
