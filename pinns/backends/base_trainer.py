@@ -408,7 +408,10 @@ class BaseTrainer(ABC):
                 self._train_pool[name] = self._to_tensor(np_data)
     
     def _select_from_pool(self, rng=None):
-        """Select training data from pre-sampled pool (fast random indexing)."""
+        """Select training data from pre-sampled pool (fast random indexing).
+        
+        Also updates target values for BCs with callable value functions.
+        """
         if not hasattr(self, '_train_pool') or self._train_pool is None:
             # Fallback to full resampling
             self._sample_train_data()
@@ -418,6 +421,7 @@ class BaseTrainer(ABC):
             rng = self.rng
         
         self._train_data = {}
+        self._train_targets = {}  # Reset targets for new selection
         samples_dict = self._list_to_dict_samples(self.train_samples)
         for name, n in samples_dict.items():
             if n > 0 and name in self._train_pool:
@@ -426,6 +430,16 @@ class BaseTrainer(ABC):
                 # Random indices from pool
                 indices = rng.choice(pool_size, size=n, replace=False)
                 self._train_data[name] = self._index_tensor(pool, indices)
+                
+                # Compute target values for BCs with callable value functions
+                if name != 'pde':
+                    bc = self._get_bc_by_name(name)
+                    if bc is not None and callable(bc.value):
+                        np_data = self._to_numpy(self._train_data[name])
+                        target_np = bc.value(np_data)
+                        if hasattr(target_np, 'squeeze'):
+                            target_np = target_np.squeeze(-1) if target_np.ndim > 1 else target_np
+                        self._train_targets[name] = self._to_tensor(target_np)
     
     @abstractmethod
     def _index_tensor(self, tensor, indices):
@@ -749,6 +763,13 @@ class BaseTrainer(ABC):
         self._adaptive_c = adaptive_c
         self._adaptive_factor = adaptive_factor
         
+        # Force creation of a new figure on next train() call
+        # This ensures a fresh plot in the new cell while keeping history
+        self._fig = None
+        self._axes = None
+        self._display_handle = None
+        self._colorbars = []
+        
         # Backend-specific hook (e.g., presampling in JAX)
         self._after_compile_hook()
         
@@ -839,16 +860,22 @@ class BaseTrainer(ABC):
             x: Input points (backend-specific tensor)
             
         Returns:
-            Target tensor (backend-specific)
+            Target tensor (backend-specific), 1D shape (n_points,)
         """
         from pinns.boundary import PointsetBC
         
         if isinstance(bc, PointsetBC):
-            return self._to_tensor(np.array(bc.values))
+            values = np.array(bc.values)
+            if values.ndim > 1:
+                values = values.squeeze(-1)
+            return self._to_tensor(values)
         elif callable(bc.value):
             x_np = np.asarray(x)  # Convert to numpy for user function
-            result = bc.value(x_np)
-            return self._to_tensor(np.asarray(result))
+            result = np.asarray(bc.value(x_np))
+            # Squeeze to 1D if result is 2D (e.g., shape (n, 1))
+            if result.ndim > 1:
+                result = result.squeeze(-1)
+            return self._to_tensor(result)
         else:
             return self._to_tensor(np.full((x.shape[0],), bc.value))
     
@@ -1182,22 +1209,45 @@ class BaseTrainer(ABC):
         return result
     
     def _sample_train_data(self):
-        """Sample training data and store as backend tensors."""
+        """Sample training data and store as backend tensors.
+        
+        Also precomputes target values for BCs with callable value functions.
+        """
         self._train_data = {}
+        self._train_targets = {}  # Store precomputed target values
         samples_dict = self._list_to_dict_samples(self.train_samples)
         for name, n in samples_dict.items():
             if n > 0:
                 np_data = self._sample_points_np(name, n)
                 self._train_data[name] = self._to_tensor(np_data)
+                
+                # Precompute target values for BCs with callable value functions
+                if name != 'pde':
+                    bc = self._get_bc_by_name(name)
+                    if bc is not None and callable(bc.value):
+                        target_np = bc.value(np_data)
+                        if hasattr(target_np, 'squeeze'):
+                            target_np = target_np.squeeze(-1) if target_np.ndim > 1 else target_np
+                        self._train_targets[name] = self._to_tensor(target_np)
     
     def _sample_test_data(self):
         """Sample test data and store as backend tensors."""
         self._test_data = {}
+        self._test_targets = {}  # Store precomputed target values
         samples_dict = self._list_to_dict_samples(self.test_samples)
         for name, n in samples_dict.items():
             if n > 0:
                 np_data = self._sample_points_np(name, n)
                 self._test_data[name] = self._to_tensor(np_data)
+                
+                # Precompute target values for BCs with callable value functions
+                if name != 'pde':
+                    bc = self._get_bc_by_name(name)
+                    if bc is not None and callable(bc.value):
+                        target_np = bc.value(np_data)
+                        if hasattr(target_np, 'squeeze'):
+                            target_np = target_np.squeeze(-1) if target_np.ndim > 1 else target_np
+                        self._test_targets[name] = self._to_tensor(target_np)
 
     def _get_n_batches(self) -> int:
         """Get number of mini-batches based on PDE data size and batch_size."""
@@ -1388,22 +1438,24 @@ class BaseTrainer(ABC):
             else:
                 n_cols = 2  # solution, residuals
             
-            n_rows = 1 + n_outputs + n_regions
+            # 2 rows for losses + mse_losses
+            n_rows = 2 + n_outputs + n_regions
             fig = plt.figure(figsize=(5 * n_cols, 3.5 * n_rows))
             gs = fig.add_gridspec(n_rows, n_cols)
             
             axes = {}
             axes['losses'] = fig.add_subplot(gs[0, :])
+            axes['mse_losses'] = fig.add_subplot(gs[1, :])
             
             for i in range(n_outputs):
-                axes[f'sol_{i}'] = fig.add_subplot(gs[1 + i, 0])
-                axes[f'res_{i}'] = fig.add_subplot(gs[1 + i, 1])
+                axes[f'sol_{i}'] = fig.add_subplot(gs[2 + i, 0])
+                axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, 1])
                 if has_solution:
-                    axes[f'err_{i}'] = fig.add_subplot(gs[1 + i, 2])
+                    axes[f'err_{i}'] = fig.add_subplot(gs[2 + i, 2])
             
             # Region plots
             for r in range(n_regions):
-                axes[f'region_{r}'] = fig.add_subplot(gs[1 + n_outputs + r, :])
+                axes[f'region_{r}'] = fig.add_subplot(gs[2 + n_outputs + r, :])
         
         elif n_dims == 2:
             if has_solution:
@@ -1411,39 +1463,41 @@ class BaseTrainer(ABC):
             else:
                 n_cols = 2  # predicted, residuals
             
-            n_rows = 1 + n_outputs + n_regions
+            n_rows = 2 + n_outputs + n_regions
             fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
             gs = fig.add_gridspec(n_rows, n_cols)
             
             axes = {}
             axes['losses'] = fig.add_subplot(gs[0, :])
+            axes['mse_losses'] = fig.add_subplot(gs[1, :])
             
             for i in range(n_outputs):
-                axes[f'sol_{i}'] = fig.add_subplot(gs[1 + i, 0])
+                axes[f'sol_{i}'] = fig.add_subplot(gs[2 + i, 0])
                 if has_solution:
-                    axes[f'true_{i}'] = fig.add_subplot(gs[1 + i, 1])
-                    axes[f'res_{i}'] = fig.add_subplot(gs[1 + i, 2])
-                    axes[f'err_{i}'] = fig.add_subplot(gs[1 + i, 3])
+                    axes[f'true_{i}'] = fig.add_subplot(gs[2 + i, 1])
+                    axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, 2])
+                    axes[f'err_{i}'] = fig.add_subplot(gs[2 + i, 3])
                 else:
-                    axes[f'res_{i}'] = fig.add_subplot(gs[1 + i, 1])
+                    axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, 1])
             
             for r in range(n_regions):
-                axes[f'region_{r}'] = fig.add_subplot(gs[1 + n_outputs + r, :])
+                axes[f'region_{r}'] = fig.add_subplot(gs[2 + n_outputs + r, :])
         
         else:
             # For 3D+: loss plot + region slices for all outputs with residuals
             n_cols = 2 * n_outputs  # Two columns per output (solution + residual)
-            n_rows = 1 + n_regions  # 1 for loss + one row per region
+            n_rows = 2 + n_regions  # 2 for losses + one row per region
             fig = plt.figure(figsize=(4 * n_cols, 4 * n_rows))
             gs = fig.add_gridspec(n_rows, n_cols)
             
             axes = {}
             axes['losses'] = fig.add_subplot(gs[0, :])
+            axes['mse_losses'] = fig.add_subplot(gs[1, :])
             
             for r in range(n_regions):
                 for i in range(n_outputs):
-                    axes[f'region_{r}_{i}'] = fig.add_subplot(gs[1 + r, 2*i])
-                    axes[f'region_res_{r}_{i}'] = fig.add_subplot(gs[1 + r, 2*i + 1])
+                    axes[f'region_{r}_{i}'] = fig.add_subplot(gs[2 + r, 2*i])
+                    axes[f'region_res_{r}_{i}'] = fig.add_subplot(gs[2 + r, 2*i + 1])
         
         self._colorbars = []
         return fig, axes
@@ -1499,6 +1553,57 @@ class BaseTrainer(ABC):
         ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8)
         ax.grid(True, alpha=0.3)
     
+    def _plot_mse_losses(self, ax):
+        """Plot MSE loss components on given axes."""
+        epochs = self.history['epoch']
+        if not epochs:
+            return
+        
+        # Total MSE loss
+        loss_data = self.history.get('loss', self.history.get('train_loss', []))
+        if loss_data:
+            ax.semilogy(epochs, loss_data, 'k-', label='MSE Total', linewidth=2)
+        
+        # PDE MSE losses
+        pde_losses = self.history.get('loss_pde', [])
+        if len(pde_losses) > 0:
+            if isinstance(pde_losses[0], (list, tuple)):
+                pde_array = np.array(pde_losses)
+                for i in range(pde_array.shape[1]):
+                    ax.semilogy(epochs, pde_array[:, i], 'b--', label=f'PDE eq{i+1}')
+            else:
+                ax.semilogy(epochs, pde_losses, 'b--', label='PDE')
+        
+        # BC MSE losses with names
+        bc_names = self._get_bc_names()
+        bc_losses = self.history.get('loss_bcs', [])
+        if bc_losses and len(bc_losses) > 0:
+            bc_losses_array = np.array(bc_losses)
+            if bc_losses_array.ndim == 2:
+                for i in range(bc_losses_array.shape[1]):
+                    bc_label = bc_names[i] if i < len(bc_names) else f'BC {i+1}'
+                    ax.semilogy(epochs, bc_losses_array[:, i], '--', label=bc_label)
+        
+        # Test loss
+        test_loss = self.history.get('test_loss', [])
+        if len(test_loss) > 0:
+            n_test = len(test_loss)
+            test_epochs = np.linspace(epochs[0], epochs[-1], n_test).astype(int) if n_test > 1 else [epochs[-1]]
+            ax.semilogy(test_epochs, test_loss, 'r:', marker='o', markersize=4, label='Test', linewidth=2)
+        
+        # Solution error
+        sol_error = self.history.get('solution_error', [])
+        if len(sol_error) > 0:
+            n_err = len(sol_error)
+            err_epochs = np.linspace(epochs[0], epochs[-1], n_err).astype(int) if n_err > 1 else [epochs[-1]]
+            ax.semilogy(err_epochs, sol_error, 'm-', marker='s', markersize=4, label='Solution Error', linewidth=2)
+        
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('MSE Loss')
+        ax.set_title('MSE Losses (Components)')
+        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8)
+        ax.grid(True, alpha=0.3)
+    
     def _plot_solution_1d(self, ax, output_idx, n_points=200):
         """Plot 1D solution on given axes."""
         x = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points).reshape(-1, 1)
@@ -1537,7 +1642,7 @@ class BaseTrainer(ABC):
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
         cmap = self._get_colormap(output_idx)
         im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', cmap=cmap)
-        cbar = plt.colorbar(im, ax=ax)
+        cbar = self._fig.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
         
         output_name = self._get_output_name(output_idx)
@@ -1567,7 +1672,7 @@ class BaseTrainer(ABC):
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
         cmap = self._get_colormap(output_idx)
         im = ax.imshow(Y_true, extent=extent, origin='lower', aspect='equal', cmap=cmap)
-        cbar = plt.colorbar(im, ax=ax)
+        cbar = self._fig.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
         
         output_name = self._get_output_name(output_idx)
@@ -1621,7 +1726,7 @@ class BaseTrainer(ABC):
         
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
         im = ax.imshow(error, extent=extent, origin='lower', aspect='equal', cmap='Reds')
-        cbar = plt.colorbar(im, ax=ax)
+        cbar = self._fig.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
         
         output_name = self._get_output_name(output_idx)
@@ -1692,7 +1797,7 @@ class BaseTrainer(ABC):
             extent = [x0.min(), x0.max(), x1.min(), x1.max()]
             cmap = self._get_colormap(output_idx)
             im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', cmap=cmap)
-            cbar = plt.colorbar(im, ax=ax)
+            cbar = self._fig.colorbar(im, ax=ax)
             self._colorbars.append(cbar)
             
             ax.set_xlabel(self._get_input_name(dim0))
@@ -1783,7 +1888,7 @@ class BaseTrainer(ABC):
             
             extent = [x0.min(), x0.max(), x1.min(), x1.max()]
             im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', cmap='viridis')
-            cbar = plt.colorbar(im, ax=ax, label='|Residual|')
+            cbar = self._fig.colorbar(im, ax=ax, label='|Residual|')
             self._colorbars.append(cbar)
             
             ax.set_xlabel(self._get_input_name(dim0))
@@ -1813,6 +1918,10 @@ class BaseTrainer(ABC):
                 ax.clear()
         
         self._plot_losses(axes['losses'])
+        
+        # Plot MSE losses if axis exists
+        if 'mse_losses' in axes:
+            self._plot_mse_losses(axes['mse_losses'])
         
         if n_dims == 1:
             for i in range(n_outputs):
@@ -1923,7 +2032,7 @@ class BaseTrainer(ABC):
         Res = res.reshape(X0.shape)
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
         im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', cmap='viridis')
-        cbar = plt.colorbar(im, ax=ax, label='|Residual|')
+        cbar = self._fig.colorbar(im, ax=ax, label='|Residual|')
         self._colorbars.append(cbar)
         
         output_name = self._get_output_name(output_idx)

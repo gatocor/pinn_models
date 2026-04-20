@@ -403,9 +403,10 @@ class FNN:
         self.device = device
         self.dtype = dtype
         
-        # Initialize parameters on the default device (JAX handles placement)
-        dummy_input = jnp.ones((1, self.layer_sizes[0]), dtype=dtype)
-        self.params = self._module.init(jax.random.PRNGKey(seed), dummy_input)
+        # Only initialize parameters if not already initialized
+        if not hasattr(self, 'params') or self.params is None:
+            dummy_input = jnp.ones((1, self.layer_sizes[0]), dtype=dtype)
+            self.params = self._module.init(jax.random.PRNGKey(seed), dummy_input)
         
         return self
 
@@ -563,8 +564,10 @@ class WFFNN:
         self.device = device
         self.dtype = dtype
         
-        dummy_input = jnp.ones((1, self.layer_sizes[0]), dtype=dtype)
-        self.params = self._module.init(jax.random.PRNGKey(seed), dummy_input)
+        # Only initialize parameters if not already initialized
+        if not hasattr(self, 'params') or self.params is None:
+            dummy_input = jnp.ones((1, self.layer_sizes[0]), dtype=dtype)
+            self.params = self._module.init(jax.random.PRNGKey(seed), dummy_input)
         
         return self
 
@@ -838,13 +841,15 @@ class PirateNet:
         self.device = device
         self.dtype = dtype
         
-        dummy_input = jnp.ones((1, self.input_dim), dtype=dtype)
-        
-        # Apply same transforms as in apply() to get correct input shape
-        if self.feature_encoding is not None:
-            dummy_input = self.feature_encoding(dummy_input, None)
-        
-        self.params = self._module.init(jax.random.PRNGKey(seed), dummy_input)
+        # Only initialize parameters if not already initialized
+        if not hasattr(self, 'params') or self.params is None:
+            dummy_input = jnp.ones((1, self.input_dim), dtype=dtype)
+            
+            # Apply same transforms as in apply() to get correct input shape
+            if self.feature_encoding is not None:
+                dummy_input = self.feature_encoding(dummy_input, None)
+            
+            self.params = self._module.init(jax.random.PRNGKey(seed), dummy_input)
         
         return self
 
@@ -1798,8 +1803,9 @@ class FBPINN:
         self.device = device
         self.dtype = dtype
         
-        # Initialize parameters for all active subdomains (JAX handles placement)
-        self.params = self.init(jax.random.PRNGKey(seed))
+        # Only initialize parameters if not already initialized
+        if not hasattr(self, 'params') or self.params is None:
+            self.params = self.init(jax.random.PRNGKey(seed))
         
         return self
     
