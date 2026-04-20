@@ -371,3 +371,231 @@ params = trainer._build_params()
 residual = trainer.problem.pde_fn(x_test, y_pred, params)
 print("Residual:", residual.item())
 ```
+
+---
+
+# ALTrainer (Augmented Lagrangian)
+
+The `ALTrainer` class implements the Augmented Lagrangian method for physics-informed neural networks (AL-PINNs). This approach improves constraint satisfaction by introducing adaptive Lagrange multipliers that automatically balance PDE residuals and boundary conditions.
+
+## When to Use ALTrainer
+
+ALTrainer is particularly beneficial for:
+
+- **Stiff boundary conditions**: When BCs are hard to satisfy with standard weighting
+- **Multi-scale problems**: Where different constraints have vastly different magnitudes
+- **Long-time simulations**: Where initial conditions must be preserved accurately
+- **Inverse problems**: Where data constraints must be balanced with physics
+
+## ALTrainer Class
+
+```python
+class ALTrainer:
+    def __init__(self, problem, network, device=None)
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `problem` | Problem | Problem definition (domain, PDE, BCs) |
+| `network` | nn.Module | Neural network (FNN or FBPINN) |
+| `device` | str | Device: 'cpu', 'cuda', 'mps' (auto-detected if None) |
+
+**Example:**
+
+```python
+import pinns
+
+problem = pinns.Problem(...)
+network = pinns.FNN([2, 64, 64, 1])
+
+trainer = pinns.ALTrainer(problem, network)
+```
+
+---
+
+## ALTrainer.compile()
+
+Configure training with Augmented Lagrangian parameters.
+
+```python
+trainer.compile(
+    train_samples,
+    test_samples=None,
+    weights=None,
+    optimizer="adam",
+    learning_rate=1e-3,
+    lagrange_constraints=None,
+    lagrange_optimizer="adam",
+    lagrange_lr=1e-3,
+    lagrange_max=1e6,
+    epochs=1000,
+    print_each=100,
+    show_plots=False,
+    ...
+)
+```
+
+### ALTrainer-Specific Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `lagrange_constraints` | list or None | None | Which constraints get λ multipliers |
+| `lagrange_optimizer` | str | "adam" | Optimizer for λ updates: 'adam', 'sgd', 'none' |
+| `lagrange_lr` | float | 1e-3 | Learning rate for λ updates |
+| `lagrange_max` | float | 1e6 | Maximum magnitude for λ clipping |
+
+### lagrange_constraints
+
+Specify which constraints should have adaptive Lagrange multipliers:
+
+```python
+# Apply λ only to boundary conditions (recommended)
+trainer.compile(
+    ...,
+    lagrange_constraints=['initial', 'left', 'right'],
+)
+
+# Apply λ to all constraints including PDE
+trainer.compile(
+    ...,
+    lagrange_constraints=None,  # or ['pde', 'initial', 'left', 'right']
+)
+```
+
+**Best Practice**: Apply Lagrange multipliers to boundary/initial conditions only, keeping the PDE term with fixed weight. This follows the original AL-PINNs paper methodology.
+
+### lagrange_optimizer
+
+Choose how Lagrange multipliers are updated:
+
+| Option | Description |
+|--------|-------------|
+| `"adam"` | Adaptive updates (recommended, matches AL-PINNs paper) |
+| `"sgd"` | Simple gradient ascent |
+| `"none"` | Fixed multipliers (no adaptation) |
+
+---
+
+## ALTrainer.train()
+
+Execute the Augmented Lagrangian training loop.
+
+```python
+trainer.train()
+```
+
+**Training Dynamics:**
+
+Each epoch performs:
+1. **Primal step**: Update network parameters to minimize augmented loss
+2. **Dual step**: Update Lagrange multipliers via gradient ascent
+
+The augmented Lagrangian loss is:
+
+$$L = \sum_i \left[ \beta_i \cdot \text{MSE}(g_i) + \lambda_i \cdot g_i \right]$$
+
+where:
+- $g_i$ = constraint residual
+- $\beta_i$ = penalty weight (from `weights`)
+- $\lambda_i$ = adaptive Lagrange multiplier
+
+---
+
+## ALTrainer History
+
+ALTrainer tracks additional metrics:
+
+```python
+trainer.history = {
+    'epoch': [],           # Epoch numbers
+    'loss': [],            # MSE loss (for comparison)
+    'al_loss': [],         # Augmented Lagrangian loss
+    'mse_loss': [],        # Pure MSE loss
+    'loss_pde': [],        # PDE MSE loss
+    'loss_bcs': [],        # BC MSE losses
+    'al_pde_penalty': [],  # PDE penalty term (β·MSE)
+    'al_pde_lagrangian': [], # PDE Lagrangian term (λ·g)
+    'al_bcs_penalty': [],  # BC penalty terms
+    'al_bcs_lagrangian': [], # BC Lagrangian terms
+    'test_loss': [],
+    'solution_error': []
+}
+```
+
+---
+
+## Complete ALTrainer Example
+
+```python
+import pinns
+import numpy as np
+
+# Define problem (viscous Burgers equation)
+nu = 0.01 / np.pi
+domain = pinns.DomainCubic([0, -1], [1, 1])
+
+def initial_condition(X):
+    return -np.sin(np.pi * X[:, 1:2])
+
+domain.add_dirichlet((0, None), value=initial_condition, component=0, name="initial")
+domain.add_dirichlet((None, 0), value=0.0, component=0, name="left")
+domain.add_dirichlet((None, 1), value=0.0, component=0, name="right")
+
+def burgers_residual(X, U, params, derivative=None):
+    if derivative is None:
+        derivative = pinns.derivative
+    nu = params['fixed']['nu']
+    u = U[:, 0:1]
+    u_t = derivative(u, X, 0, (0,))
+    u_x = derivative(u, X, 0, (1,))
+    u_xx = derivative(u, X, 0, (1, 1))
+    return u_t + u * u_x - nu * u_xx
+
+problem = pinns.Problem(
+    domain,
+    burgers_residual,
+    input_names=["t", "x"],
+    output_names=["u"],
+    params={'nu': nu},
+)
+
+# Create network and ALTrainer
+network = pinns.FNN([2, 256, 256, 1], activation="tanh")
+trainer = pinns.ALTrainer(problem, network)
+
+# Compile with AL settings
+trainer.compile(
+    train_samples={"pde": 2601, "initial": 100, "left": 50, "right": 50},
+    test_samples={"pde": 1000},
+    weights={"pde": 1.0, "initial": 1.0, "left": 1.0, "right": 1.0},
+    optimizer="adam",
+    learning_rate=1e-4,
+    lagrange_constraints=['initial', 'left', 'right'],  # λ on BCs only
+    lagrange_optimizer='adam',
+    lagrange_lr=1e-3,
+    epochs=50000,
+    print_each=1000,
+    show_plots=True,
+)
+
+trainer.train()
+```
+
+---
+
+## ALTrainer vs Trainer Comparison
+
+| Feature | Trainer | ALTrainer |
+|---------|---------|-----------|
+| Loss function | Weighted MSE | Augmented Lagrangian |
+| Constraint balance | Manual weights | Adaptive λ multipliers |
+| Convergence | May stall on stiff BCs | Better constraint satisfaction |
+| Complexity | Simpler | Additional hyperparameters |
+| Best for | Simple problems | Multi-scale, stiff BCs |
+
+**Recommendation**: Start with `Trainer`. Switch to `ALTrainer` if:
+- Boundary conditions remain unsatisfied
+- Loss plateaus with high BC residuals
+- Different constraints have very different scales

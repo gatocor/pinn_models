@@ -184,6 +184,43 @@ plt.show()
 ## Next Steps
 
 - Learn about [FBPINN](examples/fbpinn.md) for complex multi-scale problems
+- Try [ALTrainer](api/trainer.md#altrainer-augmented-lagrangian) for better constraint satisfaction
 - Explore [domain sampling](api/domain.md) strategies
 - Implement [hard constraints](examples/hard_constraints.md) using output transforms
 - Check out more [examples](examples/index.md)
+
+## Advanced: Using ALTrainer
+
+If your boundary conditions are not being satisfied well with the standard `Trainer`, consider using `ALTrainer` (Augmented Lagrangian method):
+
+```python
+# Replace Trainer with ALTrainer
+trainer = pinns.ALTrainer(problem, network)
+
+trainer.compile(
+    train_samples={
+        "pde": 5000,
+        "left": 200,
+        "right": 200,
+        "initial": 500
+    },
+    weights={
+        "pde": 1.0,
+        "left": 1.0,
+        "right": 1.0,
+        "initial": 1.0
+    },
+    optimizer="adam",
+    learning_rate=1e-4,
+    lagrange_constraints=['left', 'right', 'initial'],  # Adaptive λ on BCs
+    lagrange_optimizer='adam',
+    lagrange_lr=1e-3,
+    epochs=50000,
+    print_each=1000,
+    show_plots=True
+)
+
+trainer.train()
+```
+
+ALTrainer automatically adjusts constraint weights during training, helping to balance PDE residuals with boundary conditions.

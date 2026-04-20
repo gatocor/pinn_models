@@ -177,6 +177,63 @@ domain.add_dirichlet(
 )
 ```
 
+### Callable Boundary Conditions
+
+Boundary conditions can be specified as callable functions for spatially or temporally varying values. The function receives input coordinates and returns target values:
+
+```python
+def my_bc_value(X):
+    """
+    Callable BC function.
+    
+    Args:
+        X: Input coordinates, shape (n_points, n_dims)
+           Uses NumPy arrays (converted internally to backend tensors)
+    
+    Returns:
+        Target values, shape (n_points,) or (n_points, 1)
+    """
+    return some_computation(X)
+```
+
+**Examples of callable BCs:**
+
+```python
+import numpy as np
+
+# Sinusoidal initial condition
+def initial_u(X):
+    x = X[:, 0:1]  # First coordinate (spatial)
+    return np.sin(np.pi * x)
+
+domain.add_dirichlet((None, 0), value=initial_u, component=0, name="initial")
+
+# Gaussian pulse initial condition
+def gaussian_pulse(X):
+    x = X[:, 0:1]
+    return np.exp(-50 * (x - 0.5)**2)
+
+domain.add_dirichlet((None, 0), value=gaussian_pulse, component=0, name="pulse")
+
+# Time-varying boundary condition
+def oscillating_bc(X):
+    t = X[:, 1:2]  # Second coordinate (time)
+    return np.sin(2 * np.pi * t)
+
+domain.add_dirichlet((0, None), value=oscillating_bc, component=0, name="left")
+
+# Space-dependent Neumann condition
+def flux_profile(X):
+    x = X[:, 0:1]
+    return 0.5 * np.cos(np.pi * x)
+
+domain.add_neumann((None, 1), value=flux_profile, component=0, name="top_flux")
+```
+
+**Backend Compatibility:**
+
+Callable BCs work with both JAX and PyTorch backends. Use NumPy operations in your callable function - the library handles conversion to the appropriate backend tensors internally.
+
 ---
 
 ### add_neumann

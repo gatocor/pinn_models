@@ -9,7 +9,7 @@ This section provides detailed documentation for all modules in the PINNS packag
 | [Domain](domain.md) | Domain definition, sampling, and boundary conditions |
 | [Networks](networks.md) | Neural network architectures (FNN, FBPINN) |
 | [Problem](problem.md) | Problem definition combining domain, PDE, and parameters |
-| [Trainer](trainer.md) | Training loop with visualization |
+| [Trainer](trainer.md) | Training loop with visualization (Trainer, ALTrainer) |
 | [Functional](functional.md) | Derivative operators for PDEs |
 
 ## Quick Reference
@@ -79,6 +79,7 @@ lap_u = pinns.laplacian(V, X, component=0)
 ### Training
 
 ```python
+# Standard Trainer
 trainer = pinns.Trainer(problem, network)
 
 trainer.compile(
@@ -88,6 +89,22 @@ trainer.compile(
     optimizer="adam",
     learning_rate=1e-3,
     epochs=5000
+)
+
+trainer.train()
+
+# ALTrainer (Augmented Lagrangian) for better constraint satisfaction
+trainer = pinns.ALTrainer(problem, network)
+
+trainer.compile(
+    train_samples={"pde": 1000, "bc1": 100},
+    weights={"pde": 1.0, "bc1": 1.0},
+    optimizer="adam",
+    learning_rate=1e-4,
+    lagrange_constraints=['bc1'],  # Adaptive λ on BCs
+    lagrange_optimizer='adam',
+    lagrange_lr=1e-3,
+    epochs=50000
 )
 
 trainer.train()
