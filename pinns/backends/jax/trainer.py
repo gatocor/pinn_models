@@ -1481,6 +1481,29 @@ def _train_lagrangian_mode_impl(self):
 
     print(f"Starting Trainer (JAX, Lagrangian mode) for {epochs} epochs...")
 
+    # Print epoch 0 (before any training — mirrors standard training loop)
+    if print_each > 0:
+        _, compute_residuals = self._make_al_loss_fn(params_dict)
+        residuals0 = compute_residuals(self.network.params, self._train_data, train_targets)
+        bc_names = self._get_bc_names()
+        pde_mse0 = float(jnp.mean(residuals0['pde'] ** 2)) if 'pde' in residuals0 else 0.0
+        bc_mse0 = [float(jnp.mean(residuals0[n] ** 2)) if n in residuals0 else 0.0 for n in bc_names]
+        mse0 = float(sum(jnp.mean(g ** 2) for g in residuals0.values()))
+        self.history['epoch'].append(start_epoch)
+        self.history['loss'].append(mse0)
+        self.history['train_loss'].append(mse0)
+        self.history['loss_pde'].append([pde_mse0])
+        self.history['loss_bcs'].append(bc_mse0)
+        if any(s > 0 for s in self.test_samples) and self._test_data:
+            metrics_batch_size = self._batch_size if self._batch_size and self._batch_size > 0 else 1000
+            test_weights0 = {k: 1.0 for k in self._test_data.keys()}
+            test_total0, _ = self._compute_total_loss_batched(
+                self._test_data, params_dict, test_weights0, batch_size=metrics_batch_size
+            )
+            self.history['test_loss'].append(float(test_total0))
+        bc_losses_str0 = ", ".join(f"{bc_names[i]}: {bc_mse0[i]:.2e}" for i in range(len(bc_names)))
+        print(f"Epoch 0/{epochs} | MSE Loss: {mse0:.2e} | PDE: {pde_mse0:.2e} | BCs: [{bc_losses_str0}]")
+
     for epoch in range(start_epoch, start_epoch + epochs):
         self._outer_epoch = epoch - start_epoch
 
@@ -1504,23 +1527,30 @@ def _train_lagrangian_mode_impl(self):
         )
         self._update_lagrange_multipliers(residuals)
 
-        al_loss_val = float(loss)
-        mse_loss_val = float(sum(jnp.mean(g ** 2) for g in residuals.values()))
-        bc_names = self._get_bc_names()
-        pde_mse = float(jnp.mean(residuals['pde'] ** 2)) if 'pde' in residuals else 0.0
-        bc_mse_losses = [float(jnp.mean(residuals[name] ** 2)) if name in residuals else 0.0 for name in bc_names]
-        self.history['epoch'].append(epoch)
-        self.history['loss'].append(mse_loss_val)
-        self.history['train_loss'].append(mse_loss_val)
-        self.history.setdefault('al_loss', []).append(al_loss_val)
-        self.history.setdefault('al_pde_penalty', []).append(float(losses.get('pde_penalty', 0.0)))
-        self.history.setdefault('al_pde_lagrangian', []).append(float(losses.get('pde_lagrangian', 0.0)))
-        self.history.setdefault('al_bcs_penalty', []).append([float(losses.get(f'{name}_penalty', 0.0)) for name in bc_names])
-        self.history.setdefault('al_bcs_lagrangian', []).append([float(losses.get(f'{name}_lagrangian', 0.0)) for name in bc_names])
-        self.history['loss_pde'].append([pde_mse])
-        self.history['loss_bcs'].append(bc_mse_losses)
-
         if print_each > 0 and ((epoch + 1) % print_each == 0 or epoch == start_epoch + epochs - 1):
+            al_loss_val = float(loss)
+            mse_loss_val = float(sum(jnp.mean(g ** 2) for g in residuals.values()))
+            bc_names = self._get_bc_names()
+            pde_mse = float(jnp.mean(residuals['pde'] ** 2)) if 'pde' in residuals else 0.0
+            bc_mse_losses = [float(jnp.mean(residuals[name] ** 2)) if name in residuals else 0.0 for name in bc_names]
+            self.history['epoch'].append(epoch)
+            self.history['loss'].append(mse_loss_val)
+            self.history['train_loss'].append(mse_loss_val)
+            self.history.setdefault('al_loss', []).append(al_loss_val)
+            self.history.setdefault('al_pde_penalty', []).append(float(losses.get('pde_penalty', 0.0)))
+            self.history.setdefault('al_pde_lagrangian', []).append(float(losses.get('pde_lagrangian', 0.0)))
+            self.history.setdefault('al_bcs_penalty', []).append([float(losses.get(f'{name}_penalty', 0.0)) for name in bc_names])
+            self.history.setdefault('al_bcs_lagrangian', []).append([float(losses.get(f'{name}_lagrangian', 0.0)) for name in bc_names])
+            self.history['loss_pde'].append([pde_mse])
+            self.history['loss_bcs'].append(bc_mse_losses)
+            if any(s > 0 for s in self.test_samples) and self._test_data:
+                metrics_batch_size = self._batch_size if self._batch_size and self._batch_size > 0 else 1000
+                test_weights = {k: 1.0 for k in self._test_data.keys()}
+                test_total, _ = self._compute_total_loss_batched(
+                    self._test_data, params_dict, test_weights, batch_size=metrics_batch_size
+                )
+                self.history['test_loss'].append(float(test_total))
+
             elapsed = time.time() - start_time
             if self.problem.solution is not None:
                 sol_error = self._compute_solution_error()
