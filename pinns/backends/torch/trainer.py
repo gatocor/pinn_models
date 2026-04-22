@@ -45,6 +45,131 @@ class Trainer(BaseTrainer):
         
         # PyTorch-specific: ensure dtype is set
         self.dtype = torch.float32
+
+        # Single-class AL state
+        self._is_lagrangian_mode = False
+        self.lagrange_multipliers = {}
+        self.lagrange_lr = 1.0
+        self._lagrange_max = 1e6
+        self._lagrange_constraints = None
+        self._lagrange_optimizer = None
+        self._lagrange_optimizer_name = 'adam'
+
+    def _problem_uses_lagrange(self) -> bool:
+        lagrange = getattr(self.problem, 'lagrange_multipliers', None)
+        return bool(lagrange)
+
+    def _resolve_problem_lagrange_constraints(self) -> Optional[List[str]]:
+        lagrange = getattr(self.problem, 'lagrange_multipliers', None)
+        if not lagrange:
+            return None
+
+        requested = set(lagrange)
+        resolved = []
+
+        output_names = list(getattr(self.problem, 'output_names', []) or [])
+        pde_tokens = {'pde'}
+        for name in output_names:
+            pde_tokens.add(name)
+            pde_tokens.add(f"DE_{name}")
+            pde_tokens.add(f"R_{name}")
+        if any(token in requested for token in pde_tokens):
+            resolved.append('pde')
+
+        for bc_name in self._get_bc_names():
+            if bc_name in requested:
+                resolved.append(bc_name)
+        return resolved
+
+    def compile(
+        self,
+        *args,
+        auto_lagrangian: bool = True,
+        lagrange_constraints: list = None,
+        lagrange_lr: float = 1.0,
+        lagrange_max: float = 1e6,
+        lagrange_optimizer: str = "adam",
+        **kwargs,
+    ):
+        """
+        Compile trainer in a single-class setup.
+
+        Standard or AL mode is selected within this class (no delegation).
+        """
+        super().compile(*args, **kwargs)
+
+        resolved_constraints = lagrange_constraints
+        if resolved_constraints is None:
+            resolved_constraints = self._resolve_problem_lagrange_constraints()
+
+        has_explicit_al_options = (
+            lagrange_lr != 1.0
+            or lagrange_max != 1e6
+            or lagrange_optimizer != "adam"
+        )
+        has_al_request = (
+            resolved_constraints is not None
+            or self._problem_uses_lagrange()
+            or has_explicit_al_options
+        )
+        self._is_lagrangian_mode = bool(auto_lagrangian and has_al_request)
+
+        self.lagrange_lr = lagrange_lr
+        self._lagrange_max = lagrange_max
+        self._lagrange_constraints = resolved_constraints
+        self._lagrange_optimizer_name = lagrange_optimizer
+
+        if self._is_lagrangian_mode:
+            _initialize_lagrange_multipliers_impl_torch(self)
+
+    def _constraint_uses_quadratic(self, constraint_name: str) -> bool:
+        no_quadratic = getattr(self.problem, 'no_quadratic', None)
+        if not no_quadratic:
+            return True
+        if constraint_name == 'pde':
+            aliases = {'pde'}
+            for name in list(getattr(self.problem, 'output_names', []) or []):
+                aliases.add(name)
+                aliases.add(f"DE_{name}")
+                aliases.add(f"R_{name}")
+            return not any(alias in no_quadratic for alias in aliases)
+        return constraint_name not in no_quadratic
+
+    def _initialize_lagrange_multipliers(self):
+        return _initialize_lagrange_multipliers_impl_torch(self)
+
+    def _create_lagrange_optimizer(self):
+        return _create_lagrange_optimizer_impl_torch(self)
+
+    def _reinitialize_lagrange_if_needed(self):
+        return _reinitialize_lagrange_if_needed_impl_torch(self)
+
+    def _compute_constraint_residuals(self, data: Dict, params_dict: Dict) -> Dict[str, torch.Tensor]:
+        return _compute_constraint_residuals_impl_torch(self, data, params_dict)
+
+    def _compute_bc_residual(self, bc, x, params_dict) -> torch.Tensor:
+        return _compute_bc_residual_impl_torch(self, bc, x, params_dict)
+
+    def _compute_al_loss(self, data: Dict, params_dict: Dict, weights_dict: Dict) -> tuple:
+        return _compute_al_loss_impl_torch(self, data, params_dict, weights_dict)
+
+    def _update_lagrange_multipliers(self, data: Dict, params_dict: Dict):
+        return _update_lagrange_multipliers_impl_torch(self, data, params_dict)
+
+    def get_lagrange_statistics(self) -> Dict[str, Dict[str, float]]:
+        return _get_lagrange_statistics_impl_torch(self)
+
+    def reset_lagrange_multipliers(self):
+        return _reset_lagrange_multipliers_impl_torch(self)
+
+    def _plot_losses(self, ax):
+        return _plot_losses_impl_torch(self, ax)
+
+    def _plot_mse_losses(self, ax):
+        return _plot_mse_losses_impl_torch(self, ax)
+
+    def reset_betas(self, betas: dict = None):
+        return _reset_betas_impl_torch(self, betas)
     
     # ==================== Device Detection ====================
     
@@ -162,6 +287,10 @@ class Trainer(BaseTrainer):
     
     def train(self):
         """Run training loop."""
+        if self._is_lagrangian_mode:
+            _train_lagrangian_mode_impl_torch(self)
+            return
+
         epochs = self._epochs
         print_each = self._print_each
         show_plots = self._show_plots
@@ -445,7 +574,7 @@ class Trainer(BaseTrainer):
             plt.close(self._fig)
 
 
-class ALTrainer(Trainer):
+class _LagrangianTrainerInternal(Trainer):
     """
     Augmented Lagrangian Trainer for Physics-Informed Neural Networks.
     
@@ -470,7 +599,7 @@ class ALTrainer(Trainer):
         3. Repeat until convergence
     
     Example:
-        trainer = ALTrainer(problem, network)
+        trainer = Trainer(problem, network)
         trainer.compile(
             optimizer="adam",
             learning_rate=1e-3,
@@ -491,7 +620,7 @@ class ALTrainer(Trainer):
         device=None,
     ):
         """
-        Initialize ALTrainer.
+        Initialize Lagrangian-mode internals.
         
         Args:
             problem: The problem to solve (domain, PDE, BCs, params).
@@ -536,7 +665,7 @@ class ALTrainer(Trainer):
         **kwargs
     ):
         """
-        Configure training parameters for ALTrainer.
+        Configure training parameters for Lagrangian mode.
         
         Args:
             optimizer: Optimizer name ('adam', 'lbfgs', 'sgd').
@@ -941,7 +1070,7 @@ class ALTrainer(Trainer):
         
         weights_dict = self._list_to_dict_weights(self.weights)
         
-        print(f"Starting ALTrainer (PyTorch) for {epochs} epochs...")
+        print(f"Starting Trainer (PyTorch, Lagrangian mode) for {epochs} epochs...")
         print(f"Weights (penalty parameters): {weights_dict}")
         print(f"Lagrange optimizer: {self._lagrange_optimizer_name}, lr: {self.lagrange_lr}")
         
@@ -1158,7 +1287,7 @@ class ALTrainer(Trainer):
                     )
         
         self._global_epoch += epochs
-        print(f"ALTrainer complete in {time.time() - training_start_time:.1f}s")
+        print(f"Trainer (Lagrangian mode) complete in {time.time() - training_start_time:.1f}s")
         
         # Close figure to prevent duplicate display in notebooks
         if is_notebook() and show_plots and self._fig is not None:

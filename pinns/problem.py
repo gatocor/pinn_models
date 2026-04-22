@@ -1,6 +1,7 @@
 import torch
 from typing import Callable, List, Dict, Any, Optional, Union
 from dataclasses import dataclass, field
+import re
 
 from .boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC
 from .domain import DomainCubic, DomainCubicPartition
@@ -79,6 +80,8 @@ class Problem:
     output_names: List[str] = field(default_factory=list)
     output_range: Optional[Union[tuple, List[Optional[tuple]]]] = None
     solution: Optional[Callable] = None
+    lagrange_multipliers: Optional[List[str]] = field(default=None)
+    no_quadratic: Optional[List[str]] = field(default=None)
     
     def __post_init__(self):
         # Get n_dims from domain
@@ -222,6 +225,195 @@ class Problem:
     def update_params(self, **kwargs):
         """Update problem parameters."""
         self.params.update(kwargs)
+
+    def _latex_name(self, name: str) -> str:
+        """Convert a user-facing name into a LaTeX-safe label."""
+        if name is None:
+            return "unnamed"
+        name = str(name)
+        name = name.replace("\\", r"\backslash ")
+        name = name.replace("_", r"\_")
+        name = name.replace(" ", r"\ ")
+        return name
+
+    def _pde_symbols(self) -> List[str]:
+        """Return symbolic labels for PDE residual terms."""
+        if self.output_names:
+            return [self._latex_name(name) for name in self.output_names]
+        return [str(i) for i in range(self.n_outputs)]
+
+    def _bc_symbol(self, bc, index: int) -> str:
+        """Return a symbolic label for a boundary-condition term."""
+        if getattr(bc, 'name', None):
+            return self._latex_name(bc.name)
+        return f"bc_{index}"
+
+    def _is_lagrange(self, name: str) -> bool:
+        """Check if a term name is in the lagrange_multipliers list."""
+        if self.lagrange_multipliers is None:
+            return False
+        return name in self.lagrange_multipliers
+
+    def _has_quadratic(self, name: str) -> bool:
+        """Check if a term should include the quadratic (L2) loss term."""
+        if self.no_quadratic is None:
+            return True
+        return name not in self.no_quadratic
+
+    def get_problem_latex(
+        self,
+        augmented_lagrangian: bool = False,
+        include_constraint_legend: bool = True,
+    ) -> str:
+        """
+        Build a LaTeX representation of the optimization problem.
+
+        The rendering of each term depends on ``lagrange_multipliers`` and
+        ``no_quadratic`` stored in the problem:
+
+        * By default every term contributes a weighted quadratic:
+          ``w/N * ||R||_2^2``.
+        * Terms listed in ``no_quadratic`` omit that quadratic contribution.
+        * Terms listed in ``lagrange_multipliers`` also add a per-sample
+          Lagrange multiplier contribution:  ``(1/N) sum_i lambda_i R(x_i)``.
+        * Passing ``augmented_lagrangian=True`` treats **all** terms as if
+          they were in ``lagrange_multipliers`` (backward-compatible flag).
+
+        Args:
+            augmented_lagrangian: If True, add Lagrange multiplier terms for every residual.
+            include_constraint_legend: If True, append a compact legend describing residual symbols.
+
+        Returns:
+            A LaTeX string suitable for display with IPython ``Math``.
+        """
+        terms = []
+        legend_terms = []
+        has_any_al = False
+
+        # --- PDE residual terms ---
+        for raw_name, symbol in zip(self.output_names or [], self._pde_symbols()):
+            is_al = augmented_lagrangian or self._is_lagrange(raw_name)
+            has_quad = self._has_quadratic(raw_name)
+
+            if has_quad:
+                terms.append(
+                    rf"\frac{{w_{{{symbol}}}}}{{N_{{{symbol}}}}}\left\|\mathcal{{R}}_{{{symbol}}}\right\|_2^2"
+                )
+            if is_al:
+                has_any_al = True
+                terms.append(
+                    rf"\frac{{1}}{{N_{{{symbol}}}}}\langle \boldsymbol{{\lambda}}_{{{symbol}}},\,\mathcal{{R}}_{{{symbol}}} \rangle"
+                )
+
+            if include_constraint_legend:
+                legend_terms.append(
+                    rf"\mathcal{{R}}_{{{symbol}}}:\text{{ PDE residual for }}{symbol}"
+                )
+                legend_terms.append(
+                    rf"N_{{{symbol}}}:\text{{ number of PDE samples for }}{symbol}"
+                )
+                if has_quad:
+                    legend_terms.append(
+                        rf"w_{{{symbol}}}:\text{{ weight for }}{symbol}"
+                    )
+                if is_al:
+                    legend_terms.append(
+                        rf"\boldsymbol{{\lambda}}_{{{symbol}}}:\text{{ Lagrange multipliers vector for }}{symbol}"
+                    )
+
+        # --- Boundary condition terms ---
+        for i, bc in enumerate(self.boundary_conditions):
+            symbol = self._bc_symbol(bc, i)
+            raw_name = getattr(bc, 'name', None) or f"bc_{i}"
+            is_al = augmented_lagrangian or self._is_lagrange(raw_name)
+            has_quad = self._has_quadratic(raw_name)
+            bc_type = re.sub(r'BC$', '', type(bc).__name__)
+
+            if has_quad:
+                terms.append(
+                    rf"\frac{{w_{{{symbol}}}}}{{N_{{{symbol}}}}}\left\|\mathcal{{B}}_{{{symbol}}}\right\|_2^2"
+                )
+            if is_al:
+                has_any_al = True
+                terms.append(
+                    rf"\frac{{1}}{{N_{{{symbol}}}}}\langle \boldsymbol{{\lambda}}_{{{symbol}}},\,\mathcal{{B}}_{{{symbol}}} \rangle"
+                )
+
+            if include_constraint_legend:
+                legend_terms.append(
+                    rf"\mathcal{{B}}_{{{symbol}}}:\text{{ {bc_type} residual for }}{symbol}"
+                )
+                legend_terms.append(
+                    rf"N_{{{symbol}}}:\text{{ number of samples for }}{symbol}"
+                )
+                if has_quad:
+                    legend_terms.append(
+                        rf"w_{{{symbol}}}:\text{{ weight for }}{symbol}"
+                    )
+                if is_al:
+                    legend_terms.append(
+                        rf"\boldsymbol{{\lambda}}_{{{symbol}}}:\text{{ Lagrange multipliers vector for }}{symbol}"
+                    )
+
+        if not terms:
+            objective = r"\mathcal{L}(\theta,\boldsymbol{\lambda})=0"
+            operator = r"\min_\theta\;"
+        else:
+            if has_any_al:
+                all_lambda_symbols = []
+                for raw_name, symbol in zip(self.output_names or [], self._pde_symbols()):
+                    if augmented_lagrangian or self._is_lagrange(raw_name):
+                        all_lambda_symbols.append(rf"\boldsymbol{{\lambda}}_{{{symbol}}}")
+                for i, bc in enumerate(self.boundary_conditions):
+                    raw_name = getattr(bc, 'name', None) or f"bc_{i}"
+                    symbol = self._bc_symbol(bc, i)
+                    if augmented_lagrangian or self._is_lagrange(raw_name):
+                        all_lambda_symbols.append(rf"\boldsymbol{{\lambda}}_{{{symbol}}}")
+                lambda_vars = ",".join(all_lambda_symbols)
+                operator = rf"\min_\theta \max_{{{lambda_vars}}}\;"
+                objective = r"\mathcal{L}(\theta,\boldsymbol{\lambda})=" + " + ".join(terms)
+            else:
+                operator = r"\min_\theta\;"
+                objective = r"\mathcal{L}(\theta)=" + " + ".join(terms)
+
+        lines = [rf"{operator} {objective}"]
+
+        if include_constraint_legend and legend_terms:
+            legend_block = r" \\[4pt] \begin{array}{l} " + r" \\ ".join(legend_terms) + r" \end{array}"
+            lines.append(legend_block)
+
+        return "".join(lines)
+
+    def show_problem(
+        self,
+        augmented_lagrangian: bool = False,
+        include_constraint_legend: bool = True,
+    ) -> str:
+        """
+        Display the optimization problem in LaTeX when possible.
+
+        In notebook environments this renders a formatted math block. In plain Python
+        sessions it prints the generated LaTeX string.
+
+        Args:
+            augmented_lagrangian: If True, include symbolic Lagrange multiplier terms.
+            include_constraint_legend: If True, append a compact legend for residual symbols.
+
+        Returns:
+            The generated LaTeX string.
+        """
+        latex = self.get_problem_latex(
+            augmented_lagrangian=augmented_lagrangian,
+            include_constraint_legend=include_constraint_legend,
+        )
+
+        try:
+            from IPython.display import Math, display
+            display(Math(latex))
+        except Exception:
+            print(latex)
+
+        return latex
     
     def __repr__(self):
         n_bcs = len(self.boundary_conditions)

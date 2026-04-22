@@ -39,7 +39,7 @@ from .networks import (
     get_activation
 )
 
-from .trainer import Trainer, ALTrainer
+from .trainer import Trainer
 
 __all__ = [
     # Functional (same API as PyTorch)
@@ -64,5 +64,4 @@ __all__ = [
     'get_activation',
     # Training (same API as PyTorch)
     'Trainer',
-    'ALTrainer',
 ]

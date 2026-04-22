@@ -336,6 +336,8 @@ class BaseTrainer(ABC):
         self._plot_n_points = 200
         self._batch_size = None
         self._compiled = False
+        self._plot_kwargs = {}
+        self._plot_style = {}
     
     def _setup_network_normalization(self):
         """Set up input/output normalization on the network from problem definition."""
@@ -614,6 +616,10 @@ class BaseTrainer(ABC):
         adaptive_factor: int = 2,
         # Learning rate scheduler
         lr_scheduler: Optional[LRScheduler] = None,
+        # Time/domain curriculum
+        curriculum_t_ends: Optional[List[float]] = None,
+        curriculum_t_epochs: int = 1000,
+        curriculum_t_dim: int = 0,
         # L-BFGS specific parameters
         lbfgs_max_iter: int = 5,
         lbfgs_history_size: int = 50,
@@ -621,6 +627,10 @@ class BaseTrainer(ABC):
         lbfgs_line_search: str = "strong_wolfe",
         # SOAP specific parameters
         soap_params: Optional[Dict[str, Any]] = None,
+        # Plot keyword arguments
+        plot_kwargs: Optional[Dict[str, Any]] = None,
+        # Plot style
+        plot_style: Optional[Dict[str, Any]] = None,
     ):
         """
         Configure training parameters.
@@ -653,6 +663,13 @@ class BaseTrainer(ABC):
             adaptive_c: Offset for uniform sampling in RAR mode. Higher c = more uniform. Default: 1.0.
             adaptive_factor: Oversampling factor for RAR mode. Sample factor*n points, then select n. Default: 2.
             lr_scheduler: Learning rate scheduler (e.g., ExponentialDecay). If None, constant learning rate.
+            curriculum_t_ends: Progressive domain schedule — list of end values for the chosen
+                input dimension (e.g. [2.0, 5.0, 10.0]). Training starts sampling up to
+                curriculum_t_ends[0], advances to curriculum_t_ends[1] after
+                curriculum_t_epochs epochs, and so on. Use this to implement time-causal
+                curriculum learning. If None, disabled.
+            curriculum_t_epochs: Number of epochs per curriculum stage (default: 1000).
+            curriculum_t_dim: Which input dimension is the "time" axis (default: 0).
             lbfgs_max_iter: Max iterations per L-BFGS step (default: 5).
             lbfgs_history_size: History size for L-BFGS (default: 50).
             lbfgs_tolerance: Tolerance for gradient convergence (default: 1e-9).
@@ -666,6 +683,39 @@ class BaseTrainer(ABC):
                 - precondition_frequency: How often to update preconditioner (default: 10)
                 - max_precond_dim: Max preconditioner dimension (default: 10000)
                 - precondition_1d: Whether to precondition 1D params (default: False)
+            plot_kwargs: Optional dict of kwargs to customise individual plot panels.
+                Keys select the panel; values are dicts passed to ``ax.set()``.
+                Supported keys:
+                  - ``"losses"``      – weighted-loss panel
+                  - ``"mse_losses"``  – MSE-loss panel
+                  - ``"solution"``    – all solution panels
+                  - ``"residuals"``   – all residual panels
+                  - ``"error"``       – all error panels
+                Common matplotlib ``set()`` kwargs: ``yscale``, ``xscale``,
+                ``ylim``, ``xlim``, ``title``, ``xlabel``, ``ylabel``.
+                Example::
+
+                    plot_kwargs={
+                        "losses":   {"yscale": "log"},
+                        "solution": {"ylim": (-1.5, 1.5)},
+                    }
+            plot_style: Optional dict to control the overall figure appearance.
+                Keys:
+                  - ``"theme"``      – ``"dark"`` or ``"light"`` (default). Applies
+                    matplotlib\'s ``dark_background`` / default style.
+                  - ``"bg_color"``   – axes background color (any matplotlib color,
+                    e.g. ``"#1e1e2e"``, ``"white"``, ``"#0d0d0d"``).
+                  - ``"fig_color"``  – figure (outer) background color.
+                  - ``"text_color"`` – color for labels, titles and tick labels.
+                  - ``"grid_color"`` – gridline color (default: auto from theme).
+                Example::
+
+                    plot_style={
+                        "theme": "dark",
+                        "bg_color": "#1e1e2e",
+                        "fig_color": "#13131f",
+                        "text_color": "white",
+                    }
         """
         n_bcs = len(self.problem.boundary_conditions)
         expected_len = 1 + n_bcs
@@ -732,6 +782,8 @@ class BaseTrainer(ABC):
         self._print_each = print_each
         self._show_plots = show_plots
         self._save_plots = save_plots
+        self._plot_kwargs = plot_kwargs if plot_kwargs is not None else {}
+        self._plot_style = plot_style if plot_style is not None else {}
         
         if isinstance(show_subdomains, bool):
             self._show_subdomains = {'solution': show_subdomains, 'residuals': show_subdomains, 'zoom': show_subdomains}
@@ -762,6 +814,15 @@ class BaseTrainer(ABC):
         self._adaptive_k = adaptive_k
         self._adaptive_c = adaptive_c
         self._adaptive_factor = adaptive_factor
+
+        # Time/domain curriculum
+        self._curriculum_t_ends = list(curriculum_t_ends) if curriculum_t_ends else None
+        self._curriculum_t_epochs = curriculum_t_epochs
+        self._curriculum_t_dim = curriculum_t_dim
+        self._curriculum_t_stage = -1  # -1 means not yet applied
+        # Save original domain xmax so we can restore after training
+        if self._curriculum_t_ends:
+            self._curriculum_t_original_xmax = float(self.problem.domain.xmax[curriculum_t_dim])
         
         # Force creation of a new figure on next train() call
         # This ensures a fresh plot in the new cell while keeping history
@@ -1208,6 +1269,41 @@ class BaseTrainer(ABC):
             result[name] = weights_list[i + 1]
         return result
     
+    def _curriculum_step(self, global_epoch: int) -> bool:
+        """
+        Advance the time-domain curriculum if the current epoch crosses a stage boundary.
+
+        The domain's upper bound along `_curriculum_t_dim` is updated and training
+        data is resampled. Returns True when a stage transition occurred.
+        """
+        if not self._curriculum_t_ends:
+            return False
+
+        stage = min(global_epoch // self._curriculum_t_epochs, len(self._curriculum_t_ends) - 1)
+        if stage == self._curriculum_t_stage:
+            return False
+
+        self._curriculum_t_stage = stage
+        new_end = float(self._curriculum_t_ends[stage])
+        self.problem.domain.xmax[self._curriculum_t_dim] = new_end
+        self._sample_train_data()
+        if self._test_data:
+            self._sample_test_data()
+        # NOTE: optimizer state is intentionally NOT reset here.
+        # Accumulated momentum from the old region provides inertia that resists
+        # the large gradients from new (unseen) collocation points overwriting
+        # what was already learned.
+        # If using Lagrangian mode, resize λ vectors to match new sample count
+        if getattr(self, '_is_lagrangian_mode', False) and hasattr(self, '_reinitialize_lagrange_if_needed'):
+            self._reinitialize_lagrange_if_needed()
+        print(f"  [curriculum] Stage {stage}: domain end = {new_end}")
+        return True
+
+    def _curriculum_restore(self):
+        """Restore original domain upper bound after training with curriculum."""
+        if self._curriculum_t_ends and hasattr(self, '_curriculum_t_original_xmax'):
+            self.problem.domain.xmax[self._curriculum_t_dim] = self._curriculum_t_original_xmax
+
     def _sample_train_data(self):
         """Sample training data and store as backend tensors.
         
@@ -1285,7 +1381,7 @@ class BaseTrainer(ABC):
             else:
                 names.append(f'bc_{i}')
         return names
-    
+
     def _get_output_name(self, output_idx: int) -> str:
         """Get the name of an output by index."""
         if hasattr(self.problem, 'output_names') and self.problem.output_names is not None:
@@ -1425,6 +1521,75 @@ class BaseTrainer(ABC):
                     pass
         self._colorbars = []
     
+    def _apply_plot_kwargs(self, ax, key: str):
+        """Apply user-supplied plot_kwargs for *key* to *ax* via ax.set()."""
+        _IMSHOW_KEYS = {'norm', 'cmap', 'vmin', 'vmax', 'alpha', 'interpolation'}
+        kwargs = {k: v for k, v in getattr(self, '_plot_kwargs', {}).get(key, {}).items()
+                  if k not in _IMSHOW_KEYS}
+        if kwargs:
+            ax.set(**kwargs)
+
+    def _get_imshow_kwargs(self, key: str) -> dict:
+        """Return imshow-specific kwargs (norm, cmap, vmin, vmax, …) from plot_kwargs[key]."""
+        _IMSHOW_KEYS = {'norm', 'cmap', 'vmin', 'vmax', 'alpha', 'interpolation'}
+        return {k: v for k, v in getattr(self, '_plot_kwargs', {}).get(key, {}).items()
+                if k in _IMSHOW_KEYS}
+
+    def _apply_plot_style(self, fig, axes: dict):
+        """Apply plot_style settings (theme, bg_color, fig_color, text_color) to fig/axes."""
+        style = getattr(self, '_plot_style', {})
+        if not style:
+            return
+
+        theme = style.get('theme', 'light')
+        if theme == 'dark':
+            default_bg   = '#1a1a2e'
+            default_fig  = '#0f0f1a'
+            default_text = 'white'
+            default_grid = '#444466'
+        else:
+            default_bg   = 'white'
+            default_fig  = '#f8f8f8'
+            default_text = 'black'
+            default_grid = '#cccccc'
+
+        bg_color   = style.get('bg_color',   default_bg)
+        fig_color  = style.get('fig_color',  default_fig)
+        text_color = style.get('text_color', default_text)
+        grid_color = style.get('grid_color', default_grid)
+
+        fig.patch.set_facecolor(fig_color)
+
+        for ax in axes.values():
+            ax.set_facecolor(bg_color)
+            ax.tick_params(colors=text_color)
+            ax.xaxis.label.set_color(text_color)
+            ax.yaxis.label.set_color(text_color)
+            ax.title.set_color(text_color)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(text_color)
+            # Recolor existing gridlines
+            ax.grid(True, color=grid_color, alpha=0.4)
+            # Recolor legend text if present
+            legend = ax.get_legend()
+            if legend is not None:
+                legend.get_frame().set_facecolor(bg_color)
+                legend.get_frame().set_edgecolor(text_color)
+                for text in legend.get_texts():
+                    text.set_color(text_color)
+
+        # Recolor colorbars
+        for cbar in getattr(self, '_colorbars', []):
+            cbar.ax.tick_params(colors=text_color)
+            cbar.ax.yaxis.label.set_color(text_color)
+            cbar.ax.xaxis.label.set_color(text_color)
+            cbar.outline.set_edgecolor(text_color)
+            # colorbar label (set via label= kwarg in colorbar())
+            if cbar.ax.get_ylabel():
+                cbar.ax.yaxis.label.set_color(text_color)
+            for spine in cbar.ax.spines.values():
+                spine.set_edgecolor(text_color)
+
     def _create_figure(self):
         """Create figure and axes for plotting."""
         n_dims = self.problem.n_dims
@@ -1500,6 +1665,7 @@ class BaseTrainer(ABC):
                     axes[f'region_res_{r}_{i}'] = fig.add_subplot(gs[2 + r, 2*i + 1])
         
         self._colorbars = []
+        self._apply_plot_style(fig, axes)
         return fig, axes
     
     def _plot_losses(self, ax):
@@ -1629,7 +1795,7 @@ class BaseTrainer(ABC):
         ax.set_title(f'Solution ({output_name})')
         ax.grid(True, alpha=0.3)
     
-    def _plot_solution_2d(self, ax, output_idx, n_points=50):
+    def _plot_solution_2d(self, ax, output_idx, n_points=50, plot_key='solution'):
         """Plot 2D solution as heatmap on given axes."""
         x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
         x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
@@ -1641,7 +1807,9 @@ class BaseTrainer(ABC):
         
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
         cmap = self._get_colormap(output_idx)
-        im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', cmap=cmap)
+        ikw = {'cmap': cmap}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+        im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', **ikw)
         cbar = self._fig.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
         
@@ -1650,7 +1818,7 @@ class BaseTrainer(ABC):
         ax.set_xlabel(self._get_input_name(0))
         ax.set_ylabel(self._get_input_name(1))
     
-    def _plot_true_solution_2d(self, ax, output_idx, n_points=50):
+    def _plot_true_solution_2d(self, ax, output_idx, n_points=50, plot_key='solution'):
         """Plot 2D true solution as heatmap on given axes."""
         if self.problem.solution is None:
             return
@@ -1671,7 +1839,9 @@ class BaseTrainer(ABC):
         
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
         cmap = self._get_colormap(output_idx)
-        im = ax.imshow(Y_true, extent=extent, origin='lower', aspect='equal', cmap=cmap)
+        ikw = {'cmap': cmap}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+        im = ax.imshow(Y_true, extent=extent, origin='lower', aspect='equal', **ikw)
         cbar = self._fig.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
         
@@ -1704,7 +1874,7 @@ class BaseTrainer(ABC):
         ax.set_title(f'Absolute Error ({output_name})')
         ax.grid(True, alpha=0.3)
     
-    def _plot_error_2d(self, ax, output_idx, n_points=50):
+    def _plot_error_2d(self, ax, output_idx, n_points=50, plot_key='error'):
         """Plot 2D absolute error as heatmap."""
         if self.problem.solution is None:
             return
@@ -1725,7 +1895,9 @@ class BaseTrainer(ABC):
         error = np.abs(y[:, output_idx] - y_true[:, output_idx]).reshape(X0.shape)
         
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
-        im = ax.imshow(error, extent=extent, origin='lower', aspect='equal', cmap='Reds')
+        ikw = {'cmap': 'Reds'}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+        im = ax.imshow(error, extent=extent, origin='lower', aspect='equal', **ikw)
         cbar = self._fig.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
         
@@ -1918,30 +2090,39 @@ class BaseTrainer(ABC):
                 ax.clear()
         
         self._plot_losses(axes['losses'])
+        self._apply_plot_kwargs(axes['losses'], 'losses')
         
         # Plot MSE losses if axis exists
         if 'mse_losses' in axes:
             self._plot_mse_losses(axes['mse_losses'])
+            self._apply_plot_kwargs(axes['mse_losses'], 'mse_losses')
         
         if n_dims == 1:
             for i in range(n_outputs):
                 if f'sol_{i}' in axes:
                     self._plot_solution_1d(axes[f'sol_{i}'], i, n_points)
+                    self._apply_plot_kwargs(axes[f'sol_{i}'], 'solution')
                 if f'res_{i}' in axes:
                     self._plot_residuals_1d(axes[f'res_{i}'], i, n_points)
+                    self._apply_plot_kwargs(axes[f'res_{i}'], 'residuals')
                 if f'err_{i}' in axes and has_solution:
                     self._plot_error_1d(axes[f'err_{i}'], i, n_points)
+                    self._apply_plot_kwargs(axes[f'err_{i}'], 'error')
         
         elif n_dims == 2:
             for i in range(n_outputs):
                 if f'sol_{i}' in axes:
-                    self._plot_solution_2d(axes[f'sol_{i}'], i, n_points)
+                    self._plot_solution_2d(axes[f'sol_{i}'], i, n_points, plot_key='solution')
+                    self._apply_plot_kwargs(axes[f'sol_{i}'], 'solution')
                 if f'true_{i}' in axes and has_solution:
-                    self._plot_true_solution_2d(axes[f'true_{i}'], i, n_points)
+                    self._plot_true_solution_2d(axes[f'true_{i}'], i, n_points, plot_key='solution')
+                    self._apply_plot_kwargs(axes[f'true_{i}'], 'solution')
                 if f'res_{i}' in axes:
-                    self._plot_residuals_2d(axes[f'res_{i}'], i, n_points)
+                    self._plot_residuals_2d(axes[f'res_{i}'], i, n_points, plot_key='residuals')
+                    self._apply_plot_kwargs(axes[f'res_{i}'], 'residuals')
                 if f'err_{i}' in axes and has_solution:
-                    self._plot_error_2d(axes[f'err_{i}'], i, n_points)
+                    self._plot_error_2d(axes[f'err_{i}'], i, n_points, plot_key='error')
+                    self._apply_plot_kwargs(axes[f'err_{i}'], 'error')
         
         # Plot regions (for any dimension)
         regions = getattr(self, '_plot_regions', [])
@@ -1952,12 +2133,19 @@ class BaseTrainer(ABC):
                 for i in range(n_outputs):
                     if f'region_{r}_{i}' in axes:
                         self._plot_region_nd(axes[f'region_{r}_{i}'], i, region, n_points)
+                        self._apply_plot_kwargs(axes[f'region_{r}_{i}'], 'region')
+                        self._apply_plot_kwargs(axes[f'region_{r}_{i}'], f'region_{r}')
                     if f'region_res_{r}_{i}' in axes:
                         self._plot_region_residuals_nd(axes[f'region_res_{r}_{i}'], i, region, n_points)
+                        self._apply_plot_kwargs(axes[f'region_res_{r}_{i}'], 'region')
+                        self._apply_plot_kwargs(axes[f'region_res_{r}_{i}'], f'region_{r}')
             elif f'region_{r}' in axes:
                 # 1D/2D case: single axis per region (plots first output)
                 self._plot_region_nd(axes[f'region_{r}'], 0, region, n_points)
+                self._apply_plot_kwargs(axes[f'region_{r}'], 'region')
+                self._apply_plot_kwargs(axes[f'region_{r}'], f'region_{r}')
         
+        self._apply_plot_style(fig, axes)
         fig.tight_layout()
     
     def plot_progress(self, save_path=None, n_points=200, fig=None, axes=None, display_handle=None):
@@ -2014,7 +2202,7 @@ class BaseTrainer(ABC):
         ax.set_title(f'PDE Residual ({output_name})')
         ax.grid(True, alpha=0.3)
 
-    def _plot_residuals_2d(self, ax, output_idx, n_points=50):
+    def _plot_residuals_2d(self, ax, output_idx, n_points=50, plot_key='residuals'):
         """Plot 2D PDE residuals as heatmap."""
         x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
         x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
@@ -2031,7 +2219,9 @@ class BaseTrainer(ABC):
         
         Res = res.reshape(X0.shape)
         extent = [x0.min(), x0.max(), x1.min(), x1.max()]
-        im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', cmap='viridis')
+        ikw = {'cmap': 'viridis'}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+        im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', **ikw)
         cbar = self._fig.colorbar(im, ax=ax, label='|Residual|')
         self._colorbars.append(cbar)
         

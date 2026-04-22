@@ -53,8 +53,133 @@ class Trainer(BaseTrainer):
             network: The neural network to train (FBPINN or FNN Flax module).
             device: Device to use ('cpu', 'gpu', 'tpu'). Default: auto-detect.
         """
+        # Reset network parameters so to() always reinitializes fresh weights
+        if hasattr(network, 'params'):
+            network.params = None
+
         # Initialize base class (handles network.to(), normalization, defaults)
         super().__init__(problem, network, device)
+
+        # Single-class AL state
+        self._is_lagrangian_mode = False
+        self.lagrange_multipliers = {}
+        self.lagrange_lr = 1.0
+        self._lagrange_max = 1e6
+        self._lagrange_constraints = None
+        self._lagrange_optimizer = None
+        self._lagrange_opt_states = {}
+        self._lagrange_optimizer_name = 'adam'
+
+    def _problem_uses_lagrange(self) -> bool:
+        lagrange = getattr(self.problem, 'lagrange_multipliers', None)
+        return bool(lagrange)
+
+    def _resolve_problem_lagrange_constraints(self) -> Optional[List[str]]:
+        lagrange = getattr(self.problem, 'lagrange_multipliers', None)
+        if not lagrange:
+            return None
+
+        requested = set(lagrange)
+        resolved = []
+
+        output_names = list(getattr(self.problem, 'output_names', []) or [])
+        pde_tokens = {'pde'}
+        for name in output_names:
+            pde_tokens.add(name)
+            pde_tokens.add(f"DE_{name}")
+            pde_tokens.add(f"R_{name}")
+        if any(token in requested for token in pde_tokens):
+            resolved.append('pde')
+
+        for bc_name in self._get_bc_names():
+            if bc_name in requested:
+                resolved.append(bc_name)
+        return resolved
+
+    def compile(
+        self,
+        *args,
+        auto_lagrangian: bool = True,
+        lagrange_constraints: list = None,
+        lagrange_lr: float = 1.0,
+        lagrange_max: float = 1e6,
+        lagrange_optimizer: str = "adam",
+        **kwargs,
+    ):
+        """
+        Compile trainer in a single-class setup.
+
+        Standard or AL mode is selected within this class (no delegation).
+        """
+        super().compile(*args, **kwargs)
+
+        resolved_constraints = lagrange_constraints
+        if resolved_constraints is None:
+            resolved_constraints = self._resolve_problem_lagrange_constraints()
+
+        has_al_request = (
+            resolved_constraints is not None
+            or self._problem_uses_lagrange()
+        )
+        self._is_lagrangian_mode = bool(auto_lagrangian and has_al_request)
+
+        self.lagrange_lr = lagrange_lr
+        self._lagrange_max = lagrange_max
+        self._lagrange_optimizer_name = lagrange_optimizer
+
+        prev_constraints = self._lagrange_constraints
+        self._lagrange_constraints = resolved_constraints
+
+        if self._is_lagrangian_mode:
+            constraints_changed = (resolved_constraints != prev_constraints)
+            first_time = not bool(self.lagrange_multipliers)
+            if first_time or constraints_changed:
+                _initialize_lagrange_multipliers_impl(self)
+            else:
+                # Lagrange lr may have changed — rebuild optimizer but keep λ values
+                if self._lagrange_optimizer_name == 'adam':
+                    self._lagrange_optimizer = optax.adam(self.lagrange_lr)
+                elif self._lagrange_optimizer_name == 'sgd':
+                    self._lagrange_optimizer = optax.sgd(self.lagrange_lr)
+                else:
+                    self._lagrange_optimizer = None
+
+    def _constraint_uses_quadratic(self, constraint_name: str) -> bool:
+        """Return True if a constraint keeps its quadratic penalty term."""
+        no_quadratic = getattr(self.problem, 'no_quadratic', None)
+        if not no_quadratic:
+            return True
+
+        if constraint_name == 'pde':
+            aliases = {'pde'}
+            for name in list(getattr(self.problem, 'output_names', []) or []):
+                aliases.add(name)
+                aliases.add(f"DE_{name}")
+                aliases.add(f"R_{name}")
+            return not any(alias in no_quadratic for alias in aliases)
+
+        return constraint_name not in no_quadratic
+
+    def _initialize_lagrange_multipliers(self):
+        return _initialize_lagrange_multipliers_impl(self)
+
+    def _reinitialize_lagrange_if_needed(self):
+        return _reinitialize_lagrange_if_needed_impl(self)
+
+    def _make_al_loss_fn(self, params_dict):
+        return _make_al_loss_fn_impl(self, params_dict)
+
+    def _update_lagrange_multipliers(self, residuals):
+        return _update_lagrange_multipliers_impl(self, residuals)
+
+    def get_lagrange_statistics(self) -> Dict[str, Dict[str, float]]:
+        return _get_lagrange_statistics_impl(self)
+
+    def reset_lagrange_multipliers(self):
+        return _reset_lagrange_multipliers_impl(self)
+
+    def reset_betas(self, betas: dict = None):
+        return _reset_betas_impl(self, betas)
     
     # ==================== Device Detection ====================
     
@@ -401,6 +526,10 @@ class Trainer(BaseTrainer):
                 u_x = derivative(U, X, 0, (0,))
                 ...
         """
+        if self._is_lagrangian_mode:
+            _train_lagrangian_mode_impl(self)
+            return
+
         epochs = self._epochs
         print_each = self._print_each
         show_plots = self._show_plots
@@ -537,7 +666,10 @@ class Trainer(BaseTrainer):
         for epoch in range(epochs):
             epoch_start = time.time()
             global_epoch = start_epoch + epoch
-            
+
+            # Time-domain curriculum: expand sampling window if stage changed
+            self._curriculum_step(global_epoch)
+
             # Update learning rate if scheduler is provided
             # Skip for SOAP (has its own LR handling) and L-BFGS
             if lr_scheduler is not None and self.optimizer_name not in ("lbfgs", "soap"):
@@ -690,6 +822,7 @@ class Trainer(BaseTrainer):
         
         self._global_epoch += epochs
         print(f"Training complete in {time.time() - start_time:.1f}s")
+        self._curriculum_restore()
         
         # Close figure to prevent duplicate display in notebooks
         if is_notebook() and show_plots and self._fig is not None:
@@ -1040,831 +1173,271 @@ class Trainer(BaseTrainer):
         return self.history
 
 
-class ALTrainer(Trainer):
-    """
-    Augmented Lagrangian Trainer for Physics-Informed Neural Networks (JAX).
-    
-    Implements the augmented Lagrangian method where the loss function is:
-        L = ||data - NN(x_i)||_L2 + sum_i [β_i ||g_i(x_j)||^2 + λ_{ij} g_i(x_j)]
-    
-    where:
-        - The first term is the data loss (supervised)
-        - β_i are fixed penalty parameters for each constraint i (PDE, boundaries)
-        - g_i(x_j) are the constraint residuals at points j
-        - λ_{ij} are Lagrange multipliers for each constraint i at point j
-    
-    The optimization is a min-max problem:
-        - Minimize over NN parameters
-        - Maximize over Lagrange multipliers λ
-    
-    Algorithm:
-        1. Initialize λ_{ij} = 0 for all constraints and points
-        2. For each epoch:
-           a. Fix λ, minimize over NN params (primal update)
-           b. Update λ: λ_{ij} = λ_{ij} + λ_lr * g_i(x_j) (dual update)
-        3. Repeat until convergence
-    
-    Example:
-        trainer = ALTrainer(problem, network)
-        trainer.compile(
-            optimizer="adam",
-            learning_rate=1e-3,
-            weights={'pde': 1.0, 'left': 500.0, 'right': 500.0},
-            lagrange_lr=1.0,
-        )
-        trainer.train()
-    
-    Attributes:
-        lagrange_multipliers: Dict of Lagrange multipliers λ_i for each constraint (per point)
-        lagrange_lr: Learning rate for dual (λ) updates
-    """
-    
-    def __init__(
-        self,
-        problem,
-        network,
-        device=None,
-    ):
-        """
-        Initialize ALTrainer.
-        
-        Args:
-            problem: The problem to solve (domain, PDE, BCs, params).
-            network: The neural network to train.
-            device: Device to use ('cpu', 'gpu', 'tpu'). Default: auto-detect.
-        """
-        super().__init__(problem, network, device)
-        
-        # Augmented Lagrangian specific attributes
-        self.lagrange_multipliers = {}  # Lagrange multipliers λ_i (per constraint, per point)
-        self.lagrange_lr = 1.0  # Dual learning rate
-        self._outer_epoch = 0
-        self._lagrange_max = 1e6  # Maximum absolute value for λ (clipping)
-        self._lagrange_constraints = None  # Which constraints get λ (None = all)
-        self._lagrange_optimizer = None  # Optimizer for λ updates
-        self._lagrange_opt_states = {}  # Optimizer states for each λ
-    
-    def compile(
-        self,
-        optimizer: str = "adam",
-        learning_rate: float = 1e-3,
-        train_samples: int = 1000,
-        test_samples: int = 0,
-        epochs: int = 10000,
-        weights: dict = None,
-        lagrange_lr: float = 1.0,
-        lagrange_max: float = 1e6,
-        lagrange_constraints: list = None,
-        lagrange_optimizer: str = "adam",
-        print_each: int = 100,
-        show_plots: bool = False,
-        save_plots: str = None,
-        resample_each: int = 0,
-        plot_n_points: int = 10000,
-        plot_regions: list = None,
-        adaptive_sampling: bool = False,
-        adaptive_each: int = 100,
-        adaptive_ratio: float = 0.5,
-        adaptive_mode: str = 'replace',
-        lr_scheduler = None,
-        batch_size: int = None,
-        **kwargs
-    ):
-        """
-        Configure training parameters for ALTrainer.
-        
-        Args:
-            optimizer: Optimizer name ('adam', 'sgd', 'rmsprop').
-            learning_rate: Learning rate for the optimizer.
-            train_samples: Number of training samples per constraint.
-            test_samples: Number of test samples (0 to disable).
-            epochs: Total number of epochs.
-            weights: Penalty parameters (weights) for each constraint.
-                   Dict with keys 'pde' and BC names, values are floats.
-                   Example: {'pde': 1.0, 'left': 500.0, 'right': 500.0}
-                   These serve as β_i in the augmented Lagrangian loss.
-            lagrange_lr: Learning rate for Lagrange multiplier updates.
-            lagrange_max: Maximum absolute value for λ (clipping for stability).
-            lagrange_constraints: List of constraint names to apply λ to. Default None = all.
-                   Use e.g. ['left', 'right', 'bottom', 'top'] to only apply λ to boundaries.
-            lagrange_optimizer: Optimizer for λ updates ('adam', 'sgd', or 'none'). Default 'adam'.
-                   'adam' matches the AL-PINNs paper using Adam with momentum for stable λ updates.
-                   'none' uses simple gradient ascent: λ = λ + lr * g / N.
-            print_each: Print progress every N epochs.
-            show_plots: Show live plots during training.
-            save_plots: Path prefix for saving plots.
-            resample_each: Resample collocation points every N epochs.
-            plot_n_points: Number of points for plotting.
-            plot_regions: List of zoom regions for plots.
-            adaptive_sampling: Enable adaptive sampling based on residuals.
-            adaptive_each: Frequency of adaptive resampling.
-            adaptive_ratio: Fraction of points to resample adaptively.
-            adaptive_mode: 'replace' or 'add' for adaptive sampling.
-            lr_scheduler: Learning rate scheduler.
-            batch_size: Batch size for mini-batch training.
-            **kwargs: Additional arguments passed to parent compile().
-        """
-        # Store AL-specific parameters
-        self.lagrange_lr = lagrange_lr
-        self._lagrange_max = lagrange_max
-        self._lagrange_constraints = lagrange_constraints  # None means all constraints
-        self._lagrange_optimizer_name = lagrange_optimizer  # 'adam', 'sgd', or 'none'
-        
-        # Call parent compile (handles optimizer, sampling, weights, etc.)
-        super().compile(
-            optimizer=optimizer,
-            learning_rate=learning_rate,
-            train_samples=train_samples,
-            test_samples=test_samples,
-            epochs=epochs,
-            weights=weights,
-            print_each=print_each,
-            show_plots=show_plots,
-            save_plots=save_plots,
-            resample_each=resample_each,
-            plot_n_points=plot_n_points,
-            plot_regions=plot_regions,
-            adaptive_sampling=adaptive_sampling,
-            adaptive_each=adaptive_each,
-            adaptive_ratio=adaptive_ratio,
-            adaptive_mode=adaptive_mode,
-            lr_scheduler=lr_scheduler,
-            batch_size=batch_size,
-            **kwargs
-        )
-    
-    def _after_compile_hook(self):
-        """Initialize Lagrange multipliers after data is sampled."""
-        super()._after_compile_hook()
-        self._initialize_lagrange_multipliers()
-    
-    def _initialize_lagrange_multipliers(self):
-        """Initialize Lagrange multipliers λ for each constraint and point."""
-        self.lagrange_multipliers = {}
-        self._lagrange_opt_states = {}
-        
-        # Create λ optimizer (matching paper: Adam with lagrange_lr)
-        if self._lagrange_optimizer_name == 'adam':
-            self._lagrange_optimizer = optax.adam(self.lagrange_lr)
-        elif self._lagrange_optimizer_name == 'sgd':
-            self._lagrange_optimizer = optax.sgd(self.lagrange_lr)
-        else:
-            self._lagrange_optimizer = None  # Simple gradient ascent
-        
-        # For PDE constraint
-        if 'pde' in self._train_data:
-            n_pde_points = len(self._train_data['pde'])
-            self.lagrange_multipliers['pde'] = jnp.zeros(n_pde_points)
+def _initialize_lagrange_multipliers_impl(self):
+    self.lagrange_multipliers = {}
+    self._lagrange_opt_states = {}
+    if self._lagrange_optimizer_name == 'adam':
+        self._lagrange_optimizer = optax.adam(self.lagrange_lr)
+    elif self._lagrange_optimizer_name == 'sgd':
+        self._lagrange_optimizer = optax.sgd(self.lagrange_lr)
+    else:
+        self._lagrange_optimizer = None
+
+    if 'pde' in self._train_data and ((self._lagrange_constraints is None) or ('pde' in self._lagrange_constraints)):
+        n = len(self._train_data['pde'])
+        self.lagrange_multipliers['pde'] = jnp.zeros(n)
+        if self._lagrange_optimizer is not None:
+            self._lagrange_opt_states['pde'] = self._lagrange_optimizer.init(self.lagrange_multipliers['pde'])
+
+    for name in self._get_bc_names():
+        if name in self._train_data and ((self._lagrange_constraints is None) or (name in self._lagrange_constraints)):
+            n = len(self._train_data[name])
+            self.lagrange_multipliers[name] = jnp.zeros(n)
             if self._lagrange_optimizer is not None:
-                self._lagrange_opt_states['pde'] = self._lagrange_optimizer.init(self.lagrange_multipliers['pde'])
-        
-        # For each BC constraint
-        bc_names = self._get_bc_names()
-        for name in bc_names:
-            if name in self._train_data:
-                n_bc_points = len(self._train_data[name])
-                self.lagrange_multipliers[name] = jnp.zeros(n_bc_points)
-                if self._lagrange_optimizer is not None:
-                    self._lagrange_opt_states[name] = self._lagrange_optimizer.init(self.lagrange_multipliers[name])
-    
-    def _reinitialize_lagrange_if_needed(self):
-        """Reinitialize λ if data size changed (e.g., after resampling)."""
-        for name, data in self._train_data.items():
-            if name in self.lagrange_multipliers:
-                if len(self.lagrange_multipliers[name]) != len(data):
-                    self.lagrange_multipliers[name] = jnp.zeros(len(data))
-                    if self._lagrange_optimizer is not None:
-                        self._lagrange_opt_states[name] = self._lagrange_optimizer.init(self.lagrange_multipliers[name])
-    
-    def _make_al_loss_fn(self, params_dict):
-        """
-        Create augmented Lagrangian loss function for JIT compilation.
-        
-        Returns a function that computes:
-            L = sum_i [β_i ||g_i||^2 + λ_i · g_i]
-        """
-        from pinns.boundary import NeumannBC, DirichletBC, RobinBC
-        
-        # Pre-extract BC info
-        bc_info = {}
-        bc_names = self._get_bc_names()
-        
-        for i, bc in enumerate(self.problem.boundary_conditions):
-            name = bc_names[i]
-            is_neumann = isinstance(bc, (NeumannBC, RobinBC))
-            
-            bc_info[name] = {
-                'component': bc.component,
-                'is_neumann': is_neumann,
-                'const_value': bc.value if not callable(bc.value) else None,
-                'has_callable_value': callable(bc.value),
-            }
-            
-            if is_neumann:
-                normal_dim, normal_sign = bc.get_normal_direction()
-                bc_info[name]['normal_dim'] = normal_dim
-                bc_info[name]['normal_sign'] = normal_sign
-        
-        pde_fn = self.problem.pde_fn
-        network = self.network
-        
-        sig = inspect.signature(pde_fn)
-        pde_accepts_derivative = len(sig.parameters) >= 4
-        
-        def model_apply_with_params(params, x):
-            return network.apply(params, x, params_dict)
-        
-        def compute_residuals(params, train_data, targets_dict=None):
-            """Compute all constraint residuals."""
-            residuals = {}
-            if targets_dict is None:
-                targets_dict = {}
-            
-            # PDE residual
-            if 'pde' in train_data:
-                x_pde = train_data['pde']
-                y_pde = model_apply_with_params(params, x_pde)
-                deriv_fn = make_derivative_fn(model_apply_with_params, params)
-                
-                if pde_accepts_derivative:
-                    pde_residual = pde_fn(x_pde, y_pde, params_dict, deriv_fn)
-                else:
-                    set_context(network.apply, params)
-                    try:
-                        pde_residual = pde_fn(x_pde, y_pde, params_dict)
-                    finally:
-                        clear_context()
-                
-                if isinstance(pde_residual, (list, tuple)):
-                    residuals['pde'] = sum(r.flatten() for r in pde_residual)
-                else:
-                    residuals['pde'] = pde_residual.flatten()
-            
-            # BC residuals
-            for name, info in bc_info.items():
-                if name in train_data:
-                    x_bc = train_data[name]
-                    y_bc = model_apply_with_params(params, x_bc)
-                    comp = info['component']
-                    u = y_bc[:, comp]
-                    
-                    if info['is_neumann']:
-                        # Compute du/dn
-                        normal_dim = info['normal_dim']
-                        normal_sign = info['normal_sign']
-                        
-                        def forward_component(x):
-                            return model_apply_with_params(params, x)[:, comp]
-                        
-                        tangent = jnp.zeros_like(x_bc)
-                        tangent = tangent.at[:, normal_dim].set(1.0)
-                        _, du_dn = jax.jvp(forward_component, (x_bc,), (tangent,))
-                        
-                        # Get target: const_value for scalar BCs, targets_dict for callable BCs
-                        if info['const_value'] is not None:
-                            target = info['const_value']
-                        elif name in targets_dict:
-                            target = targets_dict[name]
-                        else:
-                            target = 0.0
-                        residuals[name] = (normal_sign * du_dn - target).flatten()
-                    else:
-                        # Dirichlet
-                        # Get target: const_value for scalar BCs, targets_dict for callable BCs
-                        if info['const_value'] is not None:
-                            target = info['const_value']
-                        elif name in targets_dict:
-                            target = targets_dict[name]
-                        else:
-                            target = 0.0
-                        residuals[name] = (u - target).flatten()
-            
-            return residuals
-        
-        def compute_al_loss(params, train_data, lagrange_dict, weights_dict, targets_dict=None):
-            """
-            Compute augmented Lagrangian loss.
-            
-            L = Σ_i [w_i * (1/N_i) Σ_j ||g_ij||² + (1/N_i) Σ_j λ_ij · g_ij]
-            
-            Where w_i are the weights (penalty parameters β).
-            All terms are normalized by the number of points per constraint.
-            λ terms are only added for constraints in lagrange_constraints (or all if None).
-            """
-            if targets_dict is None:
-                targets_dict = {}
-            residuals = compute_residuals(params, train_data, targets_dict)
-            
-            total_loss = 0.0
-            losses = {}
-            
-            # Get lagrange_constraints from outer scope
-            lc = self._lagrange_constraints
-            
-            for name, g in residuals.items():
-                weight = weights_dict.get(name, 1.0)
-                lam = lagrange_dict.get(name, jnp.zeros_like(g))
-                
-                # Ensure λ size matches
-                if len(lam) != len(g):
-                    lam = jnp.zeros_like(g)
-                
-                # Penalty term: w_i * (1/N_i) Σ_j ||g_ij||²
-                penalty = weight * jnp.mean(g ** 2)
-                
-                # Lagrangian term: only if this constraint uses λ
-                use_lambda = (lc is None) or (name in lc)
-                if use_lambda:
-                    lagrangian = jnp.mean(jax.lax.stop_gradient(lam) * g)
-                else:
-                    lagrangian = 0.0
-                
-                constraint_loss = penalty + lagrangian
-                losses[name] = constraint_loss
-                losses[f'{name}_penalty'] = penalty
-                losses[f'{name}_lagrangian'] = lagrangian
-                losses[f'{name}_residual_mean'] = jnp.mean(jnp.abs(g))
-                total_loss = total_loss + constraint_loss
-            
-            return total_loss, (losses, residuals)
-        
-        return compute_al_loss, compute_residuals
-    
-    def _update_lagrange_multipliers(self, residuals):
-        """
-        Update Lagrange multipliers (dual ascent step).
-        
-        When using optimizer (default 'adam', matching AL-PINNs paper):
-            The gradient of mean(λ·g) w.r.t. λ is g/N.
-            For gradient ascent (maximization), we negate: grad = -g/N
-            Then apply optimizer.update() for adaptive updates.
-        
-        When optimizer='none' (simple gradient ascent):
-            λ_{ij} = λ_{ij} + lagrange_lr * g_i(x_j) / N_i
-        
-        Only updates λ for constraints in lagrange_constraints (or all if None).
-        """
+                self._lagrange_opt_states[name] = self._lagrange_optimizer.init(self.lagrange_multipliers[name])
+
+
+def _reinitialize_lagrange_if_needed_impl(self):
+    for name, data in self._train_data.items():
+        if name in self.lagrange_multipliers and len(self.lagrange_multipliers[name]) != len(data):
+            self.lagrange_multipliers[name] = jnp.zeros(len(data))
+            if self._lagrange_optimizer is not None:
+                self._lagrange_opt_states[name] = self._lagrange_optimizer.init(self.lagrange_multipliers[name])
+
+
+def _make_al_loss_fn_impl(self, params_dict):
+    from pinns.boundary import NeumannBC, RobinBC
+
+    bc_info = {}
+    bc_names = self._get_bc_names()
+    for i, bc in enumerate(self.problem.boundary_conditions):
+        name = bc_names[i]
+        is_neumann = isinstance(bc, (NeumannBC, RobinBC))
+        bc_info[name] = {
+            'component': bc.component,
+            'is_neumann': is_neumann,
+            'const_value': bc.value if not callable(bc.value) else None,
+        }
+        if is_neumann:
+            normal_dim, normal_sign = bc.get_normal_direction()
+            bc_info[name]['normal_dim'] = normal_dim
+            bc_info[name]['normal_sign'] = normal_sign
+
+    pde_fn = self.problem.pde_fn
+    network = self.network
+    pde_accepts_derivative = len(inspect.signature(pde_fn).parameters) >= 4
+
+    def model_apply_with_params(params, x):
+        return network.apply(params, x, params_dict)
+
+    def compute_residuals(params, train_data, targets_dict=None):
+        targets_dict = {} if targets_dict is None else targets_dict
+        residuals = {}
+        if 'pde' in train_data:
+            x_pde = train_data['pde']
+            y_pde = model_apply_with_params(params, x_pde)
+            deriv_fn = make_derivative_fn(model_apply_with_params, params)
+            if pde_accepts_derivative:
+                pde_residual = pde_fn(x_pde, y_pde, params_dict, deriv_fn)
+            else:
+                set_context(network.apply, params)
+                try:
+                    pde_residual = pde_fn(x_pde, y_pde, params_dict)
+                finally:
+                    clear_context()
+            residuals['pde'] = sum(r.flatten() for r in pde_residual) if isinstance(pde_residual, (list, tuple)) else pde_residual.flatten()
+
+        for name, info in bc_info.items():
+            if name not in train_data:
+                continue
+            x_bc = train_data[name]
+            y_bc = model_apply_with_params(params, x_bc)
+            comp = info['component']
+            target = info['const_value'] if info['const_value'] is not None else targets_dict.get(name, 0.0)
+            if info['is_neumann']:
+                def forward_component(x):
+                    return model_apply_with_params(params, x)[:, comp]
+                tangent = jnp.zeros_like(x_bc)
+                tangent = tangent.at[:, info['normal_dim']].set(1.0)
+                _, du_dn = jax.jvp(forward_component, (x_bc,), (tangent,))
+                residuals[name] = (info['normal_sign'] * du_dn - target).flatten()
+            else:
+                residuals[name] = (y_bc[:, comp] - target).flatten()
+        return residuals
+
+    def compute_al_loss(params, train_data, lagrange_dict, weights_dict, targets_dict=None):
+        residuals = compute_residuals(params, train_data, targets_dict)
+        total_loss = 0.0
+        losses = {'bcs': []}
         lc = self._lagrange_constraints
         for name, g in residuals.items():
-            # Only update λ for specified constraints
+            lam = lagrange_dict.get(name, jnp.zeros_like(g))
+            if len(lam) != len(g):
+                lam = jnp.zeros_like(g)
+            use_quad = self._constraint_uses_quadratic(name)
             use_lambda = (lc is None) or (name in lc)
-            if name in self.lagrange_multipliers and use_lambda:
-                n_points = len(g)
-                
-                if self._lagrange_optimizer is not None:
-                    # Optimizer-based update (paper's approach)
-                    # Gradient for ascent: negate the gradient g/N
-                    grad = -g / n_points
-                    updates, new_state = self._lagrange_optimizer.update(
-                        grad, self._lagrange_opt_states[name], self.lagrange_multipliers[name]
-                    )
-                    self.lagrange_multipliers[name] = optax.apply_updates(self.lagrange_multipliers[name], updates)
-                    self._lagrange_opt_states[name] = new_state
-                else:
-                    # Simple gradient ascent
-                    self.lagrange_multipliers[name] = self.lagrange_multipliers[name] + self.lagrange_lr * g / n_points
-                
-                # Clip λ for stability
-                self.lagrange_multipliers[name] = jnp.clip(
-                    self.lagrange_multipliers[name], 
-                    -self._lagrange_max, 
-                    self._lagrange_max
-                )
-    
-    def train(self):
-        """
-        Run augmented Lagrangian training loop.
-        
-        Each epoch:
-            1. Primal optimization step (minimize over NN params)
-            2. Dual update (λ = λ + lr * g)
-        """
-        epochs = self._epochs
-        print_each = self._print_each
-        show_plots = self._show_plots
-        save_plots = self._save_plots
-        
-        params_dict = self._build_params()
-        weights_dict = self._list_to_dict_weights(self.weights)
-        
-        # Create AL loss function
-        compute_al_loss, compute_residuals = self._make_al_loss_fn(params_dict)
-        
-        # JIT compile the training step
-        @jax.jit
-        def train_step(params, opt_state, train_data, lagrange_dict, weights_dict, targets_dict):
-            (loss, (losses, residuals)), grads = jax.value_and_grad(
-                compute_al_loss, has_aux=True
-            )(params, train_data, lagrange_dict, weights_dict, targets_dict)
-            updates, new_opt_state = self.optimizer.update(grads, opt_state, params)
-            new_params = optax.apply_updates(params, updates)
-            return new_params, new_opt_state, loss, losses, residuals
-        
-        # JIT compile residual computation for dual update
-        @jax.jit
-        def compute_residuals_jit(params, train_data, targets_dict):
-            def model_apply_with_params(p, x):
-                return self.network.apply(p, x, params_dict)
-            
-            residuals = {}
-            
-            if 'pde' in train_data:
-                x_pde = train_data['pde']
-                y_pde = model_apply_with_params(params, x_pde)
-                deriv_fn = make_derivative_fn(model_apply_with_params, params)
-                
-                sig = inspect.signature(self.problem.pde_fn)
-                if len(sig.parameters) >= 4:
-                    pde_residual = self.problem.pde_fn(x_pde, y_pde, params_dict, deriv_fn)
-                else:
-                    set_context(self.network.apply, params)
-                    try:
-                        pde_residual = self.problem.pde_fn(x_pde, y_pde, params_dict)
-                    finally:
-                        clear_context()
-                
-                if isinstance(pde_residual, (list, tuple)):
-                    residuals['pde'] = sum(r.flatten() for r in pde_residual)
-                else:
-                    residuals['pde'] = pde_residual.flatten()
-            
-            return residuals
-        
-        start_time = time.time()
-        start_epoch = self._global_epoch
-        
-        # Auto-save path for script mode
-        auto_save_path = None
-        if show_plots and not save_plots and not is_notebook():
-            import glob
-            import os
-            existing = glob.glob('./al_progress_*.png')
-            nums = [int(os.path.basename(f).replace('al_progress_', '').replace('.png', '').split('_')[0]) 
-                    for f in existing if f.replace('al_progress_', '').replace('.png', '').split('_')[0].isdigit()]
-            next_num = max(nums) + 1 if nums else 0
-            auto_save_path = f'./al_progress_{next_num}.png'
-        
-        if show_plots:
-            n_zoom_regions = len(getattr(self, '_plot_regions', []))
-            needs_recreation = self._fig is None
-            if not needs_recreation and self._axes is not None and n_zoom_regions > 0:
-                if f'zoom_0_0' not in self._axes:
-                    needs_recreation = True
-            if needs_recreation:
-                self._fig, self._axes = self._create_figure()
-            
-            # Display initial plot before training starts
-            _, _, self._display_handle = self.plot_progress(
-                save_path=None, n_points=self._plot_n_points,
-                fig=self._fig, axes=self._axes, 
-                display_handle=self._display_handle
+            penalty = weights_dict.get(name, 1.0) * jnp.mean(g ** 2) if use_quad else 0.0
+            lagrangian = jnp.mean(jax.lax.stop_gradient(lam) * g) if use_lambda else 0.0
+            constraint_loss = penalty + lagrangian
+            losses[name] = constraint_loss
+            losses[f'{name}_penalty'] = penalty
+            losses[f'{name}_lagrangian'] = lagrangian
+            losses[f'{name}_residual_mean'] = jnp.mean(jnp.abs(g))
+            if name != 'pde':
+                losses['bcs'].append(constraint_loss)
+            total_loss = total_loss + constraint_loss
+        return total_loss, (losses, residuals)
+
+    return compute_al_loss, compute_residuals
+
+
+def _update_lagrange_multipliers_impl(self, residuals):
+    lc = self._lagrange_constraints
+    for name, g in residuals.items():
+        if name not in self.lagrange_multipliers:
+            continue
+        if lc is not None and name not in lc:
+            continue
+        n_points = len(g)
+        if self._lagrange_optimizer is not None:
+            grad = -g / n_points
+            updates, new_state = self._lagrange_optimizer.update(
+                grad, self._lagrange_opt_states[name], self.lagrange_multipliers[name]
             )
-        
-        resample_each = getattr(self, '_resample_each', 0)
-        adaptive_sampling = getattr(self, '_adaptive_sampling', False)
-        adaptive_each = getattr(self, '_adaptive_each', 100)
-        lr_scheduler = getattr(self, '_lr_scheduler', None)
-        
-        print(f"Starting ALTrainer (JAX) for {epochs} epochs...")
-        print(f"Weights (penalty parameters): {weights_dict}")
-        print(f"λ optimizer: {self._lagrange_optimizer_name}, lr: {self.lagrange_lr}")
-        
-        # Print epoch 0 (before any training)
-        train_targets = getattr(self, '_train_targets', {})
-        if print_each > 0:
-            _, (losses_init, residuals_init) = compute_al_loss(
-                self.network.params, self._train_data, 
-                self.lagrange_multipliers, weights_dict, train_targets
-            )
-            al_loss_init = float(losses_init.get('total', 0.0))
-            mse_loss_init = float(losses_init.get('mse_total', 0.0))
-            pde_mse_init = float(jnp.mean(residuals_init['pde'] ** 2)) if 'pde' in residuals_init else 0.0
-            bc_names = self._get_bc_names()
-            bc_mse_losses_init = [float(jnp.mean(residuals_init[name] ** 2)) if name in residuals_init else 0.0 
-                                  for name in bc_names]
-            bc_losses_str = ", ".join(
-                f"{bc_names[i]}: {bc_mse_losses_init[i]:.2e}"
-                for i in range(len(bc_names))
-            )
-            
-            self.history['epoch'].append(start_epoch)
-            self.history['train_loss'].append(mse_loss_init)
-            self.history['loss'].append(al_loss_init)
-            if 'al_loss' not in self.history:
-                self.history['al_loss'] = []
-            self.history['al_loss'].append(al_loss_init)
-            if 'mse_loss' not in self.history:
-                self.history['mse_loss'] = []
-            self.history['mse_loss'].append(mse_loss_init)
-            self.history['loss_pde'].append([pde_mse_init])
-            self.history['loss_bcs'].append(bc_mse_losses_init)
-            
-            # Initialize AL-specific history lists for epoch 0
-            if 'al_pde_penalty' not in self.history:
-                self.history['al_pde_penalty'] = []
-                self.history['al_pde_lagrangian'] = []
-                self.history['al_bcs_penalty'] = []
-                self.history['al_bcs_lagrangian'] = []
-            
-            # At epoch 0, penalty and lagrangian terms are ~0 (no training yet)
-            pde_penalty_init = float(losses_init.get('pde_penalty', 0.0))
-            pde_lagrangian_init = float(losses_init.get('pde_lagrangian', 0.0))
-            self.history['al_pde_penalty'].append(pde_penalty_init)
-            self.history['al_pde_lagrangian'].append(pde_lagrangian_init)
-            bc_penalty_init = [float(losses_init.get(f'{name}_penalty', 0.0)) for name in bc_names]
-            bc_lagrangian_init = [float(losses_init.get(f'{name}_lagrangian', 0.0)) for name in bc_names]
-            self.history['al_bcs_penalty'].append(bc_penalty_init)
-            self.history['al_bcs_lagrangian'].append(bc_lagrangian_init)
-            
-            test_targets = getattr(self, '_test_targets', {})
-            if any(s > 0 for s in self.test_samples) and self._test_data:
-                _, (_, test_residuals) = compute_al_loss(
-                    self.network.params, self._test_data, 
-                    {k: jnp.zeros(len(v)) for k, v in self._test_data.items()},
-                    {k: 1.0 for k in self._test_data.keys()},
-                    test_targets
-                )
-                test_mse = sum(jnp.mean(g ** 2) for g in test_residuals.values())
-                self.history['test_loss'].append(float(test_mse))
-            
+            self.lagrange_multipliers[name] = optax.apply_updates(self.lagrange_multipliers[name], updates)
+            self._lagrange_opt_states[name] = new_state
+        else:
+            self.lagrange_multipliers[name] = self.lagrange_multipliers[name] + self.lagrange_lr * g / n_points
+        self.lagrange_multipliers[name] = jnp.clip(self.lagrange_multipliers[name], -self._lagrange_max, self._lagrange_max)
+
+
+def _train_lagrangian_mode_impl(self):
+    epochs = self._epochs
+    print_each = self._print_each
+    show_plots = self._show_plots
+    save_plots = self._save_plots
+    params_dict = self._build_params()
+    weights_dict = self._list_to_dict_weights(self.weights)
+    compute_al_loss, _ = self._make_al_loss_fn(params_dict)
+
+    @jax.jit
+    def train_step(params, opt_state, train_data, lagrange_dict, weights_dict, targets_dict):
+        (loss, (losses, residuals)), grads = jax.value_and_grad(compute_al_loss, has_aux=True)(
+            params, train_data, lagrange_dict, weights_dict, targets_dict
+        )
+        updates, new_opt_state = self.optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, loss, losses, residuals
+
+    start_time = time.time()
+    start_epoch = self._global_epoch
+    resample_each = getattr(self, '_resample_each', 0)
+    adaptive_sampling = getattr(self, '_adaptive_sampling', False)
+    adaptive_each = getattr(self, '_adaptive_each', 100)
+    lr_scheduler = getattr(self, '_lr_scheduler', None)
+    train_targets = getattr(self, '_train_targets', {})
+
+    # Initialize live plot (mirrors standard training loop)
+    if show_plots:
+        needs_recreation = self._fig is None
+        if needs_recreation:
+            self._fig, self._axes = self._create_figure()
+        _, _, self._display_handle = self.plot_progress(
+            save_path=None, n_points=self._plot_n_points,
+            fig=self._fig, axes=self._axes,
+            display_handle=self._display_handle
+        )
+
+    print(f"Starting Trainer (JAX, Lagrangian mode) for {epochs} epochs...")
+
+    for epoch in range(start_epoch, start_epoch + epochs):
+        self._outer_epoch = epoch - start_epoch
+
+        # Time-domain curriculum: expand sampling window if stage changed
+        self._curriculum_step(epoch)
+
+        if lr_scheduler is not None and self.optimizer_name not in ("lbfgs", "soap") and hasattr(self.opt_state, 'hyperparams'):
+            new_lr = lr_scheduler.lr(self.learning_rate, epoch)
+            hp = dict(self.opt_state.hyperparams)
+            hp['learning_rate'] = new_lr
+            self.opt_state = self.opt_state._replace(hyperparams=hp)
+        if resample_each > 0 and epoch > start_epoch and epoch % resample_each == 0:
+            self._sample_train_data()
+            self._reinitialize_lagrange_if_needed()
+        if adaptive_sampling and epoch > start_epoch and epoch % adaptive_each == 0:
+            self._adaptive_resample(params_dict)
+            self._reinitialize_lagrange_if_needed()
+
+        self.network.params, self.opt_state, loss, losses, residuals = train_step(
+            self.network.params, self.opt_state, self._train_data, self.lagrange_multipliers, weights_dict, train_targets
+        )
+        self._update_lagrange_multipliers(residuals)
+
+        al_loss_val = float(loss)
+        mse_loss_val = float(sum(jnp.mean(g ** 2) for g in residuals.values()))
+        bc_names = self._get_bc_names()
+        pde_mse = float(jnp.mean(residuals['pde'] ** 2)) if 'pde' in residuals else 0.0
+        bc_mse_losses = [float(jnp.mean(residuals[name] ** 2)) if name in residuals else 0.0 for name in bc_names]
+        self.history['epoch'].append(epoch)
+        self.history['loss'].append(mse_loss_val)
+        self.history['train_loss'].append(mse_loss_val)
+        self.history.setdefault('al_loss', []).append(al_loss_val)
+        self.history.setdefault('al_pde_penalty', []).append(float(losses.get('pde_penalty', 0.0)))
+        self.history.setdefault('al_pde_lagrangian', []).append(float(losses.get('pde_lagrangian', 0.0)))
+        self.history.setdefault('al_bcs_penalty', []).append([float(losses.get(f'{name}_penalty', 0.0)) for name in bc_names])
+        self.history.setdefault('al_bcs_lagrangian', []).append([float(losses.get(f'{name}_lagrangian', 0.0)) for name in bc_names])
+        self.history['loss_pde'].append([pde_mse])
+        self.history['loss_bcs'].append(bc_mse_losses)
+
+        if print_each > 0 and ((epoch + 1) % print_each == 0 or epoch == start_epoch + epochs - 1):
+            elapsed = time.time() - start_time
             if self.problem.solution is not None:
                 sol_error = self._compute_solution_error()
                 self.history['solution_error'].append(sol_error)
-            
+            bc_losses_str = ", ".join(f"{bc_names[i]}: {bc_mse_losses[i]:.2e}" for i in range(len(bc_names)))
             msg = (
-                f"Epoch 0/{self._epochs + start_epoch} | "
-                f"AL Loss: {al_loss_init:.2e} | "
-                f"MSE Loss: {mse_loss_init:.2e} | "
-                f"PDE: {pde_mse_init:.2e} | "
-                f"BCs: [{bc_losses_str}] | "
-                f"Time: 0.0s"
+                f"Epoch {epoch + 1}/{self._epochs + start_epoch} | AL Loss: {al_loss_val:.2e} | "
+                f"MSE Loss: {mse_loss_val:.2e} | PDE: {pde_mse:.2e} | BCs: [{bc_losses_str}] | Time: {elapsed:.1f}s"
             )
-            if self.history['test_loss']:
-                msg += f" | Test: {self.history['test_loss'][-1]:.2e}"
             if self.problem.solution is not None:
                 msg += f" | Error: {self.history['solution_error'][-1]:.2e}"
             print(msg)
-        
-        for epoch in range(start_epoch, start_epoch + epochs):
-            self._outer_epoch = epoch - start_epoch
-            
-            # Update learning rate if scheduler is provided
-            if lr_scheduler is not None and self.optimizer_name not in ("lbfgs", "soap"):
-                new_lr = lr_scheduler.lr(self.learning_rate, epoch)
-                if hasattr(self.opt_state, 'hyperparams'):
-                    new_hyperparams = dict(self.opt_state.hyperparams)
-                    new_hyperparams['learning_rate'] = new_lr
-                    self.opt_state = self.opt_state._replace(hyperparams=new_hyperparams)
-            
-            if resample_each > 0 and epoch > start_epoch and epoch % resample_each == 0:
-                self._sample_train_data()
-                self._reinitialize_lagrange_if_needed()
-            
-            if adaptive_sampling and epoch > start_epoch and epoch % adaptive_each == 0:
-                self._adaptive_resample(params_dict)
-                self._reinitialize_lagrange_if_needed()
-            
-            # ==================== Primal Optimization Step ====================
-            self.network.params, self.opt_state, loss, losses, residuals = train_step(
-                self.network.params, self.opt_state, self._train_data, 
-                self.lagrange_multipliers, weights_dict, train_targets
-            )
-            
-            # ==================== Dual Update (Lagrange Multipliers) ====================
-            self._update_lagrange_multipliers(residuals)
-            
-            # ==================== Record History and Print ====================
-            # Store both AL loss (for training dynamics) and MSE loss (for comparison)
-            al_loss_val = float(loss)
-            mse_loss = sum(jnp.mean(g ** 2) for g in residuals.values())
-            mse_loss_val = float(mse_loss)
-            
-            self.history['epoch'].append(epoch)
-            self.history['loss'].append(mse_loss_val)  # MSE loss for comparison
-            self.history['train_loss'].append(mse_loss_val)
-            
-            # Store AL loss separately
-            if 'al_loss' not in self.history:
-                self.history['al_loss'] = []
-            self.history['al_loss'].append(al_loss_val)
-            
-            # Store AL loss components (penalty and lagrangian)
-            if 'al_pde_penalty' not in self.history:
-                self.history['al_pde_penalty'] = []
-                self.history['al_pde_lagrangian'] = []
-                self.history['al_bcs_penalty'] = []
-                self.history['al_bcs_lagrangian'] = []
-            
-            self.history['al_pde_penalty'].append(float(losses.get('pde_penalty', 0.0)))
-            self.history['al_pde_lagrangian'].append(float(losses.get('pde_lagrangian', 0.0)))
-            
-            bc_names = self._get_bc_names()
-            bc_penalty_list = [float(losses.get(f'{name}_penalty', 0.0)) for name in bc_names]
-            bc_lagrangian_list = [float(losses.get(f'{name}_lagrangian', 0.0)) for name in bc_names]
-            self.history['al_bcs_penalty'].append(bc_penalty_list)
-            self.history['al_bcs_lagrangian'].append(bc_lagrangian_list)
-            
-            # Compute per-constraint MSE losses
-            pde_mse = float(jnp.mean(residuals['pde'] ** 2)) if 'pde' in residuals else 0.0
-            self.history['loss_pde'].append([pde_mse])
-            
-            bc_mse_losses = [float(jnp.mean(residuals[name] ** 2)) if name in residuals else 0.0 
-                            for name in bc_names]
-            self.history['loss_bcs'].append(bc_mse_losses)
-            
-            if print_each > 0 and ((epoch + 1) % print_each == 0 or epoch == self._epochs + start_epoch - 1):
-                test_targets = getattr(self, '_test_targets', {})
-                if any(s > 0 for s in self.test_samples) and self._test_data:
-                    # Compute test MSE loss (without λ terms)
-                    _, (_, test_residuals) = compute_al_loss(
-                        self.network.params, self._test_data, 
-                        {k: jnp.zeros(len(v)) for k, v in self._test_data.items()},
-                        {k: 1.0 for k in self._test_data.keys()},
-                        test_targets
-                    )
-                    test_mse = sum(jnp.mean(g ** 2) for g in test_residuals.values())
-                    self.history['test_loss'].append(float(test_mse))
-                
-                if self.problem.solution is not None:
-                    sol_error = self._compute_solution_error()
-                    self.history['solution_error'].append(sol_error)
-                
-                elapsed_time = time.time() - start_time
-                
-                bc_losses_str = ", ".join(
-                    f"{bc_names[i]}: {bc_mse_losses[i]:.2e}"
-                    for i in range(len(bc_names))
+            if show_plots:
+                _, _, self._display_handle = self.plot_progress(
+                    save_path=None, n_points=self._plot_n_points,
+                    fig=self._fig, axes=self._axes,
+                    display_handle=self._display_handle
                 )
-                
-                # Print both AL loss and MSE loss
-                msg = (
-                    f"Epoch {epoch + 1}/{self._epochs + start_epoch} | "
-                    f"AL Loss: {al_loss_val:.2e} | "
-                    f"MSE Loss: {mse_loss_val:.2e} | "
-                    f"PDE: {pde_mse:.2e} | "
-                    f"BCs: [{bc_losses_str}] | "
-                    f"Time: {elapsed_time:.1f}s"
-                )
-                if self.history['test_loss']:
-                    msg += f" | Test: {self.history['test_loss'][-1]:.2e}"
-                if self.problem.solution is not None:
-                    msg += f" | Error: {self.history['solution_error'][-1]:.2e}"
-                print(msg)
-                
-                if show_plots or save_plots:
-                    if save_plots:
-                        plot_path = f"{save_plots}_epoch{epoch:05d}.png"
-                    elif auto_save_path:
-                        plot_path = auto_save_path
-                    else:
-                        plot_path = None
-                    _, _, self._display_handle = self.plot_progress(
-                        save_path=plot_path, n_points=self._plot_n_points,
-                        fig=self._fig, axes=self._axes,
-                        display_handle=self._display_handle
-                    )
-        
-        self._global_epoch += epochs
-        print(f"ALTrainer complete in {time.time() - start_time:.1f}s")
-        
-        # Close figure to prevent duplicate display in notebooks
-        if is_notebook() and show_plots and self._fig is not None:
-            plt.close(self._fig)
-    
-    def get_lagrange_statistics(self) -> Dict[str, Dict[str, float]]:
-        """
-        Get statistics of Lagrange multipliers.
-        
-        Returns:
-            Dict mapping constraint names to dicts with 'mean', 'std', 'min', 'max'.
-        """
-        stats = {}
-        for name, lam in self.lagrange_multipliers.items():
-            stats[name] = {
-                'mean': float(jnp.mean(lam)),
-                'std': float(jnp.std(lam)),
-                'min': float(jnp.min(lam)),
-                'max': float(jnp.max(lam)),
-            }
-        return stats
-    
-    def reset_lagrange_multipliers(self):
-        """Reset all Lagrange multipliers to zero."""
-        for name in self.lagrange_multipliers:
-            self.lagrange_multipliers[name] = jnp.zeros_like(self.lagrange_multipliers[name])
-    
-    def _plot_losses(self, ax):
-        """Plot AL loss and its components (penalty + lagrangian) on 'losses' axis."""
-        import numpy as np
-        
-        epochs = self.history['epoch']
-        if not epochs:
-            return
-        
-        # Total AL Loss
-        al_loss_data = self.history.get('al_loss', [])
-        if al_loss_data:
-            ax.semilogy(epochs, al_loss_data, 'k-', label='AL Total', linewidth=2)
-        
-        # PDE penalty and lagrangian
-        pde_penalty = self.history.get('al_pde_penalty', [])
-        pde_lagrangian = self.history.get('al_pde_lagrangian', [])
-        if pde_penalty:
-            ax.semilogy(epochs, np.abs(pde_penalty) + 1e-20, 'b--', label='PDE penalty', linewidth=1.5)
-        if pde_lagrangian:
-            ax.semilogy(epochs, np.abs(pde_lagrangian) + 1e-20, 'b:', label='PDE lagrangian', linewidth=1.5)
-        
-        # BC penalty and lagrangian
-        bc_names = self._get_bc_names()
-        bc_penalty = self.history.get('al_bcs_penalty', [])
-        bc_lagrangian = self.history.get('al_bcs_lagrangian', [])
-        
-        colors = ['r', 'g', 'c', 'm', 'y', 'tab:orange']
-        if bc_penalty and len(bc_penalty) > 0:
-            bc_penalty_arr = np.array(bc_penalty)
-            bc_lagrangian_arr = np.array(bc_lagrangian) if bc_lagrangian else None
-            
-            for i in range(bc_penalty_arr.shape[1]):
-                color = colors[i % len(colors)]
-                bc_label = bc_names[i] if i < len(bc_names) else f'BC{i+1}'
-                ax.semilogy(epochs, np.abs(bc_penalty_arr[:, i]) + 1e-20, '--', 
-                           color=color, label=f'{bc_label} penalty', linewidth=1.5)
-                if bc_lagrangian_arr is not None:
-                    ax.semilogy(epochs, np.abs(bc_lagrangian_arr[:, i]) + 1e-20, ':', 
-                               color=color, label=f'{bc_label} lagr.', linewidth=1.5)
-        
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('AL Loss')
-        ax.set_title('Augmented Lagrangian Loss (penalty + lagrangian)')
-        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=7)
-        ax.grid(True, alpha=0.3)
-    
-    def _plot_mse_losses(self, ax):
-        """Plot MSE losses for comparison on 'mse_losses' axis."""
-        import numpy as np
-        
-        epochs = self.history['epoch']
-        if not epochs:
-            return
-        
-        # Total MSE loss
-        loss_data = self.history.get('loss', self.history.get('train_loss', []))
-        if loss_data:
-            ax.semilogy(epochs, loss_data, 'k-', label='MSE Total', linewidth=2)
-        
-        # PDE MSE
-        pde_losses = self.history.get('loss_pde', [])
-        if len(pde_losses) > 0:
-            if isinstance(pde_losses[0], (list, tuple)):
-                pde_array = np.array(pde_losses)
-                for i in range(pde_array.shape[1]):
-                    ax.semilogy(epochs, pde_array[:, i], 'b--', label=f'PDE eq{i+1}')
-            else:
-                ax.semilogy(epochs, pde_losses, 'b--', label='PDE')
-        
-        # BC MSE
-        bc_names = self._get_bc_names()
-        bc_losses = self.history.get('loss_bcs', [])
-        if bc_losses and len(bc_losses) > 0:
-            bc_losses_array = np.array(bc_losses)
-            if bc_losses_array.ndim == 2:
-                for i in range(bc_losses_array.shape[1]):
-                    bc_label = bc_names[i] if i < len(bc_names) else f'BC {i+1}'
-                    ax.semilogy(epochs, bc_losses_array[:, i], '--', label=bc_label)
-        
-        # Test loss
-        test_loss = self.history.get('test_loss', [])
-        if len(test_loss) > 0:
-            n_test = len(test_loss)
-            test_epochs = np.linspace(epochs[0], epochs[-1], n_test).astype(int) if n_test > 1 else [epochs[-1]]
-            ax.semilogy(test_epochs, test_loss, 'r:', marker='o', markersize=4, label='Test MSE', linewidth=2)
-        
-        # Solution error
-        sol_error = self.history.get('solution_error', [])
-        if len(sol_error) > 0:
-            n_err = len(sol_error)
-            err_epochs = np.linspace(epochs[0], epochs[-1], n_err).astype(int) if n_err > 1 else [epochs[-1]]
-            ax.semilogy(err_epochs, sol_error, 'm-', marker='s', markersize=4, label='Solution Error', linewidth=2)
-        
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('MSE Loss')
-        ax.set_title('MSE Losses (for comparison with other methods)')
-        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=7)
-        ax.grid(True, alpha=0.3)
 
-    def reset_betas(self, betas: dict = None):
-        """
-        Reset penalty parameters.
-        
-        Args:
-            betas: New beta values. If None, reset to 1.0.
-        """
-        if betas is None:
-            for name in self.betas:
-                self.betas[name] = 1.0
-        else:
-            for name, val in betas.items():
-                if name in self.betas:
-                    self.betas[name] = val
+    self._global_epoch += epochs
+    print(f"Trainer (Lagrangian mode) complete in {time.time() - start_time:.1f}s")
+    self._curriculum_restore()
+    if is_notebook() and show_plots and self._fig is not None:
+        plt.close(self._fig)
+
+
+def _get_lagrange_statistics_impl(self) -> Dict[str, Dict[str, float]]:
+    return {
+        name: {
+            'mean': float(jnp.mean(lam)),
+            'std': float(jnp.std(lam)),
+            'min': float(jnp.min(lam)),
+            'max': float(jnp.max(lam)),
+        }
+        for name, lam in self.lagrange_multipliers.items()
+    }
+
+
+def _reset_lagrange_multipliers_impl(self):
+    for name in self.lagrange_multipliers:
+        self.lagrange_multipliers[name] = jnp.zeros_like(self.lagrange_multipliers[name])
+
+
+def _reset_betas_impl(self, betas: dict = None):
+    if betas is None:
+        for i in range(len(self.weights)):
+            self.weights[i] = 1.0
+    else:
+        self.weights = self._convert_dict_to_list(betas, 'weights')
 
     

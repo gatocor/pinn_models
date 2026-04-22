@@ -52,7 +52,7 @@ def _load_backend(name):
             from .backends.jax import (
                 FNN, WFFNN, PirateNet, FBPINN, FourierFeatures, DenseRWF,
                 derivative, gradient, laplacian, divergence,
-                Trainer, ALTrainer
+                Trainer
             )
         except ImportError as e:
             raise ImportError(
@@ -63,7 +63,7 @@ def _load_backend(name):
         from .backends.torch import (
             FNN, WFFNN, PirateNet, FBPINN, FourierFeatures, LinearRWF,
             derivative, gradient, laplacian, divergence,
-            Trainer, ALTrainer
+            Trainer
         )
     
     # Use backend-specific RWF layer
@@ -81,7 +81,6 @@ def _load_backend(name):
         'laplacian': laplacian,
         'divergence': divergence,
         'Trainer': Trainer,
-        'ALTrainer': ALTrainer,
     }
 
 
