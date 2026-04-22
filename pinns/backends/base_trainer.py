@@ -7,6 +7,7 @@ including plotting, history management, parameter building, and utilities.
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.tri as mtri
 from typing import List, Dict, Optional, Union, Any
 from abc import ABC, abstractmethod
 
@@ -987,10 +988,51 @@ class BaseTrainer(ABC):
         Returns:
             Loss tensor (backend-specific scalar)
         """
-        from pinns.boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC
-        
+        from pinns.boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC, MeshNodeBC
+
         y = self.network.forward(x, params_dict)
-        
+
+        if isinstance(bc, MeshNodeBC):
+            if bc.bc_type == "dirichlet":
+                target = self._to_tensor(bc.get_value(x))
+                diff = y[:, bc.component] - target
+                return self._mean_squared(diff)
+            elif bc.bc_type == "neumann":
+                if bc.t_mode in ("t_min", "t_max"):
+                    # Normal is along the time axis
+                    t_dim = self.problem.domain._spatial_dims
+                    sign = -1 if bc.t_mode == "t_min" else 1
+                    du_dt = self._compute_directional_derivative(
+                        x, bc.component, t_dim, params_dict)
+                    target = self._to_tensor(bc.get_value(x))
+                    return self._mean_squared(sign * du_dt - target)
+                elif bc.edge_normals is not None:
+                    # Edge-based Neumann: normals stashed per sample by _sample_boundary_np
+                    n_pts = x.shape[0]
+                    if getattr(bc, '_sampled_normals', None) is not None and len(bc._sampled_normals) == n_pts:
+                        normals_np = bc._sampled_normals
+                    else:
+                        # _sampled_normals size mismatch (e.g. batched eval) — wrap around edge_normals
+                        n_edge = len(bc.edge_normals)
+                        normals_np = bc.edge_normals[np.arange(n_pts) % n_edge]
+                    normals_t = self._to_tensor(normals_np)
+                    spatial_dims = bc.node_positions.shape[1]
+                    du_dn = None
+                    for i in range(spatial_dims):
+                        dui = self._compute_directional_derivative(
+                            x, bc.component, i, params_dict)
+                        contrib = dui * normals_t[:, i]
+                        du_dn = contrib if du_dn is None else du_dn + contrib
+                    target = self._to_tensor(bc.get_value(x))
+                    return self._mean_squared(du_dn - target)
+                else:
+                    raise ValueError(
+                        "MeshNodeBC Neumann on a spatial surface requires edge_normals. "
+                        "Use t_mode='t_min'/'t_max' for time boundaries."
+                    )
+            else:
+                raise ValueError(f"Unknown bc_type: {bc.bc_type!r}")
+
         if isinstance(bc, DirichletBC):
             target = self._get_bc_target(bc, x)
             diff = y[:, bc.component] - target
@@ -1208,11 +1250,20 @@ class BaseTrainer(ABC):
     
     def _sample_boundary_np(self, bc, n_points: int) -> np.ndarray:
         """Sample boundary points for a specific boundary condition."""
-        from pinns.boundary import PointsetBC
-        
+        from pinns.boundary import PointsetBC, MeshNodeBC
+
         if isinstance(bc, PointsetBC):
             return bc.points
-        
+
+        if isinstance(bc, MeshNodeBC):
+            pts, sampled_idx = self.problem.domain.sample_boundary_bc(bc, n_points, rng=self.rng)
+            # stash per-sample normals indexed to the sampled edges
+            if bc.edge_normals is not None:
+                bc._sampled_normals = bc.edge_normals[sampled_idx]
+            else:
+                bc._sampled_normals = None
+            return pts
+
         boundary = bc.boundary
         domain = self.problem.domain
         params = self._build_params()
@@ -1325,6 +1376,10 @@ class BaseTrainer(ABC):
                         if hasattr(target_np, 'squeeze'):
                             target_np = target_np.squeeze(-1) if target_np.ndim > 1 else target_np
                         self._train_targets[name] = self._to_tensor(target_np)
+                    # Store matched normals (set by _sample_boundary_np for MeshNodeBC)
+                    if bc is not None and getattr(bc, '_sampled_normals', None) is not None:
+                        self._train_data[f'{name}__normals'] = self._to_tensor(
+                            bc._sampled_normals.astype(np.float32))
     
     def _sample_test_data(self):
         """Sample test data and store as backend tensors."""
@@ -1344,6 +1399,10 @@ class BaseTrainer(ABC):
                         if hasattr(target_np, 'squeeze'):
                             target_np = target_np.squeeze(-1) if target_np.ndim > 1 else target_np
                         self._test_targets[name] = self._to_tensor(target_np)
+                    # Store matched normals (set by _sample_boundary_np for MeshNodeBC)
+                    if bc is not None and getattr(bc, '_sampled_normals', None) is not None:
+                        self._test_data[f'{name}__normals'] = self._to_tensor(
+                            bc._sampled_normals.astype(np.float32))
 
     def _get_n_batches(self) -> int:
         """Get number of mini-batches based on PDE data size and batch_size."""
@@ -1795,24 +1854,40 @@ class BaseTrainer(ABC):
         ax.set_title(f'Solution ({output_name})')
         ax.grid(True, alpha=0.3)
     
+    def _is_mesh_domain(self):
+        """Return True when the problem domain is a DomainMesh."""
+        try:
+            from pinns.domain import DomainMesh as _DomainMesh
+            return isinstance(self.problem.domain, _DomainMesh)
+        except ImportError:
+            return False
+
     def _plot_solution_2d(self, ax, output_idx, n_points=50, plot_key='solution'):
         """Plot 2D solution as heatmap on given axes."""
-        x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
-        x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
-        X0, X1 = np.meshgrid(x0, x1)
-        
-        x_flat = np.column_stack([X0.ravel(), X1.ravel()])
-        y = self.predict(x_flat)
-        Y = y[:, output_idx].reshape(X0.shape)
-        
-        extent = [x0.min(), x0.max(), x1.min(), x1.max()]
         cmap = self._get_colormap(output_idx)
         ikw = {'cmap': cmap}
         ikw.update(self._get_imshow_kwargs(plot_key))
-        im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', **ikw)
+
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
+            y = self.predict(dom._vertices)
+            vals = y[:, output_idx]
+            im = ax.tricontourf(tri, vals, levels=50, **ikw)
+            ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_flat = np.column_stack([X0.ravel(), X1.ravel()])
+            y = self.predict(x_flat)
+            Y = y[:, output_idx].reshape(X0.shape)
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', **ikw)
+
         cbar = self._fig.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
-        
+
         output_name = self._get_output_name(output_idx)
         ax.set_title(f'Predicted ({output_name})')
         ax.set_xlabel(self._get_input_name(0))
@@ -1822,29 +1897,38 @@ class BaseTrainer(ABC):
         """Plot 2D true solution as heatmap on given axes."""
         if self.problem.solution is None:
             return
-        
-        x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
-        x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
-        X0, X1 = np.meshgrid(x0, x1)
-        
-        x_flat = np.column_stack([X0.ravel(), X1.ravel()])
-        y_true = self.problem.solution(x_flat, self._build_params())
-        
-        if isinstance(y_true, (list, tuple)):
-            y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
-        elif y_true.ndim == 1:
-            y_true = y_true.reshape(-1, 1)
-        
-        Y_true = y_true[:, output_idx].reshape(X0.shape)
-        
-        extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+
         cmap = self._get_colormap(output_idx)
         ikw = {'cmap': cmap}
         ikw.update(self._get_imshow_kwargs(plot_key))
-        im = ax.imshow(Y_true, extent=extent, origin='lower', aspect='equal', **ikw)
+
+        def _normalise(y_true):
+            if isinstance(y_true, (list, tuple)):
+                y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
+            elif y_true.ndim == 1:
+                y_true = y_true.reshape(-1, 1)
+            return y_true
+
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
+            y_true = _normalise(self.problem.solution(dom._vertices, self._build_params()))
+            vals = y_true[:, output_idx]
+            im = ax.tricontourf(tri, vals, levels=50, **ikw)
+            ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_flat = np.column_stack([X0.ravel(), X1.ravel()])
+            y_true = _normalise(self.problem.solution(x_flat, self._build_params()))
+            Y_true = y_true[:, output_idx].reshape(X0.shape)
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            im = ax.imshow(Y_true, extent=extent, origin='lower', aspect='equal', **ikw)
+
         cbar = self._fig.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
-        
+
         output_name = self._get_output_name(output_idx)
         ax.set_title(f'True Solution ({output_name})')
         ax.set_xlabel(self._get_input_name(0))
@@ -1878,29 +1962,39 @@ class BaseTrainer(ABC):
         """Plot 2D absolute error as heatmap."""
         if self.problem.solution is None:
             return
-        
-        x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
-        x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
-        X0, X1 = np.meshgrid(x0, x1)
-        
-        x_flat = np.column_stack([X0.ravel(), X1.ravel()])
-        y = self.predict(x_flat)
-        y_true = self.problem.solution(x_flat, self._build_params())
-        
-        if isinstance(y_true, (list, tuple)):
-            y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
-        elif y_true.ndim == 1:
-            y_true = y_true.reshape(-1, 1)
-        
-        error = np.abs(y[:, output_idx] - y_true[:, output_idx]).reshape(X0.shape)
-        
-        extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+
         ikw = {'cmap': 'Reds'}
         ikw.update(self._get_imshow_kwargs(plot_key))
-        im = ax.imshow(error, extent=extent, origin='lower', aspect='equal', **ikw)
+
+        def _normalise(y_true):
+            if isinstance(y_true, (list, tuple)):
+                y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
+            elif y_true.ndim == 1:
+                y_true = y_true.reshape(-1, 1)
+            return y_true
+
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
+            y = self.predict(dom._vertices)
+            y_true = _normalise(self.problem.solution(dom._vertices, self._build_params()))
+            error = np.abs(y[:, output_idx] - y_true[:, output_idx])
+            im = ax.tricontourf(tri, error, levels=50, **ikw)
+            ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_flat = np.column_stack([X0.ravel(), X1.ravel()])
+            y = self.predict(x_flat)
+            y_true = _normalise(self.problem.solution(x_flat, self._build_params()))
+            error = np.abs(y[:, output_idx] - y_true[:, output_idx]).reshape(X0.shape)
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            im = ax.imshow(error, extent=extent, origin='lower', aspect='equal', **ikw)
+
         cbar = self._fig.colorbar(im, ax=ax)
         self._colorbars.append(cbar)
-        
+
         output_name = self._get_output_name(output_idx)
         ax.set_title(f'Absolute Error ({output_name})')
         ax.set_xlabel(self._get_input_name(0))
@@ -2204,27 +2298,36 @@ class BaseTrainer(ABC):
 
     def _plot_residuals_2d(self, ax, output_idx, n_points=50, plot_key='residuals'):
         """Plot 2D PDE residuals as heatmap."""
-        x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
-        x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
-        X0, X1 = np.meshgrid(x0, x1)
-        
-        x_np = np.column_stack([X0.ravel(), X1.ravel()])
-        
-        residuals = self._compute_residuals(x_np)
-        
-        if output_idx < len(residuals):
-            res = np.abs(residuals[output_idx]).flatten()
-        else:
-            res = np.zeros(x_np.shape[0])
-        
-        Res = res.reshape(X0.shape)
-        extent = [x0.min(), x0.max(), x1.min(), x1.max()]
         ikw = {'cmap': 'viridis'}
         ikw.update(self._get_imshow_kwargs(plot_key))
-        im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', **ikw)
+
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
+            residuals = self._compute_residuals(dom._vertices)
+            if output_idx < len(residuals):
+                res = np.abs(residuals[output_idx]).flatten()
+            else:
+                res = np.zeros(dom._vertices.shape[0])
+            im = ax.tricontourf(tri, res, levels=50, **ikw)
+            ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_np = np.column_stack([X0.ravel(), X1.ravel()])
+            residuals = self._compute_residuals(x_np)
+            if output_idx < len(residuals):
+                res = np.abs(residuals[output_idx]).flatten()
+            else:
+                res = np.zeros(x_np.shape[0])
+            Res = res.reshape(X0.shape)
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', **ikw)
+
         cbar = self._fig.colorbar(im, ax=ax, label='|Residual|')
         self._colorbars.append(cbar)
-        
+
         output_name = self._get_output_name(output_idx)
         ax.set_title(f'PDE Residual ({output_name})')
         ax.set_xlabel(self._get_input_name(0))

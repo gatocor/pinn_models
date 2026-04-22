@@ -34,7 +34,7 @@ _BACKEND = os.environ.get('PINNS_BACKEND', 'torch').lower()
 _backend_classes = {}
 
 # Domain and Problem are backend-agnostic
-from .domain import DomainCubic, DomainCubicPartition, SubdomainInfo, bump
+from .domain import DomainCubic, DomainCubicPartition, DomainMesh, SubdomainInfo, bump
 from .problem import Problem
 
 # Learning rate schedulers (backend-agnostic)
@@ -145,6 +145,7 @@ __all__ = [
     # Domain (backend-agnostic)
     "DomainCubic",
     "DomainCubicPartition",
+    "DomainMesh",
     "SubdomainInfo",
     "bump",
     # Networks

@@ -338,12 +338,13 @@ class Trainer(BaseTrainer):
     
     def _make_jit_train_step(self, weights, params_dict):
         """Create a JIT-compiled training step function."""
-        from pinns.boundary import NeumannBC
+        from pinns.boundary import NeumannBC, MeshNodeBC
         
         # Pre-extract BC info as static data
         bc_info = []
         dirichlet_bcs = []
         neumann_bcs = []
+        mesh_neumann_bcs = []   # MeshNodeBC with bc_type="neumann"
         
         # Get precomputed targets for callable BCs
         train_targets = getattr(self, '_train_targets', {})
@@ -353,6 +354,30 @@ class Trainer(BaseTrainer):
                 continue
             bc = self._get_bc_by_name(name)
             if bc is not None:
+                if isinstance(bc, MeshNodeBC):
+                    if bc.bc_type == "dirichlet":
+                        bc_data = {
+                            'name': name,
+                            'component': bc.component,
+                            'is_neumann': False,
+                            'normal_dim': 0,
+                            'normal_sign': 1,
+                            'const_value': bc.value if not callable(bc.value) else None,
+                            'has_callable_value': callable(bc.value),
+                            'weight': weights.get(name, 1.0),
+                        }
+                        dirichlet_bcs.append(bc_data)
+                    else:  # neumann
+                        bc_data = {
+                            'name': name,
+                            'component': bc.component,
+                            'const_value': bc.value if not callable(bc.value) else None,
+                            'has_callable_value': callable(bc.value),
+                            'weight': weights.get(name, 1.0),
+                        }
+                        mesh_neumann_bcs.append(bc_data)
+                    continue
+
                 is_neumann = isinstance(bc, NeumannBC)
                 normal_info = bc.get_normal_direction() if is_neumann else (0, 1)
                 bc_data = {
@@ -493,6 +518,34 @@ class Trainer(BaseTrainer):
                 bc_loss = jnp.mean((normal_sign * du_dn - target) ** 2)
                 total_loss = total_loss + bc_data['weight'] * bc_loss
             
+            # ===== Mesh Neumann BC Loss (per-sample normals read from train_data) =====
+            for bc_data in mesh_neumann_bcs:
+                bc_name = bc_data['name']
+                x_bc = train_data[bc_name]
+                comp = bc_data['component']
+                # Normals are stored alongside the BC points in train_data
+                normals_rt = train_data.get(f'{bc_name}__normals', None)
+
+                if bc_data['const_value'] is not None:
+                    mn_target = bc_data['const_value']
+                elif bc_name in targets_dict:
+                    mn_target = targets_dict[bc_name]
+                else:
+                    mn_target = 0.0
+
+                if normals_rt is not None:
+                    # du/dn = Σ_i (∂u/∂x_i) * n_i  via JVP with per-sample tangents
+                    def forward_mesh_comp(x):
+                        return model_apply_with_params(params, x)[:, comp]
+
+                    _, du_dn_mesh = jax.jvp(forward_mesh_comp, (x_bc,), (normals_rt,))
+                    bc_loss = jnp.mean((du_dn_mesh - mn_target) ** 2)
+                else:
+                    y_bc = model_apply_with_params(params, x_bc)
+                    bc_loss = jnp.mean((y_bc[:, comp] - mn_target) ** 2)
+
+                total_loss = total_loss + bc_data['weight'] * bc_loss
+
             return total_loss
         
         if pde_accepts_derivative:
@@ -1028,14 +1081,35 @@ class Trainer(BaseTrainer):
         # Pre-extract BC info
         dirichlet_bcs = []
         neumann_bcs = []
+        mesh_neumann_bcs = []   # MeshNodeBC with bc_type="neumann"
         bc_names = self._get_bc_names()
         
         # Get precomputed targets for callable BCs
         train_targets = getattr(self, '_train_targets', {})
         
         for i, bc in enumerate(self.problem.boundary_conditions):
-            from pinns.boundary import DirichletBC, NeumannBC, RobinBC
+            from pinns.boundary import DirichletBC, NeumannBC, RobinBC, MeshNodeBC
             name = bc_names[i]
+
+            if isinstance(bc, MeshNodeBC):
+                if bc.bc_type == "dirichlet":
+                    dirichlet_bcs.append({
+                        'name': name,
+                        'component': bc.component,
+                        'weight': weights.get(name, 1.0),
+                        'const_value': bc.value if not callable(bc.value) else None,
+                        'has_callable_value': callable(bc.value),
+                    })
+                else:  # neumann
+                    mesh_neumann_bcs.append({
+                        'name': name,
+                        'component': bc.component,
+                        'weight': weights.get(name, 1.0),
+                        'const_value': bc.value if not callable(bc.value) else None,
+                        'has_callable_value': callable(bc.value),
+                    })
+                continue
+
             is_neumann = isinstance(bc, (NeumannBC, RobinBC))
             
             bc_data = {
@@ -1164,6 +1238,30 @@ class Trainer(BaseTrainer):
                 bc_loss = jnp.mean((normal_sign * du_dn - target) ** 2)
                 total_loss = total_loss + bc_data['weight'] * bc_loss
             
+            # ===== Mesh Neumann BC Loss =====
+            for bc_data in mesh_neumann_bcs:
+                bc_name = bc_data['name']
+                x_bc = train_data[bc_name]
+                comp = bc_data['component']
+                normals_rt = train_data.get(f'{bc_name}__normals', None)
+
+                if bc_data['const_value'] is not None:
+                    mn_target = bc_data['const_value']
+                elif bc_name in train_targets:
+                    mn_target = train_targets[bc_name]
+                else:
+                    mn_target = 0.0
+
+                if normals_rt is not None:
+                    def forward_mesh_comp_lbfgs(x):
+                        return model_apply_with_params(params, x)[:, comp]
+                    _, du_dn_mesh = jax.jvp(forward_mesh_comp_lbfgs, (x_bc,), (normals_rt,))
+                    bc_loss = jnp.mean((du_dn_mesh - mn_target) ** 2)
+                else:
+                    y_bc = model_apply_with_params(params, x_bc)
+                    bc_loss = jnp.mean((y_bc[:, comp] - mn_target) ** 2)
+                total_loss = total_loss + bc_data['weight'] * bc_loss
+
             return total_loss
         
         return compute_loss
@@ -1206,22 +1304,37 @@ def _reinitialize_lagrange_if_needed_impl(self):
 
 
 def _make_al_loss_fn_impl(self, params_dict):
-    from pinns.boundary import NeumannBC, RobinBC
+    from pinns.boundary import NeumannBC, RobinBC, MeshNodeBC
 
     bc_info = {}
     bc_names = self._get_bc_names()
     for i, bc in enumerate(self.problem.boundary_conditions):
         name = bc_names[i]
-        is_neumann = isinstance(bc, (NeumannBC, RobinBC))
-        bc_info[name] = {
-            'component': bc.component,
-            'is_neumann': is_neumann,
-            'const_value': bc.value if not callable(bc.value) else None,
-        }
-        if is_neumann:
-            normal_dim, normal_sign = bc.get_normal_direction()
-            bc_info[name]['normal_dim'] = normal_dim
-            bc_info[name]['normal_sign'] = normal_sign
+        if isinstance(bc, MeshNodeBC):
+            is_mesh_neumann = (bc.bc_type == "neumann") and (bc.edge_normals is not None)
+            is_mesh_time_neumann = (bc.bc_type == "neumann") and (bc.t_mode in ("t_min", "t_max"))
+            bc_info[name] = {
+                'component': bc.component,
+                'is_neumann': False,
+                'is_mesh_neumann': is_mesh_neumann,
+                'is_mesh_time_neumann': is_mesh_time_neumann,
+                'const_value': bc.value if not callable(bc.value) else None,
+                'normal_dim': self.problem.domain._spatial_dims if is_mesh_time_neumann else 0,
+                'normal_sign': (-1 if bc.t_mode == "t_min" else 1) if is_mesh_time_neumann else 1,
+            }
+        else:
+            is_neumann = isinstance(bc, (NeumannBC, RobinBC))
+            bc_info[name] = {
+                'component': bc.component,
+                'is_neumann': is_neumann,
+                'is_mesh_neumann': False,
+                'is_mesh_time_neumann': False,
+                'const_value': bc.value if not callable(bc.value) else None,
+            }
+            if is_neumann:
+                normal_dim, normal_sign = bc.get_normal_direction()
+                bc_info[name]['normal_dim'] = normal_dim
+                bc_info[name]['normal_sign'] = normal_sign
 
     pde_fn = self.problem.pde_fn
     network = self.network
@@ -1254,7 +1367,25 @@ def _make_al_loss_fn_impl(self, params_dict):
             y_bc = model_apply_with_params(params, x_bc)
             comp = info['component']
             target = info['const_value'] if info['const_value'] is not None else targets_dict.get(name, 0.0)
-            if info['is_neumann']:
+            if info['is_mesh_neumann']:
+                # Edge-based Neumann: per-sample normals stored in train_data
+                normals_rt = train_data.get(f'{name}__normals', None)
+                def forward_mesh_comp(x):
+                    return model_apply_with_params(params, x)[:, comp]
+                if normals_rt is not None:
+                    _, du_dn = jax.jvp(forward_mesh_comp, (x_bc,), (normals_rt,))
+                else:
+                    tangent = jnp.ones_like(x_bc) / jnp.sqrt(x_bc.shape[1])
+                    _, du_dn = jax.jvp(forward_mesh_comp, (x_bc,), (tangent,))
+                residuals[name] = (du_dn - target).flatten()
+            elif info['is_mesh_time_neumann']:
+                # Time-boundary Neumann: normal along time axis
+                def forward_comp(x):
+                    return model_apply_with_params(params, x)[:, comp]
+                tangent = jnp.zeros_like(x_bc).at[:, info['normal_dim']].set(1.0)
+                _, du_dn = jax.jvp(forward_comp, (x_bc,), (tangent,))
+                residuals[name] = (info['normal_sign'] * du_dn - target).flatten()
+            elif info['is_neumann']:
                 def forward_component(x):
                     return model_apply_with_params(params, x)[:, comp]
                 tangent = jnp.zeros_like(x_bc)

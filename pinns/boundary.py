@@ -444,3 +444,153 @@ class BoundaryConditions:
             f"robin={len(self.robin)}, "
             f"pointset={len(self.pointset)})"
         )
+
+
+# ============================================================================
+# Mesh-domain boundary conditions
+# ============================================================================
+
+@dataclass
+class MeshNodeBC:
+    """
+    Boundary condition applied at a selected subset of mesh nodes.
+
+    Created by :meth:`DomainMesh.add_dirichlet` and
+    :meth:`DomainMesh.add_neumann`.  Node positions are pre-resolved at
+    construction time so sampling is just a random draw from the stored nodes.
+
+    Args:
+        node_positions: ``(n_selected, spatial_dims)`` array of node coordinates.
+        value: Target value — scalar float or ``(x_np) -> np.ndarray`` callable.
+        bc_type: ``"dirichlet"`` or ``"neumann"``.
+        component: Output component index (default 0).
+        name: Label used in compile dicts and plots.
+        t_mode: Time sampling strategy for spatiotemporal domains:
+                ``None`` for purely spatial domains,
+                ``"all"`` to sample the BC at random times in [t_min, t_max],
+                ``"t_min"`` for initial-condition enforcement (t = t_min),
+                ``"t_max"`` for final-condition enforcement (t = t_max).
+        t_min: Domain time minimum (set automatically by :class:`DomainMesh`).
+        t_max: Domain time maximum (set automatically by :class:`DomainMesh`).
+        normals: Optional ``(n_selected, spatial_dims)`` per-node outward unit
+                 normals (required for spatial Neumann BCs).
+
+    Example::
+
+        domain = DomainMesh(mesh, t_interval=[0, 1])
+
+        # u = 0 on left-wall nodes at all times
+        domain.add_dirichlet(
+            select=lambda v: v[:, 0] < 1e-6,
+            value=0.0, component=0, name="left_wall"
+        )
+
+        # u = sin(pi*y) initial condition at t=0
+        domain.add_dirichlet(
+            select=np.arange(100),
+            value=lambda x: np.sin(np.pi * x[:, 1]),
+            component=0, name="ic", t_mode="t_min"
+        )
+    """
+    node_positions: 'np.ndarray'          # (n_selected, spatial_dims)
+    value: Union[float, Callable]
+    bc_type: str                          # "dirichlet" or "neumann"
+    component: int = 0
+    name: Optional[str] = None
+    t_mode: Optional[str] = None         # None | "all" | "t_min" | "t_max"
+    t_min: float = 0.0
+    t_max: float = 1.0
+    edges: Optional['np.ndarray'] = None         # (n_edges, 2) vertex index pairs into the full mesh
+    edge_lengths: Optional['np.ndarray'] = None  # (n_edges,)
+    edge_normals: Optional['np.ndarray'] = None  # (n_edges, 2) outward unit normals per edge
+
+    def get_value(self, x) -> np.ndarray:
+        """Return target values as a numpy array (backend-agnostic)."""
+        if callable(self.value):
+            if hasattr(x, 'detach'):  # torch tensor
+                x_np = x.detach().cpu().numpy()
+            else:
+                x_np = np.asarray(x)
+            result = self.value(x_np)
+            return np.asarray(result, dtype=np.float32).squeeze()
+        n = x.shape[0]
+        return np.full(n, self.value, dtype=np.float32)
+
+
+@dataclass
+class MeshDirichletBC:
+    """
+    Dirichlet boundary condition on a mesh-based domain.
+
+    Used with :class:`DomainMesh`.  The ``boundary_type`` selects which part of
+    the domain is constrained:
+
+    - ``"surface"``  – the mesh surface (all faces).  Sampling distributes
+      points over the surface and, if a time interval is present, sweeps
+      uniformly in time.
+    - ``"t_min"``    – the initial-time plane (t = t_min), spatially sampled
+      from the mesh interior.
+    - ``"t_max"``    – the final-time plane (t = t_max), spatially sampled
+      from the mesh interior.
+
+    Args:
+        boundary_type: One of ``"surface"``, ``"t_min"``, ``"t_max"``.
+        value: The Dirichlet value.  Scalar or callable with signature
+               ``(x: np.ndarray) -> np.ndarray``.
+        component: Output component index (default 0).
+        name: Name used in compile dicts and plots.
+    """
+    boundary_type: str
+    value: Union[float, Callable]
+    component: int = 0
+    name: Optional[str] = None
+
+    def get_value(self, x: 'torch.Tensor') -> 'torch.Tensor':
+        if callable(self.value):
+            return _call_value_function(self.value, x)
+        return torch.full((x.shape[0],), self.value, device=x.device, dtype=x.dtype)
+
+
+@dataclass
+class MeshNeumannBC:
+    """
+    Neumann boundary condition on a mesh-based domain.
+
+    Supported ``boundary_type`` values:
+
+    - ``"t_min"``  – initial-time plane; normal points in the –t direction.
+    - ``"t_max"``  – final-time plane;   normal points in the +t direction.
+    - ``"surface"`` is **not** supported for Neumann conditions because the
+      outward normal is face-dependent and requires storing per-point normals.
+      Use a :class:`MeshDirichletBC` or a custom :class:`PointsetBC` instead.
+
+    Args:
+        boundary_type: ``"t_min"`` or ``"t_max"``.
+        value: The normal-derivative value.  Scalar or callable.
+        component: Output component index (default 0).
+        name: Name used in compile dicts and plots.
+        spatial_dims: Number of spatial dimensions in the domain.  Set
+                      automatically by :meth:`DomainMesh.add_neumann`.
+    """
+    boundary_type: str
+    value: Union[float, Callable]
+    component: int = 0
+    name: Optional[str] = None
+    spatial_dims: int = 0
+
+    def get_value(self, x: 'torch.Tensor') -> 'torch.Tensor':
+        if callable(self.value):
+            return _call_value_function(self.value, x)
+        return torch.full((x.shape[0],), self.value, device=x.device, dtype=x.dtype)
+
+    def get_normal_direction(self):
+        """Return (normal_dim, normal_sign) for the time axis."""
+        if self.boundary_type == 't_min':
+            return self.spatial_dims, -1
+        elif self.boundary_type == 't_max':
+            return self.spatial_dims, 1
+        raise ValueError(
+            f"Neumann BC on boundary_type='{self.boundary_type}' is not supported. "
+            "Use 't_min' or 't_max'."
+        )
+

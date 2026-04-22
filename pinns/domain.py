@@ -1330,3 +1330,534 @@ class DomainCubicPartition(DomainCubic):
             f"n_subdomains_per_dim={self.n_subdomains_per_dim}, "
             f"total_subdomains={self.n_subdomains}, n_conditions={n_bcs})"
         )
+
+
+# =============================================================================
+# Mesh-based domain
+# =============================================================================
+
+class DomainMesh:
+    """
+    A spatial domain defined by a triangular/tetrahedral mesh, optionally
+    combined with a time interval.
+
+    The mesh provides vertex positions and face connectivity. Interior sampling
+    uses ``trimesh`` when available; otherwise falls back to bounding-box uniform
+    sampling (acceptable for convex meshes, approximate otherwise).
+
+    Boundary conditions are added via :meth:`add_dirichlet` / :meth:`add_neumann`.
+    Nodes are selected either by an integer index array **or** a condition
+    callable of the form ``select(vertices) -> bool mask``.
+
+    Args:
+        mesh: A mesh object with ``.vertices`` and ``.faces`` attributes
+              (``trimesh.Trimesh``, ``pymesh.Mesh``, etc.).
+        t_interval: Optional ``[t_min, t_max]``. When given, the domain is
+                    ``(spatial mesh) × [t_min, t_max]`` and ``n_dims`` equals
+                    ``spatial_dims + 1``.
+
+    Example::
+
+        import trimesh, pinns
+
+        mesh = trimesh.load("geometry.obj")
+        domain = pinns.DomainMesh(mesh, t_interval=[0.0, 1.0])
+
+        # u = 0 on left wall (x ≈ 0) at all times
+        domain.add_dirichlet(
+            select=lambda v: v[:, 0] < 1e-6,
+            value=0.0, component=0, name="left_wall"
+        )
+
+        # initial condition: u = sin(pi*y) at t=0
+        domain.add_dirichlet(
+            select=np.arange(500),
+            value=lambda x: np.sin(np.pi * x[:, 1]),
+            component=0, name="ic", t_mode="t_min"
+        )
+    """
+
+    @staticmethod
+    def _extract_vertices_faces(mesh):
+        """
+        Extract vertices and triangular faces from heterogeneous mesh objects.
+
+        Supported formats
+        -----------------
+        * pymesh / trimesh style:  ``mesh.vertices``, ``mesh.faces``
+        * meshio style (pygmsh):   ``mesh.points``,   ``mesh.cells_dict["triangle"]``
+        * plain tuple/dict:        ``(vertices, faces)``
+        """
+        # --- tuple / list shortcut ----------------------------------------
+        if isinstance(mesh, (tuple, list)) and len(mesh) == 2:
+            return np.asarray(mesh[0], dtype=np.float64), np.asarray(mesh[1], dtype=np.int64)
+
+        # --- meshio (pygmsh output) ----------------------------------------
+        if hasattr(mesh, "points") and hasattr(mesh, "cells_dict"):
+            verts = np.asarray(mesh.points, dtype=np.float64)
+            # Drop the z-column when it is all zeros (2-D mesh embedded in R³)
+            if verts.shape[1] == 3 and np.allclose(verts[:, 2], 0.0):
+                verts = verts[:, :2]
+            faces_raw = None
+            for key in ("triangle", "triangle6"):
+                if key in mesh.cells_dict:
+                    faces_raw = mesh.cells_dict[key]
+                    break
+            if faces_raw is None:
+                raise ValueError(
+                    "meshio mesh has no 'triangle' cell block. "
+                    "Make sure you requested a triangular surface mesh."
+                )
+            return verts, np.asarray(faces_raw, dtype=np.int64)
+
+        # --- pymesh / trimesh style ----------------------------------------
+        if hasattr(mesh, "vertices") and hasattr(mesh, "faces"):
+            return (np.asarray(mesh.vertices, dtype=np.float64),
+                    np.asarray(mesh.faces,    dtype=np.int64))
+
+        raise TypeError(
+            f"Unrecognised mesh type {type(mesh)}.  "
+            "Provide a pymesh, trimesh, meshio, or (vertices, faces) object."
+        )
+
+    def __init__(self, mesh, t_interval=None):
+        vertices, faces = self._extract_vertices_faces(mesh)
+        self._vertices = vertices
+        self._spatial_dims = vertices.shape[1]
+        self._faces = faces
+
+        # For 2D meshes we use exact barycentric triangle sampling — no
+        # trimesh needed.  For 3D meshes we still try trimesh as a fallback.
+        self._trimesh = None
+        if self._spatial_dims == 3:
+            try:
+                import trimesh as _trimesh_mod
+                if isinstance(mesh, _trimesh_mod.Trimesh):
+                    self._trimesh = mesh
+                else:
+                    self._trimesh = _trimesh_mod.Trimesh(
+                        vertices=vertices, faces=self._faces, process=False
+                    )
+            except ImportError:
+                pass
+
+        # Precompute triangle areas (2D) for weighted sampling
+        if self._spatial_dims == 2:
+            A = vertices[self._faces[:, 0]]
+            B = vertices[self._faces[:, 1]]
+            C = vertices[self._faces[:, 2]]
+            cross = (B - A)[:, 0] * (C - A)[:, 1] - (C - A)[:, 0] * (B - A)[:, 1]
+            self._tri_areas = 0.5 * np.abs(cross)   # (n_faces,)
+            self._tri_probs  = self._tri_areas / self._tri_areas.sum()
+        else:
+            self._tri_areas = None
+            self._tri_probs  = None
+
+        sp_min = vertices.min(axis=0)
+        sp_max = vertices.max(axis=0)
+
+        if t_interval is not None:
+            self._t_min = float(t_interval[0])
+            self._t_max = float(t_interval[1])
+            self.xmin = np.append(sp_min, self._t_min)
+            self.xmax = np.append(sp_max, self._t_max)
+        else:
+            self._t_min = None
+            self._t_max = None
+            self.xmin = sp_min
+            self.xmax = sp_max
+
+        self.n_dims = len(self.xmin)
+        self.boundary_conditions: List = []
+
+        # Precompute all unique mesh edges: (n_edges, 2) vertex index pairs.
+        # Used by _resolve_select to let the user address BCs by edge index.
+        _seen_edges: dict = {}
+        _edges_list: list = []
+        for _face in self._faces:
+            for _j in range(3):
+                _v0, _v1 = int(_face[_j]), int(_face[(_j + 1) % 3])
+                _key = (min(_v0, _v1), max(_v0, _v1))
+                if _key not in _seen_edges:
+                    _seen_edges[_key] = len(_edges_list)
+                    _edges_list.append([_v0, _v1])
+        self._all_edges = (np.array(_edges_list, dtype=np.int64)
+                           if _edges_list else np.empty((0, 2), dtype=np.int64))
+        # canonical (min_v, max_v) -> edge_index  (used by helper methods)
+        self._edge_lookup: dict = _seen_edges
+
+    # ------------------------------------------------------------------ #
+    #  Internal helpers                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _sample_interior_spatial(self, n_points: int, rng) -> np.ndarray:
+        """Sample *n_points* spatial points inside the mesh."""
+        # ---- 2D: exact barycentric sampling over triangles ---------------
+        if self._spatial_dims == 2:
+            v = self._vertices
+            f = self._faces
+            # Pick triangles proportionally to area
+            tri_idx = rng.choice(len(f), n_points, p=self._tri_probs)
+            A = v[f[tri_idx, 0]]
+            B = v[f[tri_idx, 1]]
+            C = v[f[tri_idx, 2]]
+            # Uniform sampling inside triangle via barycentric coords
+            r1 = rng.uniform(0.0, 1.0, n_points)
+            r2 = rng.uniform(0.0, 1.0, n_points)
+            mask = r1 + r2 > 1.0
+            r1[mask] = 1.0 - r1[mask]
+            r2[mask] = 1.0 - r2[mask]
+            r3 = 1.0 - r1 - r2
+            return (r1[:, None] * A + r2[:, None] * B + r3[:, None] * C)
+
+        # ---- 3D: trimesh volume sampling → rejection → bbox fallback -----
+        if self._trimesh is not None:
+            try:
+                import trimesh
+                pts = trimesh.sample.volume_mesh(self._trimesh, n_points)
+                pts = np.asarray(pts, dtype=float)
+                if len(pts) >= n_points:
+                    idx = rng.choice(len(pts), n_points, replace=False)
+                    return pts[idx]
+            except Exception:
+                pass
+
+            collected: List[np.ndarray] = []
+            while len(collected) < n_points:
+                extra = max(n_points * 4, 256)
+                cands = rng.uniform(
+                    self.xmin[:self._spatial_dims],
+                    self.xmax[:self._spatial_dims],
+                    (extra, self._spatial_dims)
+                )
+                inside = self._trimesh.contains(cands)
+                for p in cands[inside]:
+                    collected.append(p)
+                    if len(collected) >= n_points:
+                        break
+            return np.array(collected[:n_points], dtype=float)
+
+        # Pure bbox fallback (no containment test)
+        return rng.uniform(
+            self.xmin[:self._spatial_dims],
+            self.xmax[:self._spatial_dims],
+            (n_points, self._spatial_dims)
+        )
+
+    def _resolve_select(self, select) -> np.ndarray:
+        """
+        Return edge indices (into ``self._all_edges``) matching *select*.
+
+        *select* can be one of:
+
+        - **``(n, 2)`` integer array** — interpreted as ``(v0, v1)`` vertex-pair
+          edge pairs (e.g. directly from ``mesh.cells_dict["line"]`` or a
+          ``boundary_edges()`` helper).  Each pair is looked up in
+          ``_edge_lookup``; unrecognised pairs are silently skipped.
+        - **Callable** — called with the full vertex array ``(n_verts, 2)``;
+          must return a boolean mask of shape ``(n_verts,)``.  An edge is
+          included when **both** of its endpoints satisfy the mask.
+        """
+        if callable(select):
+            mask = np.asarray(select(self._vertices), dtype=bool)
+            v0_ok = mask[self._all_edges[:, 0]]
+            v1_ok = mask[self._all_edges[:, 1]]
+            edge_indices = np.where(v0_ok & v1_ok)[0].astype(np.intp)
+        else:
+            arr = np.asarray(select)
+            if arr.ndim != 2 or arr.shape[1] != 2:
+                raise ValueError(
+                    "select must be a (n, 2) array of vertex-index pairs "
+                    "or a callable returning a boolean vertex mask. "
+                    f"Got array with shape {arr.shape}."
+                )
+            edge_indices = self.edge_pairs_to_indices(arr)
+        if len(edge_indices) == 0:
+            raise ValueError("Edge selector matched zero edges.")
+        return edge_indices
+
+    def edge_pairs_to_indices(self, edge_pairs: np.ndarray) -> np.ndarray:
+        """
+        Convert an array of ``(v0, v1)`` vertex-index pairs to edge indices.
+
+        Looks up each pair in ``self._edge_lookup`` (the canonical
+        ``(min_v, max_v) -> edge_index`` dict built at construction time).
+        This is the most direct way to go from the ``"line"`` cells that Gmsh /
+        meshio stores for physical boundaries to the edge-index API expected by
+        :meth:`add_dirichlet` / :meth:`add_neumann`.
+
+        Args:
+            edge_pairs: ``(n, 2)`` integer array of vertex index pairs,
+                        e.g. ``mesh.cells_dict["line"]`` for a physical group.
+
+        Returns:
+            1-D integer array of indices into ``self._all_edges``.
+            Pairs not found in the mesh are silently skipped.
+
+        Example::
+
+            domain = DomainMesh(mesh)
+            line_cells = mesh.cells_dict["line"]  # all boundary segments
+            eidx = domain.edge_pairs_to_indices(line_cells)
+            domain.add_neumann(select=eidx, value=0.0, ...)
+        """
+        indices = []
+        for v0, v1 in edge_pairs:
+            key = (min(int(v0), int(v1)), max(int(v0), int(v1)))
+            idx = self._edge_lookup.get(key)
+            if idx is not None:
+                indices.append(idx)
+        return np.array(indices, dtype=np.intp)
+
+    def node_indices_to_edge_indices(self, node_indices: np.ndarray) -> np.ndarray:
+        """
+        Convert vertex indices to edge indices.
+
+        Returns the indices (into ``self._all_edges``) of every mesh edge whose
+        **both** endpoints are in *node_indices*.
+
+        Args:
+            node_indices: 1-D integer array of vertex indices (e.g. from a
+                          physical-group node helper).
+
+        Returns:
+            1-D integer array of indices into ``self._all_edges``.
+        """
+        node_set = set(node_indices.tolist())
+        v0_ok = np.array([int(e[0]) in node_set for e in self._all_edges])
+        v1_ok = np.array([int(e[1]) in node_set for e in self._all_edges])
+        return np.where(v0_ok & v1_ok)[0].astype(np.intp)
+
+    def _infer_edge_outward_normals(self, edges: np.ndarray) -> np.ndarray:
+        """
+        Compute per-edge outward unit normals for a 2D boundary.
+
+        For each edge the tangent is ``v1 − v0``; rotating 90° CCW gives a
+        candidate normal ``(−dy, dx)`` that is then flipped to point away from
+        the mesh centroid.
+
+        Args:
+            edges: ``(n_edges, 2)`` vertex index pairs (into ``self._vertices``).
+
+        Returns:
+            ``(n_edges, 2)`` outward unit normals, one per edge.
+        """
+        v0 = self._vertices[edges[:, 0]]   # (n_edges, 2)
+        v1 = self._vertices[edges[:, 1]]
+        tangents = v1 - v0                 # (n_edges, 2)
+
+        # Rotate 90° CCW: (tx, ty) → (−ty, tx)
+        normals = np.column_stack([-tangents[:, 1], tangents[:, 0]])
+        norms   = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals /= np.where(norms > 0, norms, 1.0)
+
+        # Orient away from mesh centroid
+        centroid     = self._vertices.mean(axis=0)
+        edge_centers = 0.5 * (v0 + v1)
+        outward      = edge_centers - centroid
+        flip         = (normals * outward).sum(axis=1) < 0
+        normals[flip] *= -1
+        return normals
+
+    # ------------------------------------------------------------------ #
+    #  Public sampling API (called by the trainer)                        #
+    # ------------------------------------------------------------------ #
+
+    def sample_interior(self, n_points: int, rng=None, **kwargs) -> np.ndarray:
+        """Return interior points of shape ``(n_points, n_dims)``."""
+        if rng is None:
+            rng = np.random.default_rng()
+        pts_sp = self._sample_interior_spatial(n_points, rng)
+        if self._t_min is not None:
+            t = rng.uniform(self._t_min, self._t_max, (n_points, 1))
+            return np.hstack([pts_sp, t])
+        return pts_sp
+
+    def sample_boundary(self, n_points: int, dim: int, side: int,
+                        rng=None, **kwargs) -> np.ndarray:
+        """
+        Compatibility shim for time boundaries (``dim = spatial_dims``).
+
+        For mesh surface BCs use :meth:`sample_boundary_bc` instead.
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+        pts_sp = self._sample_interior_spatial(n_points, rng)
+        if self._t_min is not None and dim == self._spatial_dims:
+            t_val = self._t_min if side == 0 else self._t_max
+            t = np.full((n_points, 1), t_val)
+            return np.hstack([pts_sp, t])
+        return self.sample_interior(n_points, rng=rng)
+
+    def sample_boundary_bc(self, bc, n_points: int, rng=None) -> np.ndarray:
+        """
+        Sample *n_points* from the boundary curve stored in a :class:`MeshNodeBC`.
+
+        When the BC has precomputed edges (the normal case), points are drawn
+        **uniformly along the boundary edges** weighted by edge length — this
+        gives continuous coverage of the boundary rather than being restricted
+        to mesh node positions.  The returned index array contains the
+        *edge index* of each sampled point; callers use it to look up the
+        corresponding per-edge normal (``bc.edge_normals[idx]``).
+
+        When no edges are available (isolated nodes or time BCs), the method
+        falls back to drawing from ``bc.node_positions`` as before.
+
+        A time coordinate is appended according to ``bc.t_mode``.
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+
+        if bc.edges is not None:
+            # ── Edge-based sampling: uniform along boundary edges ──────────
+            probs    = bc.edge_lengths / bc.edge_lengths.sum()
+            idx      = rng.choice(len(bc.edges), size=n_points, p=probs)
+            t_param  = rng.uniform(0.0, 1.0, (n_points, 1))
+            v0       = self._vertices[bc.edges[idx, 0]]
+            v1       = self._vertices[bc.edges[idx, 1]]
+            pts_sp   = v0 + t_param * (v1 - v0)
+        else:
+            # ── Fallback: sample from discrete node positions ──────────────
+            n_nodes = len(bc.node_positions)
+            idx     = rng.integers(0, n_nodes, n_points)
+            pts_sp  = bc.node_positions[idx]
+
+        if self._t_min is None or bc.t_mode is None:
+            return pts_sp, idx
+        elif bc.t_mode == "all":
+            t = rng.uniform(self._t_min, self._t_max, (n_points, 1))
+            return np.hstack([pts_sp, t]), idx
+        elif bc.t_mode == "t_min":
+            t = np.full((n_points, 1), self._t_min)
+            return np.hstack([pts_sp, t]), idx
+        elif bc.t_mode == "t_max":
+            t = np.full((n_points, 1), self._t_max)
+            return np.hstack([pts_sp, t]), idx
+        else:
+            raise ValueError(f"Unknown t_mode: {bc.t_mode!r}. "
+                             "Choose 'all', 't_min', or 't_max'.")
+
+    # ------------------------------------------------------------------ #
+    #  Boundary-condition builders                                        #
+    # ------------------------------------------------------------------ #
+
+    def add_dirichlet(
+        self,
+        select,
+        value,
+        component: int = 0,
+        name: str = None,
+        t_mode: str = None,
+    ) -> 'DomainMesh':
+        """
+        Add a Dirichlet BC: ``u = value`` on the selected nodes.
+
+        Args:
+            select: Node selector — an ``np.ndarray`` of integer indices **or**
+                    a callable ``(vertices: ndarray) -> bool mask``.
+
+                    Examples::
+
+                        select=lambda v: v[:, 0] < 1e-6   # x ≈ 0 plane
+                        select=np.array([0, 5, 10, 42])   # explicit indices
+                        select=lambda v: np.linalg.norm(v, axis=1) > 0.99
+
+            value: Dirichlet value. Scalar **or** ``(x_np) -> np.ndarray``
+                   callable that receives the sampled coordinates (including t
+                   if a time interval is set).
+            component: Output component index (default 0).
+            name: Label used in loss weight dicts and plots.
+            t_mode: How to handle the time dimension (ignored for purely
+                    spatial domains):
+
+                    - ``None``    — no time appended (pure spatial domain)
+                    - ``"all"``   — sample t uniformly in ``[t_min, t_max]``
+                    - ``"t_min"`` — fix t = t_min  (initial condition)
+                    - ``"t_max"`` — fix t = t_max  (final condition)
+
+        Returns:
+            *self* for method chaining.
+        """
+        from pinns.boundary import MeshNodeBC
+        edge_indices  = self._resolve_select(select)
+        edges         = self._all_edges[edge_indices]          # (n_sel, 2)
+        node_positions = self._vertices[np.unique(edges)]      # unique vertices
+        edge_lengths  = np.linalg.norm(
+            self._vertices[edges[:, 1]] - self._vertices[edges[:, 0]], axis=1)
+        bc = MeshNodeBC(
+            node_positions=node_positions,
+            value=value,
+            bc_type="dirichlet",
+            component=component,
+            name=name,
+            t_mode=t_mode if self._t_min is not None else None,
+            t_min=self._t_min or 0.0,
+            t_max=self._t_max or 1.0,
+            edges=edges,
+            edge_lengths=edge_lengths,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
+    def add_neumann(
+        self,
+        select,
+        value,
+        component: int = 0,
+        name: str = None,
+        t_mode: str = None,
+    ) -> 'DomainMesh':
+        """
+        Add a Neumann BC: ``du/dn = value`` on the selected edges.
+
+        For **time boundaries** (``t_mode="t_min"`` or ``"t_max"``) the normal
+        direction is along the time axis.
+
+        For **spatial surface** edges normals are inferred automatically from
+        the local tangent of the boundary curve and oriented away from the
+        mesh centroid.
+
+        Args:
+            select: Edge selector — ``(n, 2)`` vertex-pair array or callable
+                    (see :meth:`add_dirichlet`).
+            value: Normal-derivative value. Scalar or callable.
+            component: Output component index.
+            name: Label.
+            t_mode: Time sampling mode (see :meth:`add_dirichlet`).
+
+        Returns:
+            *self* for method chaining.
+        """
+        from pinns.boundary import MeshNodeBC
+        edge_indices   = self._resolve_select(select)
+        edges          = self._all_edges[edge_indices]          # (n_sel, 2)
+        node_positions = self._vertices[np.unique(edges)]       # unique vertices
+        edge_lengths   = np.linalg.norm(
+            self._vertices[edges[:, 1]] - self._vertices[edges[:, 0]], axis=1)
+        if t_mode not in ("t_min", "t_max"):
+            edge_normals = self._infer_edge_outward_normals(edges)
+        else:
+            edge_normals = None
+        bc = MeshNodeBC(
+            node_positions=node_positions,
+            value=value,
+            bc_type="neumann",
+            component=component,
+            name=name,
+            t_mode=t_mode if self._t_min is not None else None,
+            t_min=self._t_min or 0.0,
+            t_max=self._t_max or 1.0,
+            edges=edges,
+            edge_lengths=edge_lengths,
+            edge_normals=edge_normals,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
+    def __repr__(self):
+        n_bcs = len(self.boundary_conditions)
+        sp = f"{self._spatial_dims}D"
+        t_info = (f" × t∈[{self._t_min}, {self._t_max}]"
+                  if self._t_min is not None else "")
+        return (f"DomainMesh({sp}{t_info}, "
+                f"n_nodes={len(self._vertices)}, n_conditions={n_bcs})")
