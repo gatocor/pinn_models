@@ -396,10 +396,25 @@ class Trainer(BaseTrainer):
                 else:
                     dirichlet_bcs.append(bc_data)
         
+        from pinns.problem_weak import ProblemWeak as _ProblemWeak
+        _is_weak = isinstance(self.problem, _ProblemWeak)
+
         model_apply = self.network.apply
-        pde_fn = self.problem.pde_fn
+        pde_fn = None if _is_weak else self.problem.pde_fn
         pde_weight = weights.get('pde', 1.0)
-        
+
+        # ── Weak-form: pre-build and JIT the FEM assembler loss ──────────
+        if _is_weak:
+            _network = self.network
+            def _u_and_grad(params, xy):
+                def u_single(z):
+                    return _network.apply(params, z[None])[0, 0]
+                return jax.value_and_grad(u_single)(xy)
+            _weak_loss_fn = jax.jit(self.problem.make_loss_fn(_u_and_grad))
+            self._weak_loss_fn = _weak_loss_fn
+        else:
+            _weak_loss_fn = None
+
         def model_apply_with_params(params, x):
             return self.network.apply(params, x, params_dict)
         
@@ -426,19 +441,28 @@ class Trainer(BaseTrainer):
             """Apply network using sparse indices with derivative support."""
             return network.apply_sparse_differentiable(params, x, sparse_indices, params_dict)
         
-        sig = inspect.signature(pde_fn)
-        pde_accepts_derivative = len(sig.parameters) >= 4
-        
+        pde_accepts_derivative = False
+        if pde_fn is not None:
+            sig = inspect.signature(pde_fn)
+            pde_accepts_derivative = len(sig.parameters) >= 4
+        # Weak-form always uses the full-JIT path (derivative not needed externally)
+        if _is_weak:
+            pde_accepts_derivative = True
+
         # Precompute n_dims from first BC if available
         n_dims = self.problem.n_dims
-        
+
         def compute_loss(params, train_data, targets_dict):
             total_loss = 0.0
-            
-            # ===== PDE Loss =====
-            if 'pde' in train_data:
+
+            # ===== PDE / Weak-form Loss =====
+            if _is_weak:
+                # Weak-form: cubature assembly, no collocation points needed
+                pde_loss = _weak_loss_fn(params)
+                total_loss = total_loss + pde_weight * pde_loss
+            elif 'pde' in train_data:
                 x_pde = train_data['pde']
-                
+
                 # Use sparse differentiable forward if available
                 if precomputed_pde is not None:
                     # Sparse path with derivative support
@@ -450,7 +474,7 @@ class Trainer(BaseTrainer):
                     # Standard path
                     y_pde = model_apply_with_params(params, x_pde)
                     deriv_fn = make_derivative_fn(model_apply_with_params, params)
-                
+
                 if pde_accepts_derivative:
                     residual = pde_fn(x_pde, y_pde, params_dict, deriv_fn)
                 else:
@@ -459,7 +483,7 @@ class Trainer(BaseTrainer):
                         residual = pde_fn(x_pde, y_pde, params_dict)
                     finally:
                         clear_context()
-                
+
                 if isinstance(residual, (list, tuple)):
                     pde_loss = sum(jnp.mean(r**2) for r in residual) / len(residual)
                 else:
@@ -568,8 +592,42 @@ class Trainer(BaseTrainer):
             
             return (grad_fn, apply_updates), False
     
+    # ==================== Loss Computation (weak-form override) ====================
+
+    def _compute_total_loss(self, data, params_dict, weights_dict):
+        """Override to include weak-form PDE residual in metrics for ProblemWeak."""
+        from pinns.problem_weak import ProblemWeak as _ProblemWeak
+        if isinstance(self.problem, _ProblemWeak) and hasattr(self, '_weak_loss_fn'):
+            # Strip 'pde' so base never tries to call problem.pde_fn
+            bc_data = {k: v for k, v in data.items() if k != 'pde'}
+            total_loss, losses = super()._compute_total_loss(bc_data, params_dict, weights_dict)
+            # Add weak PDE residual
+            pde_weight = weights_dict.get('pde', 1.0)
+            weak_pde_loss = float(self._weak_loss_fn(self.network.params))
+            losses['pde'] = pde_weight * weak_pde_loss
+            extra = pde_weight * weak_pde_loss
+            total_loss = extra if total_loss is None else total_loss + extra
+            return total_loss, losses
+        return super()._compute_total_loss(data, params_dict, weights_dict)
+
+    def _compute_total_loss_batched(self, data, params_dict, weights_dict, batch_size=1000):
+        """Override so the weak-form PDE loss is computed once, not per-batch."""
+        from pinns.problem_weak import ProblemWeak as _ProblemWeak
+        if isinstance(self.problem, _ProblemWeak) and hasattr(self, '_weak_loss_fn'):
+            # Strip 'pde' so base never tries to call problem.pde_fn
+            bc_data = {k: v for k, v in data.items() if k != 'pde'}
+            total_loss, losses = super()._compute_total_loss_batched(
+                bc_data, params_dict, weights_dict, batch_size)
+            # Add weak residual exactly once
+            pde_weight = weights_dict.get('pde', 1.0)
+            weak_pde_loss = float(self._weak_loss_fn(self.network.params))
+            losses['pde'] = pde_weight * weak_pde_loss
+            total_loss = (total_loss or 0.0) + pde_weight * weak_pde_loss
+            return total_loss, losses
+        return super()._compute_total_loss_batched(data, params_dict, weights_dict, batch_size)
+
     # ==================== Training ====================
-    
+
     def train(self):
         """
         Train the model.

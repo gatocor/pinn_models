@@ -36,6 +36,7 @@ _backend_classes = {}
 # Domain and Problem are backend-agnostic
 from .domain import DomainCubic, DomainCubicPartition, DomainMesh, SubdomainInfo, bump
 from .problem import Problem
+from .problem_weak import ProblemWeak
 
 # Learning rate schedulers (backend-agnostic)
 from .backends import LRScheduler, ExponentialDecay, ReduceLROnPlateau
@@ -157,6 +158,7 @@ __all__ = [
     "RWFLayer",
     # Problems
     "Problem",
+    "ProblemWeak",
     # Functional
     "derivative",
     "gradient",

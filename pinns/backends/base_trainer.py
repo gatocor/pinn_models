@@ -308,8 +308,13 @@ class BaseTrainer(ABC):
         # Training configuration defaults
         n_bcs = len(problem.boundary_conditions)
         expected_len = 1 + n_bcs
-        self.train_samples = [100] + [10] * n_bcs
-        self.test_samples = [100] + [0] * n_bcs
+        # For weak-form problems the PDE residual is assembled via cubature,
+        # not by sampling interior collocation points.  Set the first entry
+        # (PDE samples) to 0 so no interior sampling is performed.
+        from pinns.problem_weak import ProblemWeak as _ProblemWeak
+        _pde_samples = 0 if isinstance(problem, _ProblemWeak) else 100
+        self.train_samples = [_pde_samples] + [10] * n_bcs
+        self.test_samples = [0] + [0] * n_bcs
         self.weights = [1.0] * expected_len
         self.learning_rate = 1e-3
         self.optimizer_name = "adam"
@@ -1477,9 +1482,16 @@ class BaseTrainer(ABC):
             result = []
             
             # First element is 'pde'
+            # For ProblemWeak the PDE residual is assembled via cubature,
+            # so 'pde' samples are not needed — default to 0 if omitted.
+            from pinns.problem_weak import ProblemWeak as _ProblemWeak
+            _default_pde = 0 if isinstance(self.problem, _ProblemWeak) else None
             if 'pde' not in data:
-                raise ValueError(f"{param_name} dict must contain 'pde' key")
-            result.append(data['pde'])
+                if _default_pde is None:
+                    raise ValueError(f"{param_name} dict must contain 'pde' key")
+                result.append(_default_pde)
+            else:
+                result.append(data['pde'])
             
             # Then BC values in order
             for i, bc_name in enumerate(bc_names):
@@ -1836,7 +1848,7 @@ class BaseTrainer(ABC):
         
         # Plot true solution if available
         if self.problem.solution is not None:
-            y_true = self.problem.solution(x, self._build_params())
+            y_true = self._call_solution(x)
             if isinstance(y_true, (list, tuple)):
                 y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
             elif y_true.ndim == 1:
@@ -1912,7 +1924,7 @@ class BaseTrainer(ABC):
         if self._is_mesh_domain():
             dom = self.problem.domain
             tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
-            y_true = _normalise(self.problem.solution(dom._vertices, self._build_params()))
+            y_true = _normalise(self._call_solution(dom._vertices))
             vals = y_true[:, output_idx]
             im = ax.tricontourf(tri, vals, levels=50, **ikw)
             ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
@@ -1921,7 +1933,7 @@ class BaseTrainer(ABC):
             x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
             X0, X1 = np.meshgrid(x0, x1)
             x_flat = np.column_stack([X0.ravel(), X1.ravel()])
-            y_true = _normalise(self.problem.solution(x_flat, self._build_params()))
+            y_true = _normalise(self._call_solution(x_flat))
             Y_true = y_true[:, output_idx].reshape(X0.shape)
             extent = [x0.min(), x0.max(), x1.min(), x1.max()]
             im = ax.imshow(Y_true, extent=extent, origin='lower', aspect='equal', **ikw)
@@ -1942,7 +1954,7 @@ class BaseTrainer(ABC):
         x = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points).reshape(-1, 1)
         y = self.predict(x)
         
-        y_true = self.problem.solution(x, self._build_params())
+        y_true = self._call_solution(x)
         if isinstance(y_true, (list, tuple)):
             y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
         elif y_true.ndim == 1:
@@ -1977,7 +1989,7 @@ class BaseTrainer(ABC):
             dom = self.problem.domain
             tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
             y = self.predict(dom._vertices)
-            y_true = _normalise(self.problem.solution(dom._vertices, self._build_params()))
+            y_true = _normalise(self._call_solution(dom._vertices))
             error = np.abs(y[:, output_idx] - y_true[:, output_idx])
             im = ax.tricontourf(tri, error, levels=50, **ikw)
             ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
@@ -1987,7 +1999,7 @@ class BaseTrainer(ABC):
             X0, X1 = np.meshgrid(x0, x1)
             x_flat = np.column_stack([X0.ravel(), X1.ravel()])
             y = self.predict(x_flat)
-            y_true = _normalise(self.problem.solution(x_flat, self._build_params()))
+            y_true = _normalise(self._call_solution(x_flat))
             error = np.abs(y[:, output_idx] - y_true[:, output_idx]).reshape(X0.shape)
             extent = [x0.min(), x0.max(), x1.min(), x1.max()]
             im = ax.imshow(error, extent=extent, origin='lower', aspect='equal', **ikw)
@@ -2278,6 +2290,10 @@ class BaseTrainer(ABC):
 
     def _plot_residuals_1d(self, ax, output_idx, n_points=200):
         """Plot 1D PDE residuals."""
+        from pinns.problem_weak import ProblemWeak as _ProblemWeak
+        if isinstance(self.problem, _ProblemWeak):
+            ax.set_visible(False)
+            return
         x_np = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points).reshape(-1, 1)
         
         residuals = self._compute_residuals(x_np)
@@ -2298,6 +2314,10 @@ class BaseTrainer(ABC):
 
     def _plot_residuals_2d(self, ax, output_idx, n_points=50, plot_key='residuals'):
         """Plot 2D PDE residuals as heatmap."""
+        from pinns.problem_weak import ProblemWeak as _ProblemWeak
+        if isinstance(self.problem, _ProblemWeak):
+            ax.set_visible(False)
+            return
         ikw = {'cmap': 'viridis'}
         ikw.update(self._get_imshow_kwargs(plot_key))
 
@@ -2448,7 +2468,14 @@ class BaseTrainer(ABC):
                           alpha=1, marker='x', zorder=6)
     
     # ==================== Solution Error Computation ====================
-    
+
+    def _call_solution(self, x: np.ndarray) -> np.ndarray:
+        """Call problem.solution with either 1-arg or 2-arg signature."""
+        try:
+            return self.problem.solution(x, self._build_params())
+        except TypeError:
+            return self.problem.solution(x)
+
     def _compute_solution_error(self, n_points: int = 1000) -> Optional[float]:
         """
         Compute L2 relative error between predicted and true solution.
@@ -2470,7 +2497,7 @@ class BaseTrainer(ABC):
         )
         
         y_pred = self.predict(x)
-        y_true = self.problem.solution(x, self._build_params())
+        y_true = self._call_solution(x)
         
         if isinstance(y_true, (list, tuple)):
             y_true = np.concatenate([np.atleast_2d(y).T if y.ndim == 1 else y for y in y_true], axis=1)
