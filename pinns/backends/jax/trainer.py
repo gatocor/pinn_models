@@ -75,7 +75,13 @@ class Trainer(BaseTrainer):
         return bool(lagrange)
 
     def _resolve_problem_lagrange_constraints(self) -> Optional[List[str]]:
+        from pinns.problem_weak import ProblemWeak as _ProblemWeak
         lagrange = getattr(self.problem, 'lagrange_multipliers', None)
+        if not lagrange:
+            return None
+        # For ProblemWeak the list is already in the right format
+        if isinstance(self.problem, _ProblemWeak):
+            return list(lagrange)
         if not lagrange:
             return None
 
@@ -241,7 +247,7 @@ class Trainer(BaseTrainer):
             self.opt_state = None
         else:
             self.opt_state = self.optimizer.init(self.network.params)
-    
+
     def _after_compile_hook(self):
         """Sample data and precompute FBPINN sparse data if applicable."""
         # Call parent to sample train/test data (or pool)
@@ -339,7 +345,7 @@ class Trainer(BaseTrainer):
     def _make_jit_train_step(self, weights, params_dict):
         """Create a JIT-compiled training step function."""
         from pinns.boundary import NeumannBC, MeshNodeBC
-        
+
         # Pre-extract BC info as static data
         bc_info = []
         dirichlet_bcs = []
@@ -412,6 +418,8 @@ class Trainer(BaseTrainer):
                 return jax.value_and_grad(u_single)(xy)
             _weak_loss_fn = jax.jit(self.problem.make_loss_fn(_u_and_grad))
             self._weak_loss_fn = _weak_loss_fn
+            self._weak_residual_fn = jax.jit(
+                self.problem.make_residual_vector_fn(_u_and_grad))
         else:
             _weak_loss_fn = None
 
@@ -452,7 +460,7 @@ class Trainer(BaseTrainer):
         # Precompute n_dims from first BC if available
         n_dims = self.problem.n_dims
 
-        def compute_loss(params, train_data, targets_dict):
+        def compute_loss(params, train_data, targets_dict, lm_params=None):
             total_loss = 0.0
 
             # ===== PDE / Weak-form Loss =====
@@ -571,7 +579,7 @@ class Trainer(BaseTrainer):
                 total_loss = total_loss + bc_data['weight'] * bc_loss
 
             return total_loss
-        
+
         if pde_accepts_derivative:
             @jax.jit
             def train_step(params, opt_state, train_data, targets_dict):
@@ -580,7 +588,7 @@ class Trainer(BaseTrainer):
                 new_params = optax.apply_updates(params, updates)
                 return new_params, new_opt_state, loss
             
-            return train_step, True
+            return train_step, True, False
         else:
             grad_fn = jax.value_and_grad(compute_loss)
             
@@ -590,7 +598,7 @@ class Trainer(BaseTrainer):
                 new_params = optax.apply_updates(params, updates)
                 return new_params, new_opt_state
             
-            return (grad_fn, apply_updates), False
+            return (grad_fn, apply_updates), False, False
     
     # ==================== Loss Computation (weak-form override) ====================
 
@@ -655,7 +663,7 @@ class Trainer(BaseTrainer):
                              params_dict, weights)
             return
         
-        result, is_full_jit = self._make_jit_train_step(weights, params_dict)
+        result, is_full_jit, _ = self._make_jit_train_step(weights, params_dict)
         
         # Calculate number of batches
         n_batches = self._get_n_batches()
@@ -844,8 +852,8 @@ class Trainer(BaseTrainer):
                     
                     if is_full_jit:
                         self.network.params, self.opt_state, loss = train_step(
-                            self.network.params, self.opt_state, batch_data, batch_targets
-                        )
+                                self.network.params, self.opt_state, batch_data, batch_targets
+                            )
                     else:
                         loss, grads = grad_fn(self.network.params, batch_data, batch_targets)
                         self.network.params, self.opt_state = apply_updates(self.network.params, grads, self.opt_state)
@@ -858,8 +866,8 @@ class Trainer(BaseTrainer):
                 train_targets = getattr(self, '_train_targets', {})
                 if is_full_jit:
                     self.network.params, self.opt_state, loss = train_step(
-                        self.network.params, self.opt_state, self._train_data, train_targets
-                    )
+                            self.network.params, self.opt_state, self._train_data, train_targets
+                        )
                 else:
                     loss, grads = grad_fn(self.network.params, self._train_data, train_targets)
                     self.network.params, self.opt_state = apply_updates(self.network.params, grads, self.opt_state)
@@ -1345,6 +1353,15 @@ def _initialize_lagrange_multipliers_impl(self):
         if self._lagrange_optimizer is not None:
             self._lagrange_opt_states['pde'] = self._lagrange_optimizer.init(self.lagrange_multipliers['pde'])
 
+    # For ProblemWeak the PDE residual has size n_free_nodes (no collocation pts)
+    from pinns.problem_weak import ProblemWeak as _ProblemWeak
+    if isinstance(self.problem, _ProblemWeak):
+        if ((self._lagrange_constraints is None) or ('pde' in self._lagrange_constraints)):
+            n = self.problem.n_free_nodes
+            self.lagrange_multipliers['pde'] = jnp.zeros(n)
+            if self._lagrange_optimizer is not None:
+                self._lagrange_opt_states['pde'] = self._lagrange_optimizer.init(self.lagrange_multipliers['pde'])
+
     for name in self._get_bc_names():
         if name in self._train_data and ((self._lagrange_constraints is None) or (name in self._lagrange_constraints)):
             n = len(self._train_data[name])
@@ -1363,6 +1380,85 @@ def _reinitialize_lagrange_if_needed_impl(self):
 
 def _make_al_loss_fn_impl(self, params_dict):
     from pinns.boundary import NeumannBC, RobinBC, MeshNodeBC
+    from pinns.problem_weak import ProblemWeak as _ProblemWeak
+    _is_weak = isinstance(self.problem, _ProblemWeak)
+
+    # ── For ProblemWeak: replace the strong-form PDE residual (collocation)
+    # with the FEM weak-form residual vector R[free_nodes].  BC residuals
+    # remain identical to the strong form (point evaluation u − g).
+    if _is_weak:
+        network = self.network
+
+        def _u_and_grad(p, xy):
+            def _u(z): return network.apply(p, z[None])[0, 0]
+            return jax.value_and_grad(_u)(xy)
+
+        _weak_res_fn = jax.jit(self.problem.make_residual_vector_fn(_u_and_grad))
+        # Store for the residual plot
+        self._weak_residual_fn = _weak_res_fn
+        _free_nodes_jax = jnp.array(self.problem.free_nodes, dtype=jnp.int32)
+
+        def _model_apply(p, x):
+            return network.apply(p, x)
+
+        train_targets = getattr(self, '_train_targets', {})
+        bc_names = self._get_bc_names()
+
+        # Collect Dirichlet BC info (same as strong form)
+        _bc_point_info = []
+        for i, bc in enumerate(self.problem.boundary_conditions):
+            name = bc_names[i]
+            if isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet':
+                _bc_point_info.append({
+                    'name': name,
+                    'component': bc.component,
+                    'const_value': bc.value if not callable(bc.value) else None,
+                })
+
+        def compute_residuals_weak(params, train_data, targets_dict=None):
+            targets_dict = {} if targets_dict is None else targets_dict
+            residuals = {}
+            # PDE: weak-form R_free (shape n_free_nodes)
+            R_full = _weak_res_fn(params)
+            residuals['pde'] = R_full[_free_nodes_jax]
+            # BCs: point evaluation  u(x_k) − g
+            for info in _bc_point_info:
+                bname = info['name']
+                if bname not in train_data:
+                    continue
+                x_bc = train_data[bname]
+                y_bc = _model_apply(params, x_bc)
+                comp   = info['component']
+                target = (info['const_value'] if info['const_value'] is not None
+                          else targets_dict.get(bname, 0.0))
+                residuals[bname] = (y_bc[:, comp] - target).flatten()
+            return residuals
+
+        def compute_al_loss_weak(params, train_data, lagrange_dict,
+                                 weights_dict, targets_dict=None):
+            residuals = compute_residuals_weak(params, train_data, targets_dict)
+            total_loss = 0.0
+            losses = {'bcs': []}
+            lc = self._lagrange_constraints
+            for name, g in residuals.items():
+                lam = lagrange_dict.get(name, jnp.zeros_like(g))
+                if len(lam) != len(g):
+                    lam = jnp.zeros_like(g)
+                use_quad   = self._constraint_uses_quadratic(name)
+                use_lambda = (lc is None) or (name in lc)
+                penalty    = weights_dict.get(name, 1.0) * jnp.mean(g ** 2) if use_quad else 0.0
+                lagrangian = jnp.mean(jax.lax.stop_gradient(lam) * g) if use_lambda else 0.0
+                constraint_loss = penalty + lagrangian
+                losses[name] = constraint_loss
+                losses[f'{name}_penalty']        = penalty
+                losses[f'{name}_lagrangian']     = lagrangian
+                losses[f'{name}_residual_mean']  = jnp.mean(jnp.abs(g))
+                if name != 'pde':
+                    losses['bcs'].append(constraint_loss)
+                total_loss = total_loss + constraint_loss
+            return total_loss, (losses, residuals)
+
+        return compute_al_loss_weak, compute_residuals_weak
 
     bc_info = {}
     bc_names = self._get_bc_names()

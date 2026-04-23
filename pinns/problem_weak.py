@@ -179,6 +179,23 @@ def _ref_nodes_pqr(N: int):
     return nodes
 
 
+def _local_edge_dof_indices(le: int, N: int) -> list:
+    """
+    Local DOF indices within an element's ``elem_dofs`` row for the N+1 DOFs
+    on local edge *le*, ordered from element corner *la* toward *lb*.
+
+    le=0: corners (0→1) + interior edge-0 DOFs
+    le=1: corners (1→2) + interior edge-1 DOFs
+    le=2: corners (2→0) + interior edge-2 DOFs
+    """
+    n_ei      = N - 1
+    offsets   = [3, 3 + n_ei, 3 + 2 * n_ei]
+    endpoints = [(0, 1), (1, 2), (2, 0)]
+    ea, eb    = endpoints[le]
+    interior  = list(range(offsets[le], offsets[le] + n_ei))
+    return [ea] + interior + [eb]   # length N+1
+
+
 def _lagrange_basis_and_grad(pts_ref: np.ndarray, N: int):
     """
     Evaluate order-N Lagrange basis functions and their reference gradients
@@ -457,6 +474,110 @@ def _precompute_boundary_edges(vertices:     np.ndarray,
     }
 
 
+def _precompute_lm_boundary(vertices:          np.ndarray,
+                             faces:             np.ndarray,
+                             elem_dofs:         np.ndarray,
+                             boundary_edges:    np.ndarray,
+                             bc_value,
+                             bc_component:      int,
+                             cub_order:         int,
+                             lag_order:         int,
+                             lm_global_dof_ids: np.ndarray):
+    """
+    Precompute boundary cubature data for one Lagrange-multiplier (LM) BC.
+
+    The LM space uses the same order-N Lagrange trace basis as the primal
+    space, so ``phi`` in the returned dict plays the role of *both* the
+    primal-trace and LM-basis matrices (they coincide when both spaces are
+    order-N on the boundary).
+
+    Returns
+    -------
+    dict with keys:
+        pts            (n_bdy, n_eq, 2)    – physical quadrature points
+        weights        (n_bdy, n_eq)       – Gauss weights × edge length
+        phi            (n_bdy, n_eq, N+1)  – trace Lagrange basis
+        global_dof_ids (n_bdy, N+1) int32  – global DOF indices (scatter → R)
+        lm_local_ids   (n_bdy, N+1) int32  – LM index (scatter/gather lm_params)
+        g_vals         (n_bdy, n_eq)       – prescribed BC values at quad pts
+    """
+    N = lag_order
+
+    # Build edge → (face_idx, local_edge_idx) lookup
+    edge_to_face: dict = {}
+    local_edge_pairs = [(0, 1), (1, 2), (2, 0)]
+    for f, face in enumerate(faces):
+        for le, (la, lb) in enumerate(local_edge_pairs):
+            key = (min(int(face[la]), int(face[lb])), max(int(face[la]), int(face[lb])))
+            edge_to_face[key] = (f, le)
+
+    ref_t, ref_w = _edge_cubature_1d(cub_order)
+    n_eq      = len(ref_t)
+    n_bdy     = len(boundary_edges)
+    n_local_e = N + 1
+
+    lm_g2l         = {int(g): i for i, g in enumerate(lm_global_dof_ids)}
+    pts_all        = np.empty((n_bdy, n_eq, 2),        dtype=np.float64)
+    weights_all    = np.empty((n_bdy, n_eq),            dtype=np.float64)
+    phi_all        = np.empty((n_bdy, n_eq, n_local_e), dtype=np.float64)
+    global_ids_all = np.empty((n_bdy, n_local_e),      dtype=np.int64)
+    lm_loc_all     = np.empty((n_bdy, n_local_e),      dtype=np.int64)
+    g_vals_all     = np.empty((n_bdy, n_eq),            dtype=np.float64)
+
+    def _ref_edge_pts(le, t):
+        """Map t ∈ [0,1] to reference-triangle coords along local edge le."""
+        if le == 0:
+            return np.stack([t, np.zeros_like(t)], axis=1)
+        elif le == 1:
+            return np.stack([1.0 - t, t], axis=1)
+        else:
+            return np.stack([np.zeros_like(t), 1.0 - t], axis=1)
+
+    for e, (va, vb) in enumerate(boundary_edges):
+        va, vb    = int(va), int(vb)
+        key       = (min(va, vb), max(va, vb))
+        f_idx, le = edge_to_face[key]
+        face      = faces[f_idx]
+        la, lb    = local_edge_pairs[le]
+        fa_node   = int(face[la])
+        # direction_matches: physical va==face[la], so t goes la→lb in ref
+        direction_matches = (va == fa_node)
+
+        xa, xb = vertices[va], vertices[vb]
+        length = np.linalg.norm(xb - xa)
+        pts_all[e]    = xa + ref_t[:, None] * (xb - xa)
+        weights_all[e] = ref_w * length
+
+        # Reference coords of the quadrature points on this edge
+        t_ref        = ref_t if direction_matches else (1.0 - ref_t)
+        ref_pts_edge = _ref_edge_pts(le, t_ref)                # (n_eq, 2)
+        phi_full, _  = _lagrange_basis_and_grad(ref_pts_edge, N)  # (n_eq, n_local)
+        local_ids    = _local_edge_dof_indices(le, N)           # N+1 in la→lb order
+
+        phi_all[e]        = phi_full[:, local_ids]              # (n_eq, N+1)
+        glob_ids          = np.array(elem_dofs[f_idx])[local_ids]
+        global_ids_all[e] = glob_ids
+        lm_loc_all[e]     = np.array([lm_g2l[int(g)] for g in glob_ids])
+
+        # Prescribed BC value at quad points
+        if callable(bc_value):
+            for q in range(n_eq):
+                val = bc_value(pts_all[e, q])
+                g_vals_all[e, q] = (val[bc_component]
+                                    if hasattr(val, '__len__') else float(val))
+        else:
+            g_vals_all[e, :] = float(bc_value)
+
+    return {
+        'pts':            pts_all.astype(np.float32),
+        'weights':        weights_all.astype(np.float32),
+        'phi':            phi_all.astype(np.float32),
+        'global_dof_ids': global_ids_all.astype(np.int32),
+        'lm_local_ids':   lm_loc_all.astype(np.int32),
+        'g_vals':         g_vals_all.astype(np.float32),
+    }
+
+
 # ---------------------------------------------------------------------------
 # ProblemWeak
 # ---------------------------------------------------------------------------
@@ -540,12 +661,13 @@ class ProblemWeak:
     lagrange_order: int = 1
     basis: str = "lagrange"
     solution: Optional[Callable] = None
+    lagrange_multipliers: List[str] = field(default_factory=list)
 
     # ── filled by __post_init__ ──────────────────────────────────────────
-    cubature_data: Dict = field(init=False, default_factory=dict)
-    neumann_data:  List = field(init=False, default_factory=list)
-    free_nodes:    np.ndarray = field(init=False, default=None)
-    dirichlet_nodes: np.ndarray = field(init=False, default=None)
+    cubature_data:    Dict       = field(init=False, default_factory=dict)
+    neumann_data:     List       = field(init=False, default_factory=list)
+    free_nodes:       np.ndarray = field(init=False, default=None)
+    dirichlet_nodes:  np.ndarray = field(init=False, default=None)
 
     def __post_init__(self):
         from .domain import DomainMesh
@@ -615,19 +737,17 @@ class ProblemWeak:
         for bc in self.domain.boundary_conditions:
             if isinstance(bc, MeshNodeBC) and bc.bc_type == "dirichlet":
                 if bc.edges is not None:
-                    # Collect unique vertex indices from Dirichlet edges
                     for i0, i1 in bc.edges:
                         dirichlet_vertex_set.add(int(i0))
                         dirichlet_vertex_set.add(int(i1))
                 else:
-                    # Fallback: distance-based matching to vertices
                     for xy in bc.node_positions:
                         dists = np.linalg.norm(verts - xy, axis=1)
                         dirichlet_vertex_set.add(int(np.argmin(dists)))
 
         dirichlet_set = set(dirichlet_vertex_set)
 
-        # Pass 2 — edge interior DOFs (N ≥ 2)
+        # Pass 2 — edge interior DOFs for strong Dirichlet (N ≥ 2)
         if self.lagrange_order >= 2:
             for bc in self.domain.boundary_conditions:
                 if isinstance(bc, MeshNodeBC) and bc.bc_type == "dirichlet":
@@ -638,8 +758,6 @@ class ProblemWeak:
                                 for idx in edge_to_dofs[key]:
                                     dirichlet_set.add(idx)
                     else:
-                        # If no edge info, mark edge DOFs whose position is
-                        # close to any Dirichlet vertex DOF (conservative)
                         for dof_idx in range(len(verts), n_dofs):
                             pos = dof_coords[dof_idx]
                             dists = np.linalg.norm(verts - pos, axis=1)
@@ -785,6 +903,74 @@ class ProblemWeak:
             return jnp.mean(R[free_nodes_jax] ** 2)
 
         return loss_fn
+
+    def make_residual_vector_fn(self, u_and_grad_fn):
+        """
+        Return a JAX-jittable function that assembles and returns the full
+        per-DOF residual vector  R  (shape ``(n_dofs,)``).
+
+        Useful for diagnostics and plotting: the nodal weak residual is
+
+            R_j = \\sum_{k∋j} \\int_{T_k} volume_fn(x, u, params, φ_j, ∇φ_j)  dΩ
+
+        Free-node entries encode how well the weak form is satisfied;
+        Dirichlet-node entries are zero.
+
+        Parameters
+        ----------
+        u_and_grad_fn : same as in :meth:`make_loss_fn`.
+
+        Returns
+        -------
+        residual_fn : callable
+            ``residual_fn(params) -> jnp.ndarray``  shape ``(n_dofs,)``
+        """
+        import jax
+        import jax.numpy as jnp
+
+        cd             = self.cubature_data
+        pts_jax        = jnp.asarray(cd['pts'],      dtype=jnp.float32)
+        weights_jax    = jnp.asarray(cd['weights'],  dtype=jnp.float32)
+        phi_jax        = jnp.asarray(cd['phi'],      dtype=jnp.float32)
+        grad_phi_jax   = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)
+        node_ids_jax   = jnp.asarray(cd['node_ids'], dtype=jnp.int32)
+
+        n_dofs  = self.n_dofs
+        n_faces = pts_jax.shape[0]
+        n_qpts  = pts_jax.shape[1]
+        n_local = phi_jax.shape[2]
+        volume_fn   = self.volume_fn
+        params_dict = self._build_params()
+
+        def residual_fn(params):
+            pts_flat = pts_jax.reshape(-1, 2)
+            u_flat, grad_u_flat = jax.vmap(
+                lambda xy: u_and_grad_fn(params, xy))(pts_flat)
+            y_flat = u_flat.reshape(-1, 1)
+
+            def make_deriv(gu):
+                def deriv_fn(Y, X, component, order):
+                    dim = order[0] if isinstance(order, (list, tuple)) else order
+                    return gu[:, dim]
+                return deriv_fn
+
+            deriv = make_deriv(grad_u_flat)
+
+            R = jnp.zeros(n_dofs, dtype=jnp.float32)
+            for a in range(n_local):
+                phi_a  = phi_jax[:, :, a]
+                gphi_a = grad_phi_jax[:, :, a, :]
+                integrand = volume_fn(
+                    pts_flat, y_flat, params_dict,
+                    phi_a.reshape(-1), gphi_a.reshape(-1, 2), deriv,
+                )
+                elem_int = jnp.einsum(
+                    'fq,fq->f', weights_jax,
+                    integrand.reshape(n_faces, n_qpts))
+                R = R.at[node_ids_jax[:, a]].add(elem_int)
+            return R
+
+        return residual_fn
 
     def __repr__(self):
         N = self.lagrange_order

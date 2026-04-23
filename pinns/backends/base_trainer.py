@@ -2292,7 +2292,7 @@ class BaseTrainer(ABC):
         """Plot 1D PDE residuals."""
         from pinns.problem_weak import ProblemWeak as _ProblemWeak
         if isinstance(self.problem, _ProblemWeak):
-            ax.set_visible(False)
+            self._plot_weak_residuals_on_mesh(ax, output_idx)
             return
         x_np = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points).reshape(-1, 1)
         
@@ -2312,11 +2312,86 @@ class BaseTrainer(ABC):
         ax.set_title(f'PDE Residual ({output_name})')
         ax.grid(True, alpha=0.3)
 
+    def _plot_weak_residuals_on_mesh(self, ax, output_idx=0):
+        """Plot the nodal weak-form residual |R_j| on the mesh triangulation.
+
+        Only free (interior) nodes are shown; Dirichlet boundary nodes are
+        masked (NaN / white) because their residual is never minimized and
+        has no meaningful interpretation in the loss.
+        """
+        import matplotlib.tri as _mtri
+        weak_res_fn = getattr(self, '_weak_residual_fn', None)
+        if weak_res_fn is None:
+            ax.text(0.5, 0.5, 'Weak residual\nnot available',
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=10, color='gray')
+            ax.set_title('Weak Residual')
+            return
+
+        R = np.array(weak_res_fn(self.network.params))   # (n_dofs,)
+
+        dom        = self.problem.domain
+        verts_xy   = dom._vertices                        # (n_verts, 2)
+        faces      = dom._faces                           # (n_faces, 3)
+        n_verts    = len(verts_xy)
+
+        # R at the original vertex nodes (first n_verts DOFs for any Lagrange order)
+        R_verts = np.abs(R[:n_verts]).astype(float)
+
+        # Mask Dirichlet boundary nodes — set to NaN so they are white in the plot.
+        free_nodes = getattr(self.problem, 'free_nodes', None)
+        if free_nodes is not None:
+            free_set = set(int(i) for i in free_nodes if int(i) < n_verts)
+            mask = np.array([i not in free_set for i in range(n_verts)])
+            R_verts[mask] = np.nan
+
+        # Build a triangulation from the original mesh connectivity.
+        # Mask any triangle that has at least one fully-masked (boundary) vertex
+        # on ALL three corners — tricontourf cannot handle interior NaN nodes.
+        tri_obj = _mtri.Triangulation(verts_xy[:, 0], verts_xy[:, 1], faces)
+
+        # Mask triangles whose nodes are ALL outside free_set (pure boundary triangles)
+        if free_nodes is not None:
+            tri_mask = np.array([
+                np.isnan(R_verts[f[0]]) and np.isnan(R_verts[f[1]]) and np.isnan(R_verts[f[2]])
+                for f in faces
+            ])
+            tri_obj.set_mask(tri_mask)
+
+        # For any remaining triangle that still has a NaN corner, replace NaN
+        # with the mean of the valid corners (edge-boundary triangles touching
+        # both a free interior node and a Dirichlet corner).
+        # This avoids the "masked points within triangulation" ValueError from
+        # tricontourf while keeping the colormap driven by free-node values.
+        R_plot = R_verts.copy()
+        nan_mask = np.isnan(R_plot)
+        if nan_mask.any():
+            valid_mean = float(np.nanmean(R_plot)) if not np.all(nan_mask) else 0.0
+            R_plot[nan_mask] = valid_mean
+
+        ikw = {'cmap': 'inferno'}
+        ikw.update(self._get_imshow_kwargs('residuals'))
+        try:
+            im = ax.tricontourf(tri_obj, R_plot, levels=50, **ikw)
+        except Exception:
+            # Fallback: scatter plot coloured by free-node residuals
+            sc = ax.scatter(verts_xy[:, 0], verts_xy[:, 1],
+                            c=R_plot, cmap='inferno', s=8)
+            im = sc
+
+        # Overlay the original mesh edges
+        ax.triplot(tri_obj, color='white', lw=0.3, alpha=0.4)
+        cbar = self._fig.colorbar(im, ax=ax, label='|R_j| (free nodes only)')
+        self._colorbars.append(cbar)
+        ax.set_title('Weak Residual |R_j| (free nodes)')
+        ax.set_xlabel(self._get_input_name(0))
+        ax.set_ylabel(self._get_input_name(1))
+
     def _plot_residuals_2d(self, ax, output_idx, n_points=50, plot_key='residuals'):
         """Plot 2D PDE residuals as heatmap."""
         from pinns.problem_weak import ProblemWeak as _ProblemWeak
         if isinstance(self.problem, _ProblemWeak):
-            ax.set_visible(False)
+            self._plot_weak_residuals_on_mesh(ax, output_idx)
             return
         ikw = {'cmap': 'viridis'}
         ikw.update(self._get_imshow_kwargs(plot_key))
