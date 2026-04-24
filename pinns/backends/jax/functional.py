@@ -119,9 +119,9 @@ def _make_derivative_fn_batched(model_apply, params):
                 current_fn = make_next_fn(prev_fn, dim_to_diff)
                 _fn_cache[partial_key] = current_fn
         
-        # Evaluate and reshape to (batch_size, 1)
+        # Evaluate and return (batch_size,) — one scalar per input point
         result = current_fn(X)
-        return result.reshape(-1, 1)
+        return result.reshape(-1)
     
     return deriv_fn
 
@@ -175,7 +175,7 @@ def _make_derivative_fn_forward(model_apply, params):
                 return final_fn(x)
         
         result = jax.vmap(forward_single_point)(X)
-        return result.reshape(-1, 1)
+        return result.reshape(-1)
     
     return deriv_fn
 
@@ -203,7 +203,7 @@ def _make_derivative_fn_reverse(model_apply, params):
             fn = make_grad(fn, dim)
         
         result = jax.vmap(fn)(X)
-        return result.reshape(-1, 1)
+        return result.reshape(-1)
     
     return deriv_fn
 
@@ -313,7 +313,7 @@ def laplacian(Y: jnp.ndarray, X: jnp.ndarray, component: int = 0,
         _, d2 = jax.jvp(first_deriv, (X,), (tangent,))
         laplacian_sum = laplacian_sum + d2
     
-    return laplacian_sum.reshape(-1, 1)
+    return laplacian_sum.reshape(-1)
 
 
 def divergence(Y: jnp.ndarray, X: jnp.ndarray,
@@ -346,7 +346,7 @@ def divergence(Y: jnp.ndarray, X: jnp.ndarray,
         _, deriv = jax.jvp(forward_comp, (X,), (tangent,))
         div_sum = div_sum + deriv
     
-    return div_sum.reshape(-1, 1)
+    return div_sum.reshape(-1)
 
 
 class DifferentialOperators:
