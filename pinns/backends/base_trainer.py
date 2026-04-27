@@ -306,7 +306,12 @@ class BaseTrainer(ABC):
         self._setup_network_normalization()
         
         # Training configuration defaults
-        n_bcs = len(problem.boundary_conditions)
+        try:
+            from pinns.boundary import PeriodicBC as _PBC2, CubicPeriodicBC as _CPBC2
+            _periodic_types2 = (_PBC2, _CPBC2)
+        except ImportError:
+            _periodic_types2 = ()
+        n_bcs = sum(1 for bc in problem.boundary_conditions if not isinstance(bc, _periodic_types2))
         expected_len = 1 + n_bcs
         # For weak-form problems the PDE residual is assembled via cubature,
         # not by sampling interior collocation points.  Set the first entry
@@ -723,7 +728,7 @@ class BaseTrainer(ABC):
                         "text_color": "white",
                     }
         """
-        n_bcs = len(self.problem.boundary_conditions)
+        n_bcs = len(self._get_bc_names())
         expected_len = 1 + n_bcs
         
         # Store L-BFGS parameters
@@ -1166,10 +1171,19 @@ class BaseTrainer(ABC):
             total_loss = pde_loss
         
         # BC losses
+        try:
+            from pinns.boundary import PeriodicBC as _PBC3, CubicPeriodicBC as _CPBC3
+            _periodic_types3 = (_PBC3, _CPBC3)
+        except ImportError:
+            _periodic_types3 = ()
         bc_names = self._get_bc_names()
         losses['bcs'] = []
+        name_idx = 0
         for i, bc in enumerate(self.problem.boundary_conditions):
-            name = bc_names[i]
+            if _periodic_types3 and isinstance(bc, _periodic_types3):
+                continue   # handled by the JIT train step, not here
+            name = bc_names[name_idx]
+            name_idx += 1
             if name in data:
                 x_bc = data[name]
                 from pinns.boundary import MeshCustomBC as _MeshCustomBC
@@ -1557,9 +1571,16 @@ class BaseTrainer(ABC):
     # ==================== Utility Methods ====================
 
     def _get_bc_names(self) -> List[str]:
-        """Get list of boundary condition names."""
+        """Get list of boundary condition names (excluding periodic BCs)."""
+        try:
+            from pinns.boundary import PeriodicBC as _PBC, CubicPeriodicBC as _CPBC
+            _periodic_types = (_PBC, _CPBC)
+        except ImportError:
+            _periodic_types = ()
         names = []
         for i, bc in enumerate(self.problem.boundary_conditions):
+            if _periodic_types and isinstance(bc, _periodic_types):
+                continue   # handled separately; no sampled data needed
             if hasattr(bc, 'name') and bc.name is not None:
                 names.append(bc.name)
             else:
@@ -2569,11 +2590,17 @@ class BaseTrainer(ABC):
             x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
             X0, X1 = np.meshgrid(x0, x1)
             x_np = np.column_stack([X0.ravel(), X1.ravel()])
-            residuals = self._compute_residuals(x_np)
+            try:
+                residuals = self._compute_residuals(x_np)
+            except Exception:
+                residuals = []
+            expected = X0.size
             if output_idx < len(residuals):
                 res = np.abs(residuals[output_idx]).flatten()
+                if res.size != expected:
+                    res = np.zeros(expected)
             else:
-                res = np.zeros(x_np.shape[0])
+                res = np.zeros(expected)
             Res = res.reshape(X0.shape)
             extent = [x0.min(), x0.max(), x1.min(), x1.max()]
             im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', **ikw)

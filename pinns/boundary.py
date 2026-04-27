@@ -554,6 +554,61 @@ class MeshCustomBC:
 
 
 @dataclass
+class PeriodicBC:
+    """
+    Periodic boundary condition pairing nodes on two boundaries.
+
+    Enforces :math:`u(\\mathbf{x}_A) = u(\\mathbf{x}_B)` for matched node
+    pairs from edge set A and edge set B by minimising
+    :math:`\\text{mean}\\bigl((u(\\mathbf{x}_A) - u(\\mathbf{x}_B))^2\\bigr)`.
+
+    Created by :meth:`DomainMesh.add_periodic`.
+
+    Args:
+        node_positions_a: ``(n_pairs, spatial_dims)`` — source boundary nodes.
+        node_positions_b: ``(n_pairs, spatial_dims)`` — matched target nodes.
+        component: Output component to enforce periodicity on, or ``None`` for
+                   all components simultaneously.
+        name: Label used in weights dicts.
+    """
+    node_positions_a: 'np.ndarray'        # (n_pairs, 2)
+    node_positions_b: 'np.ndarray'        # (n_pairs, 2)  — matched to a
+    component:        Optional[int] = None # None = all components
+    name:             Optional[str] = None
+    match_x_derivative: bool = False       # also penalise u_x(a) - u_x(b)
+    bc_type:          str = 'periodic'    # sentinel for trainer dispatch
+
+
+@dataclass
+class CubicPeriodicBC:
+    """
+    Periodic boundary condition for :class:`~pinns.domain.DomainCubic` domains.
+
+    Instead of pre-computed node arrays, stores only which spatial dimension is
+    periodic.  The trainer samples the required point pairs automatically at
+    compile time.
+
+    Created by :meth:`~pinns.domain.DomainCubic.add_periodic`.
+
+    Args:
+        dim: Spatial (or temporal) dimension index that is periodic.
+        n_pairs: Number of collocation pairs to sample.
+        component: Output component to enforce, or ``None`` to enforce all
+                   components (each gets its own sub-loss named
+                   ``name_0``, ``name_1``, …).
+        name: Base label used in weights dicts.
+        match_x_derivative: If ``True``, also penalise
+            :math:`|\\partial_x u(x_l) - \\partial_x u(x_r)|^2`.
+    """
+    dim:                int
+    n_pairs:            int = 200
+    component:          Optional[int] = None
+    name:               Optional[str] = None
+    match_x_derivative: bool = True
+    bc_type:            str = 'cubic_periodic'
+
+
+@dataclass
 class MeshDirichletBC:
     """
     Dirichlet boundary condition on a mesh-based domain.

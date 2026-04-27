@@ -4,7 +4,7 @@ from itertools import product
 from typing import Callable, Optional, Union, Literal, Tuple, List, Any
 from dataclasses import dataclass
 
-from .boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC
+from .boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC, CubicPeriodicBC
 
 
 # ============================================================================
@@ -670,6 +670,51 @@ class DomainCubic:
         self.boundary_conditions.append(bc)
         return self
     
+    def add_periodic(
+        self,
+        dim: int,
+        name: str = 'periodic',
+        component: Optional[int] = None,
+        n_pairs: int = 200,
+        match_x_derivative: bool = True,
+    ) -> 'DomainCubic':
+        """
+        Add a soft periodic boundary condition along a spatial dimension.
+
+        Enforces :math:`u(\\mathbf{x}_l) = u(\\mathbf{x}_r)` (and optionally
+        :math:`\\partial_x u(\\mathbf{x}_l) = \\partial_x u(\\mathbf{x}_r)`) by
+        adding a penalty term to the loss.
+
+        If *component* is ``None``, one sub-condition is created per output
+        component, named ``name_0``, ``name_1``, etc.
+
+        Args:
+            dim: Dimension along which the domain is periodic
+                 (0 = first dim, 1 = second dim, …).
+            name: Base name used in weights dicts.
+            component: Output component index, or ``None`` for all components.
+            n_pairs: Number of collocation pairs to sample at compile time.
+            match_x_derivative: Also penalise the derivative mismatch
+                :math:`|\\partial_{x_{dim}} u(x_l) - \\partial_{x_{dim}} u(x_r)|^2`.
+
+        Returns:
+            self (for method chaining)
+
+        Example::
+
+            domain = DomainCubic([0.0, -1.0], [1.0, 1.0])
+            domain.add_periodic(dim=1, name="periodic")
+        """
+        bc = CubicPeriodicBC(
+            dim=dim,
+            n_pairs=n_pairs,
+            component=component,
+            name=name,
+            match_x_derivative=match_x_derivative,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
     def get_dirichlet_conditions(self) -> List[DirichletBC]:
         """Get all Dirichlet boundary conditions."""
         return [bc for bc in self.boundary_conditions if isinstance(bc, DirichletBC)]
@@ -1975,6 +2020,79 @@ class DomainMesh:
             edge_lengths=edge_lengths,
             is_weak=_is_weak,
             weak_fn=_weak_fn,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
+    def add_periodic(
+        self,
+        select_a,
+        select_b,
+        component: int = None,
+        name: str = 'periodic',
+    ) -> 'DomainMesh':
+        """
+        Add a **periodic boundary condition** pairing nodes on two boundaries.
+
+        For each node on edge set *A* the nearest node on edge set *B* (in the
+        transverse direction) is found and the pair is stored.  The trainer
+        then minimises
+
+        .. math::
+            \\text{mean}\\bigl(u(\\mathbf{x}_A) - u(\\mathbf{x}_B)\\bigr)^2
+
+        Typical usage — periodic in x (left ↔ right)::
+
+            domain.add_periodic(edges_left, edges_right,
+                                component=None, name="periodic_x")
+
+        Args:
+            select_a: Edge selector for side A (array of vertex-pair rows or
+                      callable as in :meth:`add_dirichlet`).
+            select_b: Edge selector for side B.
+            component: Output component index to enforce, or ``None`` (default)
+                       to enforce periodicity for all components jointly.
+            name: Label used in the weights dict.
+
+        Returns:
+            *self* for method chaining.
+        """
+        from pinns.boundary import PeriodicBC
+
+        edges_a = self._all_edges[self._resolve_select(select_a)]
+        edges_b = self._all_edges[self._resolve_select(select_b)]
+
+        pts_a = self._vertices[np.unique(edges_a)]   # (na, 2)
+        pts_b = self._vertices[np.unique(edges_b)]   # (nb, 2)
+
+        # Match each node in pts_a to its periodic partner in pts_b.
+        # Strategy: shift pts_a by the mean offset between the two boundaries
+        # and then find the nearest neighbour in pts_b.
+        shift = pts_b.mean(axis=0) - pts_a.mean(axis=0)   # (2,)
+        pts_a_shifted = pts_a + shift                      # expected positions in pts_b
+
+        # Nearest-neighbour matching (euclidean)
+        from scipy.spatial import cKDTree
+        tree = cKDTree(pts_b)
+        dists, idx = tree.query(pts_a_shifted, k=1)
+
+        import warnings
+        max_dist = dists.max()
+        tol = np.linalg.norm(shift) * 0.1 + 1e-10
+        if max_dist > tol:
+            warnings.warn(
+                f"add_periodic('{name}'): largest pairing distance is {max_dist:.4g}."
+                " The two boundaries may not have matching node distributions.",
+                UserWarning,
+            )
+
+        pts_b_matched = pts_b[idx]   # (na, 2) — matched partners for pts_a
+
+        bc = PeriodicBC(
+            node_positions_a=pts_a.astype(np.float32),
+            node_positions_b=pts_b_matched.astype(np.float32),
+            component=component,
+            name=name,
         )
         self.boundary_conditions.append(bc)
         return self

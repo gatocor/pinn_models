@@ -423,7 +423,7 @@ class Trainer(BaseTrainer):
     
     def _make_jit_train_step(self, weights, params_dict):
         """Create a JIT-compiled training step function."""
-        from pinns.boundary import NeumannBC, MeshNodeBC, MeshCustomBC
+        from pinns.boundary import NeumannBC, MeshNodeBC, MeshCustomBC, PeriodicBC, CubicPeriodicBC
 
         # Pre-extract BC info as static data
         bc_info = []
@@ -431,10 +431,46 @@ class Trainer(BaseTrainer):
         neumann_bcs = []
         mesh_neumann_bcs = []   # MeshNodeBC with bc_type="neumann"
         custom_bc_list = []     # MeshCustomBC entries
+        periodic_bcs  = []      # PeriodicBC entries (fixed precomputed points)
         
         # Get precomputed targets for callable BCs
         train_targets = getattr(self, '_train_targets', {})
-        
+
+        # ── Precompute PeriodicBC point arrays as JAX constants ──────────────
+        # Periodic BCs use fixed mesh nodes — no sampling, no train_data lookup.
+        for bc in self.problem.domain.boundary_conditions:
+            if isinstance(bc, PeriodicBC):
+                periodic_bcs.append({
+                    'name':          bc.name,
+                    'x_a':           jnp.asarray(bc.node_positions_a, dtype=jnp.float32),
+                    'x_b':           jnp.asarray(bc.node_positions_b, dtype=jnp.float32),
+                    'component':     bc.component,
+                    'weight':        weights.get(bc.name, 1.0),
+                    'match_x_deriv': getattr(bc, 'match_x_derivative', False),
+                    'x_deriv_dim':   1,
+                })
+
+        # ── CubicPeriodicBC — sample pairs from domain at compile time ────────
+        _n_out = len(self.problem.output_names) if (hasattr(self.problem, 'output_names') and self.problem.output_names) else getattr(self.problem, 'n_outputs', 1)
+        for bc in self.problem.domain.boundary_conditions:
+            if isinstance(bc, CubicPeriodicBC):
+                _rng = np.random.default_rng()
+                _pts_a = self.problem.domain.sample_boundary(bc.n_pairs, bc.dim, 0, rng=_rng)
+                _pts_b = _pts_a.copy()
+                _pts_b[:, bc.dim] = self.problem.domain.xmax[bc.dim]
+                _comps = [bc.component] if bc.component is not None else list(range(_n_out))
+                for _i in _comps:
+                    _sub_name = bc.name if bc.component is not None else f'{bc.name}_{_i}'
+                    periodic_bcs.append({
+                        'name':          _sub_name,
+                        'x_a':           jnp.asarray(_pts_a, dtype=jnp.float32),
+                        'x_b':           jnp.asarray(_pts_b, dtype=jnp.float32),
+                        'component':     _i,
+                        'weight':        weights.get(_sub_name, weights.get(bc.name, 1.0)),
+                        'match_x_deriv': bc.match_x_derivative,
+                        'x_deriv_dim':   bc.dim,
+                    })
+
         for name in self._train_data.keys():
             if name == 'pde':
                 continue
@@ -699,6 +735,32 @@ class Trainer(BaseTrainer):
                     else:
                         _bc_loss = jnp.mean(_residual ** 2)
                         total_loss = total_loss + _bc_weight * _bc_loss
+
+            # ===== Periodic BC Loss =====
+            for _pbc in periodic_bcs:
+                _x_a  = _pbc['x_a']
+                _x_b  = _pbc['x_b']
+                _y_a  = model_apply_with_params(params, _x_a)
+                _y_b  = model_apply_with_params(params, _x_b)
+                _comp = _pbc['component']
+                if _comp is not None:
+                    _pbc_loss = jnp.mean((_y_a[:, _comp] - _y_b[:, _comp]) ** 2)
+                else:
+                    _pbc_loss = jnp.mean((_y_a - _y_b) ** 2)
+
+                # Optional: also penalise u_x(a) - u_x(b)  (neumann-style periodicity)
+                if _pbc['match_x_deriv']:
+                    _cidx   = _comp if _comp is not None else 0
+                    _dim    = _pbc.get('x_deriv_dim', 1)
+                    _tang_a = jnp.zeros_like(_x_a).at[:, _dim].set(1.0)
+                    _tang_b = jnp.zeros_like(_x_b).at[:, _dim].set(1.0)
+                    def _fa(x): return model_apply_with_params(params, x)[:, _cidx]
+                    def _fb(x): return model_apply_with_params(params, x)[:, _cidx]
+                    _, _ux_a = jax.jvp(_fa, (_x_a,), (_tang_a,))
+                    _, _ux_b = jax.jvp(_fb, (_x_b,), (_tang_b,))
+                    _pbc_loss = _pbc_loss + jnp.mean((_ux_a - _ux_b) ** 2)
+
+                total_loss = total_loss + _pbc['weight'] * _pbc_loss
 
             return total_loss
 
@@ -1275,9 +1337,18 @@ class Trainer(BaseTrainer):
         # Get precomputed targets for callable BCs
         train_targets = getattr(self, '_train_targets', {})
         
+        try:
+            from pinns.boundary import PeriodicBC as _PBC5, CubicPeriodicBC as _CPBC5
+            _periodic_types5 = (_PBC5, _CPBC5)
+        except ImportError:
+            _periodic_types5 = ()
+        _bc_name_idx5 = 0
         for i, bc in enumerate(self.problem.boundary_conditions):
             from pinns.boundary import DirichletBC, NeumannBC, RobinBC, MeshNodeBC
-            name = bc_names[i]
+            if _periodic_types5 and isinstance(bc, _periodic_types5):
+                continue
+            name = bc_names[_bc_name_idx5]
+            _bc_name_idx5 += 1
 
             if isinstance(bc, MeshNodeBC):
                 if bc.bc_type == "dirichlet":
@@ -1492,6 +1563,26 @@ def _initialize_lagrange_multipliers_impl(self):
             if self._lagrange_optimizer is not None:
                 self._lagrange_opt_states[name] = self._lagrange_optimizer.init(self.lagrange_multipliers[name])
 
+    # Initialize Lagrange multipliers for CubicPeriodicBC / PeriodicBC entries
+    try:
+        from pinns.boundary import PeriodicBC as _PBC_L, CubicPeriodicBC as _CPBC_L
+        _periodic_types_L = (_PBC_L, _CPBC_L)
+    except ImportError:
+        _periodic_types_L = ()
+    _n_out_L = len(self.problem.output_names) if (hasattr(self.problem, 'output_names') and self.problem.output_names) else getattr(self.problem, 'n_outputs', 1)
+    for bc in self.problem.domain.boundary_conditions:
+        if not (_periodic_types_L and isinstance(bc, _periodic_types_L)):
+            continue
+        _comps_L = [bc.component] if bc.component is not None else list(range(_n_out_L))
+        for _i_L in _comps_L:
+            _sub_name_L = bc.name if bc.component is not None else f'{bc.name}_{_i_L}'
+            if (self._lagrange_constraints is None) or (_sub_name_L in self._lagrange_constraints):
+                _n_pairs_L = bc.n_pairs if hasattr(bc, 'n_pairs') else len(bc.node_positions_a)
+                _n_res_L = _n_pairs_L * 2 if getattr(bc, 'match_x_derivative', False) else _n_pairs_L
+                self.lagrange_multipliers[_sub_name_L] = jnp.zeros(_n_res_L)
+                if self._lagrange_optimizer is not None:
+                    self._lagrange_opt_states[_sub_name_L] = self._lagrange_optimizer.init(self.lagrange_multipliers[_sub_name_L])
+
 
 def _reinitialize_lagrange_if_needed_impl(self):
     for name, data in self._train_data.items():
@@ -1544,8 +1635,17 @@ def _make_al_loss_fn_impl(self, params_dict):
 
         # Collect Dirichlet BC info (same as strong form)
         _bc_point_info = []
+        try:
+            from pinns.boundary import PeriodicBC as _PBC6, CubicPeriodicBC as _CPBC6
+            _periodic_types6 = (_PBC6, _CPBC6)
+        except ImportError:
+            _periodic_types6 = ()
+        _bc_name_idx6 = 0
         for i, bc in enumerate(self.problem.boundary_conditions):
-            name = bc_names[i]
+            if _periodic_types6 and isinstance(bc, _periodic_types6):
+                continue
+            name = bc_names[_bc_name_idx6]
+            _bc_name_idx6 += 1
             if isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet':
                 _bc_point_info.append({
                     'name': name,
@@ -1600,8 +1700,48 @@ def _make_al_loss_fn_impl(self, params_dict):
 
     bc_info = {}
     bc_names = self._get_bc_names()
+    try:
+        from pinns.boundary import PeriodicBC as _PBC4, CubicPeriodicBC as _CPBC4
+        _periodic_types4 = (_PBC4, _CPBC4)
+    except ImportError:
+        _periodic_types4 = ()
+
+    # ── Pre-sample CubicPeriodicBC pairs for use in compute_residuals ──────
+    _periodic_al_entries = []  # list of dicts with x_a, x_b, name, component, dim, match_deriv
+    _n_out_al = len(self.problem.output_names) if (hasattr(self.problem, 'output_names') and self.problem.output_names) else getattr(self.problem, 'n_outputs', 1)
+    import numpy as _np_al
+    for bc in self.problem.domain.boundary_conditions:
+        if not (_periodic_types4 and isinstance(bc, _periodic_types4)):
+            continue
+        if hasattr(bc, 'n_pairs'):  # CubicPeriodicBC
+            _rng_al = _np_al.random.default_rng()
+            _pts_a_al = self.problem.domain.sample_boundary(bc.n_pairs, bc.dim, 0, rng=_rng_al)
+            _pts_b_al = _pts_a_al.copy()
+            _pts_b_al[:, bc.dim] = self.problem.domain.xmax[bc.dim]
+            _x_a_al = jnp.asarray(_pts_a_al, dtype=jnp.float32)
+            _x_b_al = jnp.asarray(_pts_b_al, dtype=jnp.float32)
+            _dim_al = bc.dim
+        else:  # PeriodicBC (pre-computed arrays)
+            _x_a_al = jnp.asarray(bc.node_positions_a, dtype=jnp.float32)
+            _x_b_al = jnp.asarray(bc.node_positions_b, dtype=jnp.float32)
+            _dim_al = 1
+        _comps_al = [bc.component] if bc.component is not None else list(range(_n_out_al))
+        for _i_al in _comps_al:
+            _sub_name_al = bc.name if bc.component is not None else f'{bc.name}_{_i_al}'
+            _periodic_al_entries.append({
+                'name':        _sub_name_al,
+                'x_a':         _x_a_al,
+                'x_b':         _x_b_al,
+                'component':   _i_al,
+                'dim':         _dim_al,
+                'match_deriv': getattr(bc, 'match_x_derivative', False),
+            })
+    name_idx = 0
     for i, bc in enumerate(self.problem.boundary_conditions):
-        name = bc_names[i]
+        if _periodic_types4 and isinstance(bc, _periodic_types4):
+            continue
+        name = bc_names[name_idx]
+        name_idx += 1
         if isinstance(bc, MeshNodeBC):
             is_mesh_neumann = (bc.bc_type == "neumann") and (bc.edge_normals is not None)
             is_mesh_time_neumann = (bc.bc_type == "neumann") and (bc.t_mode in ("t_min", "t_max"))
@@ -1686,6 +1826,27 @@ def _make_al_loss_fn_impl(self, params_dict):
                 residuals[name] = (info['normal_sign'] * du_dn - target).flatten()
             else:
                 residuals[name] = (y_bc[:, comp] - target).flatten()
+
+        # ── Periodic BC residuals ───────────────────────────────────────────
+        for _pe in _periodic_al_entries:
+            _x_a_r = _pe['x_a']
+            _x_b_r = _pe['x_b']
+            _c_r   = _pe['component']
+            _y_a_r = model_apply_with_params(params, _x_a_r)
+            _y_b_r = model_apply_with_params(params, _x_b_r)
+            _res_u = (_y_a_r[:, _c_r] - _y_b_r[:, _c_r])
+            if _pe['match_deriv']:
+                _d_r = _pe['dim']
+                _tang_a_r = jnp.zeros_like(_x_a_r).at[:, _d_r].set(1.0)
+                _tang_b_r = jnp.zeros_like(_x_b_r).at[:, _d_r].set(1.0)
+                def _fa_r(x): return model_apply_with_params(params, x)[:, _c_r]
+                def _fb_r(x): return model_apply_with_params(params, x)[:, _c_r]
+                _, _ux_a_r = jax.jvp(_fa_r, (_x_a_r,), (_tang_a_r,))
+                _, _ux_b_r = jax.jvp(_fb_r, (_x_b_r,), (_tang_b_r,))
+                _res_ux = _ux_a_r - _ux_b_r
+                residuals[_pe['name']] = jnp.concatenate([_res_u, _res_ux])
+            else:
+                residuals[_pe['name']] = _res_u
         return residuals
 
     def compute_al_loss(params, train_data, lagrange_dict, weights_dict, targets_dict=None):
