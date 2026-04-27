@@ -442,7 +442,7 @@ class BaseTrainer(ABC):
                 # Compute target values for BCs with callable value functions
                 if name != 'pde':
                     bc = self._get_bc_by_name(name)
-                    if bc is not None and callable(bc.value):
+                    if bc is not None and hasattr(bc, 'value') and callable(bc.value):
                         np_data = self._to_numpy(self._train_data[name])
                         target_np = bc.value(np_data)
                         if hasattr(target_np, 'squeeze'):
@@ -754,6 +754,7 @@ class BaseTrainer(ABC):
             self.test_samples = test_samples
         
         if weights is not None:
+            self._raw_weights_dict = weights if isinstance(weights, dict) else None
             weights = self._convert_dict_to_list(weights, 'weights')
             if len(weights) != expected_len:
                 raise ValueError(
@@ -929,7 +930,11 @@ class BaseTrainer(ABC):
         Returns:
             Target tensor (backend-specific), 1D shape (n_points,)
         """
-        from pinns.boundary import PointsetBC
+        from pinns.boundary import PointsetBC, MeshCustomBC
+        
+        if isinstance(bc, MeshCustomBC):
+            # MeshCustomBC has no value attribute; its loss is computed in _compute_custom_bc_loss
+            return None
         
         if isinstance(bc, PointsetBC):
             values = np.array(bc.values)
@@ -993,9 +998,12 @@ class BaseTrainer(ABC):
         Returns:
             Loss tensor (backend-specific scalar)
         """
-        from pinns.boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC, MeshNodeBC
+        from pinns.boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC, MeshNodeBC, MeshCustomBC
 
         y = self.network.forward(x, params_dict)
+
+        if isinstance(bc, MeshCustomBC):
+            return self._compute_custom_bc_loss(bc, x, y, params_dict)
 
         if isinstance(bc, MeshNodeBC):
             if bc.bc_type == "dirichlet":
@@ -1064,7 +1072,68 @@ class BaseTrainer(ABC):
         
         else:
             raise ValueError(f"Unknown BC type: {type(bc)}")
-    
+
+    def _compute_custom_bc_losses_dict(self, bc, x, y, params_dict, weights_dict=None):
+        """Return a {output_name: weighted_scalar_loss} dict for a MeshCustomBC.
+
+        Each output in ``bc.output_names`` gets its own entry so the plotter can
+        show per-component losses.
+        """
+        # Weak BCs (phi in signature) are handled by ProblemWeak's Galerkin
+        # assembler — skip pointwise evaluation.
+        if getattr(bc, 'is_weak', False):
+            out_names = bc.output_names or [bc.name]
+            return {oname: 0.0 for oname in out_names}
+        import inspect as _inspect
+        sig = _inspect.signature(bc.f)
+        n_params = len(sig.parameters)
+        if n_params >= 4:
+            residual = bc.f(x, y, params_dict, None)
+        elif n_params == 3:
+            residual = bc.f(x, y, params_dict)
+        else:
+            residual = bc.f(x, y)
+        if not isinstance(residual, (list, tuple)):
+            residual = (residual,)
+        out_names = (bc.output_names or ([bc.name] * len(residual)))
+        default_w = (weights_dict or {}).get(bc.name, 1.0) if weights_dict else 1.0
+        return {
+            oname: (weights_dict or {}).get(oname, default_w) * self._mean_squared(r)
+            for r, oname in zip(residual, out_names)
+        }
+
+    def _compute_custom_bc_loss(self, bc, x, y, params_dict, weights_dict=None):
+        """Evaluate a MeshCustomBC residual and return the MSE loss.
+
+        Override in backend subclasses to supply real autodiff derivatives.
+        The base implementation calls ``f`` with ``derivative=None``.
+        When ``weights_dict`` is provided and ``bc.output_names`` is set,
+        each output is weighted independently.
+        """
+        # Weak BCs (phi in signature) are handled by ProblemWeak's Galerkin
+        # assembler — skip pointwise evaluation.
+        if getattr(bc, 'is_weak', False):
+            return 0.0
+        import inspect as _inspect
+        sig = _inspect.signature(bc.f)
+        n_params = len(sig.parameters)
+        if n_params >= 4:
+            residual = bc.f(x, y, params_dict, None)
+        elif n_params == 3:
+            residual = bc.f(x, y, params_dict)
+        else:
+            residual = bc.f(x, y)
+        if isinstance(residual, (list, tuple)):
+            out_names = (bc.output_names or ([bc.name] * len(residual)))
+            default_w = (weights_dict or {}).get(bc.name, 1.0) if weights_dict else 1.0
+            losses = [
+                (weights_dict or {}).get(oname, default_w) * self._mean_squared(r)
+                for r, oname in zip(residual, out_names)
+            ]
+            return sum(losses)
+        default_w = (weights_dict or {}).get(bc.name, 1.0)
+        return default_w * self._mean_squared(residual)
+
     def _compute_total_loss(self, data: Dict, params_dict: Dict[str, Any], weights_dict: Dict):
         """
         Compute total weighted loss from data dict.
@@ -1103,10 +1172,20 @@ class BaseTrainer(ABC):
             name = bc_names[i]
             if name in data:
                 x_bc = data[name]
-                bc_loss = self._compute_bc_loss(bc, x_bc, params_dict)
-                weighted_bc_loss = weights_dict.get(name, 1.0) * bc_loss
+                from pinns.boundary import MeshCustomBC as _MeshCustomBC
+                if isinstance(bc, _MeshCustomBC):
+                    per_output = self._compute_custom_bc_losses_dict(
+                        bc, x_bc,
+                        self.network.forward(x_bc, params_dict),
+                        params_dict, weights_dict)
+                    weighted_bc_loss = sum(per_output.values())
+                    for oname, oloss in per_output.items():
+                        losses[oname] = oloss
+                else:
+                    bc_loss = self._compute_bc_loss(bc, x_bc, params_dict)
+                    weighted_bc_loss = weights_dict.get(name, 1.0) * bc_loss
+                    losses[name] = weighted_bc_loss
                 losses['bcs'].append(weighted_bc_loss)
-                losses[name] = weighted_bc_loss
                 
                 if total_loss is None:
                     total_loss = weighted_bc_loss
@@ -1232,7 +1311,48 @@ class BaseTrainer(ABC):
                 all_residuals[i].append(r)
         
         return [np.concatenate(res_list) for res_list in all_residuals]
-    
+
+    def _evaluate_observables(self, x_np: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Evaluate ``problem.obs_fn`` at the given input points.
+
+        ``obs_fn`` has the signature::
+
+            obs_fn(x, y, params, derivative) -> list of (n,) arrays
+
+        The returned list is zipped with ``problem.obs_names``.
+        This base implementation passes ``None`` for ``derivative``; the JAX
+        subclass overrides this to supply true autodiff derivatives.
+
+        Returns
+        -------
+        dict
+            ``{name: np.ndarray}`` with values of shape ``(n,)``.
+        """
+        import inspect as _inspect
+        obs_fn = getattr(self.problem, 'obs_fn', None)
+        obs_names = getattr(self.problem, 'obs_names', None) or []
+        if obs_fn is None or not obs_names:
+            return {}
+        x = self._to_tensor(x_np)
+        params_dict = self._build_params()
+        y = self.network.forward(x, params_dict)
+        try:
+            sig = _inspect.signature(obs_fn)
+            n_params = len(sig.parameters)
+            if n_params >= 4:
+                vals = obs_fn(x, y, params_dict, None)
+            elif n_params == 3:
+                vals = obs_fn(x, y, params_dict)
+            else:
+                vals = obs_fn(x, y)
+        except Exception:
+            return {}
+        return {
+            name: self._to_numpy(v).reshape(len(x_np), -1)
+            for name, v in zip(obs_names, vals)
+        }
+
     @abstractmethod
     def _to_numpy(self, tensor) -> np.ndarray:
         """Convert backend tensor to numpy array."""
@@ -1255,17 +1375,17 @@ class BaseTrainer(ABC):
     
     def _sample_boundary_np(self, bc, n_points: int) -> np.ndarray:
         """Sample boundary points for a specific boundary condition."""
-        from pinns.boundary import PointsetBC, MeshNodeBC
+        from pinns.boundary import PointsetBC, MeshNodeBC, MeshCustomBC
 
         if isinstance(bc, PointsetBC):
             return bc.points
 
-        if isinstance(bc, MeshNodeBC):
+        if isinstance(bc, (MeshNodeBC, MeshCustomBC)):
             pts, sampled_idx = self.problem.domain.sample_boundary_bc(bc, n_points, rng=self.rng)
-            # stash per-sample normals indexed to the sampled edges
-            if bc.edge_normals is not None:
+            # stash per-sample normals for MeshNodeBC Neumann
+            if isinstance(bc, MeshNodeBC) and bc.edge_normals is not None:
                 bc._sampled_normals = bc.edge_normals[sampled_idx]
-            else:
+            elif isinstance(bc, MeshNodeBC):
                 bc._sampled_normals = None
             return pts
 
@@ -1376,7 +1496,7 @@ class BaseTrainer(ABC):
                 # Precompute target values for BCs with callable value functions
                 if name != 'pde':
                     bc = self._get_bc_by_name(name)
-                    if bc is not None and callable(bc.value):
+                    if bc is not None and hasattr(bc, 'value') and callable(bc.value):
                         target_np = bc.value(np_data)
                         if hasattr(target_np, 'squeeze'):
                             target_np = target_np.squeeze(-1) if target_np.ndim > 1 else target_np
@@ -1399,7 +1519,7 @@ class BaseTrainer(ABC):
                 # Precompute target values for BCs with callable value functions
                 if name != 'pde':
                     bc = self._get_bc_by_name(name)
-                    if bc is not None and callable(bc.value):
+                    if bc is not None and hasattr(bc, 'value') and callable(bc.value):
                         target_np = bc.value(np_data)
                         if hasattr(target_np, 'squeeze'):
                             target_np = target_np.squeeze(-1) if target_np.ndim > 1 else target_np
@@ -1482,8 +1602,6 @@ class BaseTrainer(ABC):
             result = []
             
             # First element is 'pde'
-            # For ProblemWeak the PDE residual is assembled via cubature,
-            # so 'pde' samples are not needed — default to 0 if omitted.
             from pinns.problem_weak import ProblemWeak as _ProblemWeak
             _default_pde = 0 if isinstance(self.problem, _ProblemWeak) else None
             if 'pde' not in data:
@@ -1667,7 +1785,13 @@ class BaseTrainer(ABC):
         n_outputs = self.problem.n_outputs
         has_solution = self.problem.solution is not None
         n_regions = len(getattr(self, '_plot_regions', []))
-        
+        obs_names = list(getattr(self.problem, 'obs_names', None) or [])
+        obs_spatial = list(getattr(self.problem, 'obs_spatial', None) or [])
+        # Regular observables: those not listed in obs_spatial
+        obs_regular = [n for n in obs_names if n not in obs_spatial]
+        has_spatial = len(obs_spatial) > 0
+        n_obs = len(obs_regular) + (1 if has_spatial else 0)
+
         if n_dims == 1:
             if has_solution:
                 n_cols = 3  # solution, residuals, error
@@ -1675,7 +1799,7 @@ class BaseTrainer(ABC):
                 n_cols = 2  # solution, residuals
             
             # 2 rows for losses + mse_losses
-            n_rows = 2 + n_outputs + n_regions
+            n_rows = 2 + n_outputs + n_regions + n_obs
             fig = plt.figure(figsize=(5 * n_cols, 3.5 * n_rows))
             gs = fig.add_gridspec(n_rows, n_cols)
             
@@ -1692,6 +1816,15 @@ class BaseTrainer(ABC):
             # Region plots
             for r in range(n_regions):
                 axes[f'region_{r}'] = fig.add_subplot(gs[2 + n_outputs + r, :])
+
+            # Regular observable plots
+            for k, name in enumerate(obs_regular):
+                axes[f'obs_{name}'] = fig.add_subplot(gs[2 + n_outputs + n_regions + k, :])
+            # Joint deformed-mesh plot for spatial observables (two panels: original | deformed)
+            if has_spatial:
+                row_s = 2 + n_outputs + n_regions + len(obs_regular)
+                axes['obs__deformed_ref'] = fig.add_subplot(gs[row_s, 0])
+                axes['obs__deformed_def'] = fig.add_subplot(gs[row_s, 1])
         
         elif n_dims == 2:
             if has_solution:
@@ -1699,7 +1832,7 @@ class BaseTrainer(ABC):
             else:
                 n_cols = 2  # predicted, residuals
             
-            n_rows = 2 + n_outputs + n_regions
+            n_rows = 2 + n_outputs + n_regions + n_obs
             fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
             gs = fig.add_gridspec(n_rows, n_cols)
             
@@ -1718,6 +1851,15 @@ class BaseTrainer(ABC):
             
             for r in range(n_regions):
                 axes[f'region_{r}'] = fig.add_subplot(gs[2 + n_outputs + r, :])
+
+            # Regular observable plots — one subplot per observable, spanning first two columns
+            for k, name in enumerate(obs_regular):
+                axes[f'obs_{name}'] = fig.add_subplot(gs[2 + n_outputs + n_regions + k, :2])
+            # Joint deformed-mesh plot for spatial observables (two panels: original | deformed)
+            if has_spatial:
+                row_s = 2 + n_outputs + n_regions + len(obs_regular)
+                axes['obs__deformed_ref'] = fig.add_subplot(gs[row_s, 0])
+                axes['obs__deformed_def'] = fig.add_subplot(gs[row_s, 1])
         
         else:
             # For 3D+: loss plot + region slices for all outputs with residuals
@@ -2229,7 +2371,23 @@ class BaseTrainer(ABC):
                 if f'err_{i}' in axes and has_solution:
                     self._plot_error_2d(axes[f'err_{i}'], i, n_points, plot_key='error')
                     self._apply_plot_kwargs(axes[f'err_{i}'], 'error')
-        
+
+        # Plot observables (1D or 2D)
+        obs_spatial = list(getattr(self.problem, 'obs_spatial', None) or [])
+        for obs_name in (getattr(self.problem, 'obs_names', None) or []):
+            if obs_name in obs_spatial:
+                continue  # handled below as joint deformed mesh
+            ax_key = f'obs_{obs_name}'
+            if ax_key not in axes:
+                continue
+            if n_dims == 1:
+                self._plot_observable_1d(axes[ax_key], obs_name, n_points)
+            else:
+                self._plot_observable_2d(axes[ax_key], obs_name, n_points)
+        # Joint deformed-mesh plot
+        if obs_spatial and 'obs__deformed_ref' in axes:
+            self._plot_deformed_mesh_spatial(axes['obs__deformed_ref'], axes['obs__deformed_def'], obs_spatial, n_points)
+
         # Plot regions (for any dimension)
         regions = getattr(self, '_plot_regions', [])
         n_outputs = self.problem.n_outputs
@@ -2427,6 +2585,149 @@ class BaseTrainer(ABC):
         ax.set_title(f'PDE Residual ({output_name})')
         ax.set_xlabel(self._get_input_name(0))
         ax.set_ylabel(self._get_input_name(1))
+
+    # ==================== Observable Plotting ====================
+
+    def _plot_observable_1d(self, ax, obs_name: str, n_points: int = 200):
+        """Plot a 1D observable field on the given axes."""
+        x_np = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points).reshape(-1, 1)
+        obs = self._evaluate_observables(x_np)
+        if obs_name not in obs:
+            ax.text(0.5, 0.5, f'Observable\n{obs_name!r}\nnot available',
+                    ha='center', va='center', transform=ax.transAxes)
+            return
+        vals = obs[obs_name]   # (n, 1) or (n,)
+        ax.plot(x_np.flatten(), vals.flatten(), linewidth=2)
+        ax.set_xlabel(self._get_input_name(0))
+        ax.set_ylabel(obs_name)
+        ax.set_title(f'Observable: {obs_name}')
+        ax.grid(True, alpha=0.3)
+
+    def _plot_observable_2d(self, ax, obs_name: str, n_points: int = 50):
+        """Plot a scalar 2D observable as a filled contour / heatmap."""
+        ikw = {'cmap': 'viridis'}
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            x_np = dom._vertices
+            obs = self._evaluate_observables(x_np)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_np = np.column_stack([X0.ravel(), X1.ravel()])
+            obs = self._evaluate_observables(x_np)
+
+        if obs_name not in obs:
+            ax.text(0.5, 0.5, f'Observable\n{obs_name!r}\nnot available',
+                    ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'Observable: {obs_name}')
+            return
+
+        vals = obs[obs_name]   # (n, k)
+        scalar = vals[:, 0] if vals.ndim == 2 else vals.flatten()
+
+        if self._is_mesh_domain():
+            tri = mtri.Triangulation(x_np[:, 0], x_np[:, 1], dom._faces)
+            im = ax.tricontourf(tri, scalar, levels=50, **ikw)
+            ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
+        else:
+            Y = scalar.reshape(n_points, n_points)
+            extent = [x_np[:, 0].min(), x_np[:, 0].max(),
+                      x_np[:, 1].min(), x_np[:, 1].max()]
+            im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', **ikw)
+
+        cbar = self._fig.colorbar(im, ax=ax)
+        self._colorbars.append(cbar)
+        ax.set_title(f'Observable: {obs_name}')
+        ax.set_xlabel(self._get_input_name(0))
+        ax.set_ylabel(self._get_input_name(1))
+
+    def _plot_deformed_mesh_spatial(self, ax_ref, ax_def, obs_spatial: list, n_points: int = 50):
+        """Side-by-side deformed-mesh plot.
+
+        ``obs_spatial`` is an ordered list of observable names whose scalar
+        values are the **absolute new positions** of each node (e.g. ``x + u1``,
+        ``y + u2``).
+
+        * Left panel (``ax_ref``): original (undeformed) mesh
+        * Right panel (``ax_def``): deformed mesh coloured by ``‖displacement‖``
+        """
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            x_np = dom._vertices   # (n, 2)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_np = np.column_stack([X0.ravel(), X1.ravel()])
+
+        obs = self._evaluate_observables(x_np)
+
+        # Stack displacement components: each spatial name contributes one column
+        disp_cols = []
+        for name in obs_spatial:
+            if name not in obs:
+                for ax in (ax_ref, ax_def):
+                    ax.text(0.5, 0.5, f'Spatial observable\n{name!r}\nnot available',
+                            ha='center', va='center', transform=ax.transAxes)
+                    ax.set_title('Deformed mesh')
+                return
+            v = obs[name]   # (n,) or (n, k)
+            disp_cols.append(v[:, 0] if v.ndim == 2 else v.flatten())
+
+        x_def = np.column_stack(disp_cols)              # (n, n_spatial_dims)
+        mag   = np.linalg.norm(x_def - x_np[:, :x_def.shape[1]], axis=1)  # |displacement|
+
+        xlabel = self._get_input_name(0)
+        ylabel = self._get_input_name(1)
+
+        # Shared colour scale across both panels
+        vmin, vmax = mag.min(), mag.max()
+        levels = np.linspace(vmin, vmax, 51)
+
+        # Shared axis limits: union of original and deformed extents
+        all_x = np.concatenate([x_np[:, 0], x_def[:, 0]])
+        all_y = np.concatenate([x_np[:, 1], x_def[:, 1]])
+        pad_x = (all_x.max() - all_x.min()) * 0.05 or 0.05
+        pad_y = (all_y.max() - all_y.min()) * 0.05 or 0.05
+        xlim = (all_x.min() - pad_x, all_x.max() + pad_x)
+        ylim = (all_y.min() - pad_y, all_y.max() + pad_y)
+
+        if self._is_mesh_domain():
+            faces = dom._faces
+            ref_tri = mtri.Triangulation(x_np[:, 0], x_np[:, 1], faces)
+            def_tri = mtri.Triangulation(x_def[:, 0], x_def[:, 1], faces)
+
+            # Left: original mesh coloured by displacement magnitude
+            im = ax_ref.tricontourf(ref_tri, mag, levels=levels, cmap='inferno', vmin=vmin, vmax=vmax)
+            ax_ref.triplot(ref_tri, color='white', lw=0.3, alpha=0.4)
+
+            # Right: deformed mesh coloured by displacement magnitude
+            ax_def.tricontourf(def_tri, mag, levels=levels, cmap='inferno', vmin=vmin, vmax=vmax)
+            ax_def.triplot(def_tri, color='white', lw=0.3, alpha=0.4)
+        else:
+            scatter_kw = dict(c=mag, cmap='inferno', vmin=vmin, vmax=vmax, s=4)
+            im = ax_ref.scatter(x_np[:, 0], x_np[:, 1], **scatter_kw)
+            ax_def.scatter(x_def[:, 0], x_def[:, 1], **scatter_kw)
+
+        for ax, title in ((ax_ref, 'Original (undeformed)'), (ax_def, 'Deformed')):
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+            ax.set_aspect('equal')
+            ax.set_title(title)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+
+        # Place the colorbar to the right of ax_def, and add a matching invisible
+        # axes to the left of ax_ref so both plots remain the same width.
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        div_ref = make_axes_locatable(ax_ref)
+        cax_dummy = div_ref.append_axes("left", size="5%", pad=0.08)
+        cax_dummy.set_visible(False)
+        divider = make_axes_locatable(ax_def)
+        cax = divider.append_axes("right", size="5%", pad=0.08)
+        cbar = self._fig.colorbar(im, cax=cax, label='‖displacement‖')
+        self._colorbars.append(cbar)
 
     # ==================== FBPINN-specific Plotting ====================
 

@@ -1854,6 +1854,131 @@ class DomainMesh:
         self.boundary_conditions.append(bc)
         return self
 
+    def add_bc(
+        self,
+        select,
+        f: 'Callable',
+        name = None,
+    ) -> 'DomainMesh':
+        """
+        Add a **custom** boundary condition defined by a residual function.
+
+        Unlike :meth:`add_dirichlet` / :meth:`add_neumann` which enforce a
+        single output component against a scalar target, ``add_bc`` lets you
+        write an arbitrary residual that is minimised in the loss.  The
+        function signature mirrors ``pde_fn``::
+
+            f(x, y, params, derivative) -> residual   # (n,) array or tuple
+
+        The trainer calls ``f`` on the sampled boundary points and minimises
+        ``mean(f(...)²)`` (or the sum of squared terms if a tuple is returned).
+
+        Example — traction BC in elasticity (right edge, normal = (1,0))
+        where :math:`\\sigma \\cdot \\mathbf{n} = (0.5, 0)`::
+
+            def traction_right(x, y, params, derivative):
+                lam = params['fixed']['lam']
+                mu  = params['fixed']['mu']
+                u1_x = derivative(y, x, 0, (0,))
+                u2_y = derivative(y, x, 1, (1,))
+                u1_y = derivative(y, x, 0, (1,))
+                u2_x = derivative(y, x, 1, (0,))
+                r0 = (lam + 2*mu)*u1_x + lam*u2_y - 0.5   # sigma_11 = 0.5
+                r1 = mu*(u1_y + u2_x)                       # sigma_12 = 0
+                return r0, r1
+
+            domain.add_bc(edges_right, f=traction_right, name="right_traction")
+
+        Args:
+            select: Edge selector — ``(n, 2)`` vertex-pair array (e.g.
+                    from a *pygmsh* / *meshio* ``cells_dict``), an
+                    ``np.ndarray`` of integer indices into
+                    ``domain._all_edges``, or a callable
+                    ``(vertices) -> bool mask``.
+            f: Residual callable.  Receives ``(x, y, params, derivative)``
+               and returns a ``(n,)`` array **or** a tuple of ``(n,)`` arrays.
+               The backend supplies the ``derivative`` function automatically;
+               it supports the same conventions as ``pde_fn``.
+            name: Label for the compile / weight dicts.  Required if you
+                  want to assign a weight via ``trainer.compile(weights=...)``.
+
+        Returns:
+            *self* for method chaining.
+        """
+        import inspect as _inspect_mod
+        from pinns.boundary import MeshCustomBC
+        edge_indices   = self._resolve_select(select)
+        edges          = self._all_edges[edge_indices]
+        node_positions = self._vertices[np.unique(edges)]
+        edge_lengths   = np.linalg.norm(
+            self._vertices[edges[:, 1]] - self._vertices[edges[:, 0]], axis=1)
+        # Detect weak BC: f accepts 'phi' in its signature
+        _f_params  = list(_inspect_mod.signature(f).parameters.keys())
+        _is_weak   = 'phi' in _f_params
+        _weak_fn   = f if _is_weak else None
+        # When name is a list, create one independent MeshCustomBC per output
+        if isinstance(name, (list, tuple)):
+            for idx, oname in enumerate(name):
+                _idx = idx  # capture by value
+                def _make_wrapper(fn, i):
+                    import inspect as _insp
+                    _params = list(_insp.signature(fn).parameters.keys())
+                    _n = len(_params)
+                    _has_phi = 'phi' in _params
+                    def _wrapper_weak(x, y, params, phi, derivative):
+                        result = fn(x, y, params, phi, derivative)
+                        if isinstance(result, (list, tuple)):
+                            return result[i]
+                        return result
+                    def _wrapper(x, y, params, derivative):
+                        result = fn(x, y, params, derivative)
+                        if isinstance(result, (list, tuple)):
+                            return result[i]
+                        return result
+                    def _wrapper3(x, y, params):
+                        result = fn(x, y, params)
+                        if isinstance(result, (list, tuple)):
+                            return result[i]
+                        return result
+                    def _wrapper2(x, y):
+                        result = fn(x, y)
+                        if isinstance(result, (list, tuple)):
+                            return result[i]
+                        return result
+                    if _has_phi:
+                        return _wrapper_weak
+                    elif _n >= 4:
+                        return _wrapper
+                    elif _n == 3:
+                        return _wrapper3
+                    else:
+                        return _wrapper2
+                bc = MeshCustomBC(
+                    node_positions=node_positions,
+                    f=_make_wrapper(f, _idx),
+                    name=oname,
+                    output_names=[oname],
+                    edges=edges,
+                    edge_lengths=edge_lengths,
+                    is_weak=_is_weak,
+                    weak_fn=_weak_fn,
+                )
+                self.boundary_conditions.append(bc)
+            return self
+        # Single name — single BC
+        bc = MeshCustomBC(
+            node_positions=node_positions,
+            f=f,
+            name=name,
+            output_names=[name] if name is not None else None,
+            edges=edges,
+            edge_lengths=edge_lengths,
+            is_weak=_is_weak,
+            weak_fn=_weak_fn,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
     def __repr__(self):
         n_bcs = len(self.boundary_conditions)
         sp = f"{self._spatial_dims}D"

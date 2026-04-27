@@ -82,6 +82,9 @@ class Problem:
     solution: Optional[Callable] = None
     lagrange_multipliers: Optional[List[str]] = field(default=None)
     no_quadratic: Optional[List[str]] = field(default=None)
+    obs_fn: Optional[Callable] = field(default=None)
+    obs_names: Optional[List[str]] = field(default=None)
+    obs_spatial: Optional[List[str]] = field(default=None)
     
     def __post_init__(self):
         # Get n_dims from domain

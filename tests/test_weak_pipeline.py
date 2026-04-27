@@ -549,4 +549,589 @@ except Exception as e:
     traceback.print_exc()
 
 
+
+# ============================================================
+# TEST 17 — _precompute_boundary_edges: shapes, weights, phi
+# ============================================================
+print("\n=== TEST 17: _precompute_boundary_edges shapes & correctness ===")
+from pinns.problem_weak import _precompute_boundary_edges
+
+# Bottom edge of unit square: node 0=(0,0) → node 1=(1,0), normal=(0,-1)
+# Right  edge:                node 1=(1,0) → node 2=(1,1), normal=(1,0)
+edges_test = np.array([[0, 1], [1, 2]], dtype=np.int64)
+normals_test = np.array([[0., -1.], [1., 0.]], dtype=np.float64)
+
+for order in [1, 2, 3]:
+    bd = _precompute_boundary_edges(VERTS, edges_test, normals_test, order)
+    E, Q = 2, len(_edge_cubature_1d(order)[0]) if False else bd['pts'].shape[1]
+    # --- import helper so we can verify Q independently
+    from pinns.problem_weak import _edge_cubature_1d as _ec1d
+    Q_exp = len(_ec1d(order)[0])
+
+    check(f"order={order}: pts   shape = (2, {Q_exp}, 2)",
+          bd['pts'].shape    == (2, Q_exp, 2), f"got {bd['pts'].shape}")
+    check(f"order={order}: weights shape = (2, {Q_exp})",
+          bd['weights'].shape == (2, Q_exp),    f"got {bd['weights'].shape}")
+    check(f"order={order}: phi   shape = (2, {Q_exp}, 2)",
+          bd['phi'].shape    == (2, Q_exp, 2), f"got {bd['phi'].shape}")
+    check(f"order={order}: normals shape = (2, 2)",
+          bd['normals'].shape == (2, 2),          f"got {bd['normals'].shape}")
+    check(f"order={order}: edge_ids shape = (2, 2)",
+          bd['edge_ids'].shape == (2, 2),          f"got {bd['edge_ids'].shape}")
+
+# Weights should sum to edge length = 1.0 for both edges
+bd3 = _precompute_boundary_edges(VERTS, edges_test, normals_test, 3)
+for e in range(2):
+    s = float(bd3['weights'][e].sum())
+    check(f"edge {e}: sum(weights) = edge_length = 1.0",
+          abs(s - 1.0) < 1e-5, f"sum={s:.6f}")
+
+# phi sums to 1 at every quadrature point (partition of unity on edge)
+for e in range(2):
+    phi_sum = bd3['phi'][e].sum(axis=1)   # (Q,)
+    check(f"edge {e}: phi sums to 1 at all q-pts",
+          np.allclose(phi_sum, 1.0, atol=1e-6),
+          f"max dev={abs(phi_sum - 1).max():.2e}")
+
+# phi(:,0)=1-t and phi(:,1)=t: verify at t=0 and t=1 extremes indirectly by
+# checking that the interpolated midpoint equals midpoint of vertices
+pts_e0 = bd3['pts'][0]           # (Q, 2)  along edge 0→1 = (0,0)→(1,0)
+phi_e0 = bd3['phi'][0]           # (Q, 2)
+x_interp = phi_e0[:, 0] * VERTS[0, 0] + phi_e0[:, 1] * VERTS[1, 0]
+check("edge 0: phi-interpolated x equals pts[:,0]",
+      np.allclose(x_interp, pts_e0[:, 0], atol=1e-5),
+      f"max dev={abs(x_interp - pts_e0[:,0]).max():.2e}")
+
+
+# ============================================================
+# TEST 18 — ProblemWeak: boundary_fn dict populates boundary_fn_data
+# ============================================================
+print("\n=== TEST 18: boundary_fn dict → boundary_fn_data populated ===")
+try:
+    import pinns, types
+    from pinns.problem_weak import ProblemWeak
+
+    # Mesh with labelled right and bottom edges
+    mock_bc = types.SimpleNamespace()
+    mock_bc.points = np.pad(VERTS, ((0, 0), (0, 1)))
+    mock_bc.cells_dict = {
+        "triangle": FACES,
+        "line": edges_test,
+    }
+    mock_bc.cell_sets_dict = {}
+    mock_bc.field_data = {}
+    dom_bc = pinns.DomainMesh(mock_bc)
+    # Register the edges as named BCs so boundary_fn can find them
+    edges_right_bc  = edges_test[1:2]   # node 1→2  (right edge)
+    edges_bottom_bc = edges_test[0:1]   # node 0→1  (bottom edge)
+    dom_bc.add_bc(edges_right_bc,  f=lambda *a: None, name="right")
+    dom_bc.add_bc(edges_bottom_bc, f=lambda *a: None, name="bottom")
+
+    def traction_right(x, y, params, phi, derivative):
+        return 0.5 * phi    # constant traction, single component
+
+    def _vol(x, y, params, phi, grad_phi, derivative=None):
+        du_dx = derivative(y, x, 0, (0,))
+        du_dy = derivative(y, x, 0, (1,))
+        return jnp.sum(jnp.stack([du_dx, du_dy], axis=-1) * grad_phi, axis=-1)
+
+    prob_bc = ProblemWeak(
+        domain=dom_bc,
+        volume_fn=_vol,
+        input_names=["x", "y"],
+        output_names=["u"],
+        cubature_order=3,
+        boundary_fn={"right": traction_right},
+    )
+
+    check("boundary_fn_data has 1 entry",
+          len(prob_bc.boundary_fn_data) == 1,
+          f"got {len(prob_bc.boundary_fn_data)}")
+    bd_entry = prob_bc.boundary_fn_data[0]
+    check("entry has key 'pts'",     'pts'      in bd_entry)
+    check("entry has key 'weights'", 'weights'  in bd_entry)
+    check("entry has key 'phi'",     'phi'      in bd_entry)
+    check("entry has key 'normals'", 'normals'  in bd_entry)
+    check("entry has key 'edge_ids'","edge_ids" in bd_entry)
+    check("entry has key 'fn'",      'fn'       in bd_entry)
+    check("entry has key 'name'",    'name'     in bd_entry)
+    check("entry['name'] == 'right'",
+          bd_entry['name'] == 'right', f"got {bd_entry['name']!r}")
+    check("entry['fn'] is traction_right",
+          bd_entry['fn'] is traction_right)
+
+except Exception as e:
+    import traceback
+    print(f"  [FAIL]  Test 18 raised: {e}")
+    traceback.print_exc()
+
+
+# ============================================================
+# TEST 19 — boundary_fn as a single callable (not dict)
+# ============================================================
+print("\n=== TEST 19: boundary_fn as callable (non-dict) ===")
+try:
+    # Single callable uses '__default__' key internally; register matching BC
+    mock_s = types.SimpleNamespace()
+    mock_s.points = np.pad(VERTS, ((0, 0), (0, 1)))
+    mock_s.cells_dict = {
+        "triangle": FACES,
+        "line": edges_test,
+    }
+    mock_s.cell_sets_dict = {}
+    mock_s.field_data = {}
+    dom_s = pinns.DomainMesh(mock_s)
+    # Register both edges under the '__default__' name
+    dom_s.add_bc(edges_test, f=lambda *a: None, name="__default__")
+
+    def traction_scalar(x, y, params, phi, derivative):
+        return phi
+
+    prob_s = ProblemWeak(
+        domain=dom_s,
+        volume_fn=_vol,
+        input_names=["x", "y"],
+        output_names=["u"],
+        cubature_order=2,
+        boundary_fn=traction_scalar,   # ← single callable, not dict
+    )
+    check("single callable → len(boundary_fn_data) == 1",
+          len(prob_s.boundary_fn_data) == 1,
+          f"got {len(prob_s.boundary_fn_data)}")
+    check("single callable → entry['fn'] is the function",
+          prob_s.boundary_fn_data[0]['fn'] is traction_scalar)
+
+except Exception as e:
+    import traceback
+    print(f"  [FAIL]  Test 19 raised: {e}")
+    traceback.print_exc()
+
+
+# ============================================================
+# TEST 20 — boundary_fn with unknown key raises ValueError
+# ============================================================
+print("\n=== TEST 20: boundary_fn with unknown key raises ValueError ===")
+try:
+    mock_e = types.SimpleNamespace()
+    mock_e.points = np.pad(VERTS, ((0, 0), (0, 1)))
+    mock_e.cells_dict = {
+        "triangle": FACES,
+        "line": edges_test,
+    }
+    mock_e.cell_sets_dict = {}
+    mock_e.field_data = {}
+    dom_e = pinns.DomainMesh(mock_e)
+    # Register "right" so the domain has a known BC; the test passes a wrong key
+    dom_e.add_bc(edges_test[1:2], f=lambda *a: None, name="right")
+
+    raised = False
+    try:
+        ProblemWeak(
+            domain=dom_e,
+            volume_fn=_vol,
+            input_names=["x", "y"],
+            output_names=["u"],
+            cubature_order=2,
+            boundary_fn={"nonexistent_boundary": lambda *a: None},
+        )
+    except ValueError:
+        raised = True
+    check("unknown boundary_fn key raises ValueError", raised)
+
+except Exception as e:
+    import traceback
+    print(f"  [FAIL]  Test 20 raised unexpectedly: {e}")
+    traceback.print_exc()
+
+
+# ============================================================
+# TEST 21 — boundary_fn dict with two entries (multi-BC)
+# ============================================================
+print("\n=== TEST 21: boundary_fn dict with two entries (two BCs) ===")
+try:
+    mock_two = types.SimpleNamespace()
+    mock_two.points = np.pad(VERTS, ((0, 0), (0, 1)))
+    mock_two.cells_dict = {
+        "triangle": FACES,
+        "line": edges_test,        # 2 edges
+    }
+    mock_two.cell_sets_dict = {}
+    mock_two.field_data = {}
+    dom_two = pinns.DomainMesh(mock_two)
+    dom_two.add_bc(edges_test[1:2], f=lambda *a: None, name="right")
+    dom_two.add_bc(edges_test[0:1], f=lambda *a: None, name="bottom")
+
+    def traction_right2(x, y, params, phi, derivative):
+        return 0.5 * phi
+
+    def traction_bottom2(x, y, params, phi, derivative):
+        return jnp.zeros_like(phi)
+
+    prob_two = ProblemWeak(
+        domain=dom_two,
+        volume_fn=_vol,
+        input_names=["x", "y"],
+        output_names=["u"],
+        cubature_order=3,
+        boundary_fn={
+            "right":  traction_right2,
+            "bottom": traction_bottom2,
+        },
+    )
+
+    check("two dict entries → len(boundary_fn_data) == 2",
+          len(prob_two.boundary_fn_data) == 2,
+          f"got {len(prob_two.boundary_fn_data)}")
+
+    names = {e['name'] for e in prob_two.boundary_fn_data}
+    check("both names present in boundary_fn_data",
+          names == {"right", "bottom"}, f"got {names}")
+
+    for entry in prob_two.boundary_fn_data:
+        E_exp = 1    # each BC has exactly 1 edge
+        check(f"BC '{entry['name']}': pts has {E_exp} edge(s)",
+              entry['pts'].shape[0] == E_exp,
+              f"got {entry['pts'].shape[0]}")
+
+except Exception as e:
+    import traceback
+    print(f"  [FAIL]  Test 21 raised: {e}")
+    traceback.print_exc()
+
+
+# ============================================================
+# TEST 22 — make_loss_fn: boundary_fn subtraction actually applied
+#
+# Problem: Laplacian(u) = 0 on [0,1]^2, u=0 on left (Dirichlet).
+# Analytical solution u(x,y) = x  →  ∇u = (1, 0).
+# Natural RHS on right edge: t = n·∇u = 1.
+#
+# Green's identity tells us:
+#   R_j = ∫_Ω ∇u·∇φ dΩ − ∫_Γ_right φ dS  ≈  0
+# Without the boundary term the residual is non-zero.
+# So:  loss_with_bc  < loss_without_bc
+# ============================================================
+print("\n=== TEST 22: make_loss_fn boundary subtraction reduces residual ===")
+try:
+    import types
+    import jax, jax.numpy as jnp
+    import pinns
+    from pinns.problem_weak import ProblemWeak
+
+    # VERTS / FACES defined at the top of this file ([0,1]^2, 2 triangles)
+    # Right edge: node 1=(1,0) → node 2=(1,1)
+    # Left  edge: node 0=(0,0) → node 3=(0,1)
+    edges_right_22 = np.array([[1, 2]], dtype=np.int64)
+
+    def _make_dom():
+        mock = types.SimpleNamespace()
+        mock.points = np.pad(VERTS, ((0, 0), (0, 1)))
+        mock.cells_dict = {"triangle": FACES, "line": edges_right_22}
+        mock.cell_sets_dict = {}
+        mock.field_data = {}
+        dom = pinns.DomainMesh(mock)
+        # Register right edge as a named BC so boundary_fn key can find it
+        dom.add_bc(edges_right_22, f=lambda *a: None, name="right")
+        return dom
+
+    # Laplacian volume integrand: ∫ ∇u · ∇φ dΩ
+    def vol_fn_22(x, y, params, phi, grad_phi, derivative=None):
+        du_dx = derivative(y, x, 0, (0,))
+        du_dy = derivative(y, x, 0, (1,))
+        return du_dx * grad_phi[:, 0] + du_dy * grad_phi[:, 1]
+
+    # Traction on right edge: t = 1  (= n · ∇u where n=(1,0) and ∇u=(1,0))
+    def traction_right_22(x, y, params, phi, derivative):
+        return 1.0 * phi    # constant traction = 1
+
+    dom_with    = _make_dom()
+    dom_without = _make_dom()
+
+    prob_with = ProblemWeak(
+        domain=dom_with, volume_fn=vol_fn_22,
+        input_names=["x", "y"], output_names=["u"],
+        cubature_order=3,
+        boundary_fn={"right": traction_right_22},
+    )
+    prob_without = ProblemWeak(
+        domain=dom_without, volume_fn=vol_fn_22,
+        input_names=["x", "y"], output_names=["u"],
+        cubature_order=3,
+        boundary_fn=None,
+    )
+
+    # Network that returns u(x,y) = x  (exact solution)
+    def u_and_grad_22(params, xy):
+        u = xy[0]
+        grad_u = jnp.array([1.0, 0.0])
+        return u, grad_u
+
+    loss_fn_with    = prob_with.make_loss_fn(u_and_grad_22)
+    loss_fn_without = prob_without.make_loss_fn(u_and_grad_22)
+
+    dummy_params = {}
+    loss_with    = float(loss_fn_with(dummy_params))
+    loss_without = float(loss_fn_without(dummy_params))
+
+    check(
+        "loss_with_boundary_fn < loss_without_boundary_fn  (traction subtracted)",
+        loss_with < loss_without,
+        f"loss_with={loss_with:.6f}, loss_without={loss_without:.6f}",
+    )
+
+except Exception as e:
+    import traceback
+    print(f"  [FAIL]  Test 22 raised: {e}")
+    traceback.print_exc()
+
+
+# ============================================================
+# TEST 23 — multi-component weak form + boundary_fn
+#
+# Problem: 2D linear elasticity, λ=μ=1, on the 2-triangle unit square.
+#   volume_fn returns a tuple (a1, a2)  — two components.
+#   Traction on right edge: (t1, t2) = (0.5, 0).
+#
+# The exact uniform-stress solution (u1=(3/16)x, u2=-(1/16)y) satisfies
+# equilibrium and the right traction.  By Green's identity the assembled
+# residuals for free nodes are:
+#
+#   R1_j = ∫_Ω (σ11 ∂φ/∂x + σ12 ∂φ/∂y) dΩ  (volume)
+#          −  0.5 ∫_right φ dS             (traction RHS)
+#
+#   R2_j = ∫_Ω (σ12 ∂φ/∂x + σ22 ∂φ/∂y) dΩ  (volume, ≡ 0)
+#          − 0 · ∫_right φ dS
+#
+# Checks:
+#   (a) loss WITH traction boundary_fn  < loss WITHOUT   (subtraction active)
+#   (b) loss WITHOUT traction boundary_fn is non-zero    (missing RHS matters)
+# ============================================================
+print("\n=== TEST 23: multi-component weak form + boundary_fn (2D elasticity) ===")
+try:
+    import types
+    import jax, jax.numpy as jnp
+    import pinns
+    from pinns.problem_weak import ProblemWeak
+
+    edges_right_23 = np.array([[1, 2]], dtype=np.int64)   # right edge of unit square
+
+    def _make_dom_23():
+        mock = types.SimpleNamespace()
+        mock.points = np.pad(VERTS, ((0, 0), (0, 1)))
+        mock.cells_dict = {"triangle": FACES, "line": edges_right_23}
+        mock.cell_sets_dict = {}
+        mock.field_data = {}
+        dom = pinns.DomainMesh(mock)
+        # Register right edge for boundary_fn lookup
+        dom.add_bc(edges_right_23, f=lambda *a: None, name="right")
+        return dom
+
+    lam_t, mu_t = 1.0, 1.0
+
+    def vol_fn_23(x, y, params, phi, grad_phi, derivative=None):
+        u1_x = derivative(y, x, 0, (0,))
+        u1_y = derivative(y, x, 0, (1,))
+        u2_x = derivative(y, x, 1, (0,))
+        u2_y = derivative(y, x, 1, (1,))
+        sigma_11 = (lam_t + 2*mu_t) * u1_x + lam_t * u2_y
+        sigma_12 = mu_t * (u1_y + u2_x)
+        sigma_22 = lam_t * u1_x + (lam_t + 2*mu_t) * u2_y
+        dphi_dx = grad_phi[:, 0]
+        dphi_dy = grad_phi[:, 1]
+        a1 = sigma_11 * dphi_dx + sigma_12 * dphi_dy
+        a2 = sigma_12 * dphi_dx + sigma_22 * dphi_dy
+        return a1, a2
+
+    # Traction RHS: (t1, t2) = (0.5, 0)
+    def traction_rhs_23(x, y, params, phi, derivative):
+        return 0.5 * phi, jnp.zeros_like(phi)
+
+    dom_with_23    = _make_dom_23()
+    dom_without_23 = _make_dom_23()
+
+    prob_with_23 = ProblemWeak(
+        domain=dom_with_23, volume_fn=vol_fn_23,
+        input_names=["x", "y"], output_names=["u1", "u2"],
+        cubature_order=3,
+        boundary_fn={"right": traction_rhs_23},
+    )
+    prob_without_23 = ProblemWeak(
+        domain=dom_without_23, volume_fn=vol_fn_23,
+        input_names=["x", "y"], output_names=["u1", "u2"],
+        cubature_order=3,
+        boundary_fn=None,
+    )
+
+    # Exact solution: u1 = (3/16) x,  u2 = -(1/16) y
+    C1, C2 = 3.0/16.0, -1.0/16.0
+    def u_and_grad_23(params, xy):
+        u1 = C1 * xy[0]
+        u2 = C2 * xy[1]
+        u   = jnp.array([u1, u2])
+        jac = jnp.array([[C1, 0.0],   # ∂u1/∂x, ∂u1/∂y
+                          [0.0, C2]])  # ∂u2/∂x, ∂u2/∂y
+        return u, jac
+
+    loss_with_23    = float(prob_with_23.make_loss_fn(u_and_grad_23)({}))
+    loss_without_23 = float(prob_without_23.make_loss_fn(u_and_grad_23)({}))
+
+    check(
+        "multi-component: loss_with_bc < loss_without_bc",
+        loss_with_23 < loss_without_23,
+        f"loss_with={loss_with_23:.6f}, loss_without={loss_without_23:.6f}",
+    )
+    check(
+        "multi-component: loss_without_bc non-zero (missing traction RHS matters)",
+        loss_without_23 > 1e-5,
+        f"loss_without={loss_without_23:.2e}",
+    )
+
+except Exception as e:
+    import traceback
+    print(f"  [FAIL]  Test 23 raised: {e}")
+    traceback.print_exc()
+
+
+# ============================================================
+# TEST 24 — Boundary edge cubature: weights and phi integrals
+#
+# Sub-tests:
+#   (a) sum of quadrature weights over an edge == edge length
+#   (b) ∫_edge phi_0 ds = L/2  and  ∫_edge phi_1 ds = L/2
+#       (the two P1 hat functions integrate equally over a straight edge)
+#   (c) Assembled boundary-subtraction vector for a constant traction t=1
+#       on the right edge of the unit square equals the analytical values:
+#         corner node  (1,0) or (1,1): ∫_edge phi ds = 0.5
+#         the boundary_fn_data scatter correctly adds to those node ids
+#   (d) A constant traction t=1 on right edge with u(x,y)=x (Poisson):
+#       the boundary subtraction reduces the assembled residual of the
+#       right-edge nodes to ≈ 0  (Green's identity check node-by-node)
+# ============================================================
+print("\n=== TEST 24: boundary edge cubature correctness ===")
+try:
+    import types
+    import jax, jax.numpy as jnp
+    import pinns
+    from pinns.problem_weak import _precompute_boundary_edges, ProblemWeak
+
+    # ── (a & b) unit right edge: node 1=(1,0) → node 2=(1,1), length=1 ──────
+    verts_sq = VERTS          # [[0,0],[1,0],[1,1],[0,1]]
+    edge_right = np.array([[1, 2]], dtype=np.int64)
+
+    # Inward normal for right edge is (1,0) but direction does not affect weights
+    edge_normals = np.array([[1.0, 0.0]])
+
+    for order in [1, 2, 3, 4]:
+        bd = _precompute_boundary_edges(verts_sq, edge_right, edge_normals, order)
+        w   = bd['weights']   # (1, Q)
+        phi = bd['phi']       # (1, Q, 2)
+
+        # (a) sum of weights == edge length == 1
+        check(
+            f"order={order}: sum(edge_weights) == 1.0 (right edge length)",
+            abs(w.sum() - 1.0) < 1e-10,
+            f"sum={w.sum():.8f}",
+        )
+        # (b) each hat function integrates to 0.5 = L/2
+        int_phi0 = (w * phi[0, :, 0]).sum()
+        int_phi1 = (w * phi[0, :, 1]).sum()
+        check(
+            f"order={order}: ∫ phi_0 ds = 0.5",
+            abs(int_phi0 - 0.5) < 1e-10,
+            f"integral={int_phi0:.8f}",
+        )
+        check(
+            f"order={order}: ∫ phi_1 ds = 0.5",
+            abs(int_phi1 - 0.5) < 1e-10,
+            f"integral={int_phi1:.8f}",
+        )
+
+    # ── (c) scatter-add puts correct values at node ids ──────────────────────
+    bd3 = _precompute_boundary_edges(verts_sq, edge_right, edge_normals, order=3)
+    w3   = bd3['weights']     # (1, Q)
+    phi3 = bd3['phi']         # (1, Q, 2)
+    eids = bd3['edge_ids']    # (1, 2) → should be [1, 2]
+
+    # scatter: for each endpoint p, add ∫ 1*phi_p ds = 0.5
+    R_scatter = np.zeros(len(verts_sq))
+    for p in range(2):
+        contrib = (w3 * phi3[0, :, p]).sum()
+        R_scatter[eids[0, p]] += contrib
+
+    check(
+        "scatter: R[node_1] == 0.5 (right-edge corner)",
+        abs(R_scatter[1] - 0.5) < 1e-8,
+        f"R[1]={R_scatter[1]:.8f}",
+    )
+    check(
+        "scatter: R[node_2] == 0.5 (right-edge corner)",
+        abs(R_scatter[2] - 0.5) < 1e-8,
+        f"R[2]={R_scatter[2]:.8f}",
+    )
+    check(
+        "scatter: interior nodes unaffected (R[0]=R[3]=0)",
+        abs(R_scatter[0]) < 1e-12 and abs(R_scatter[3]) < 1e-12,
+        f"R[0]={R_scatter[0]:.2e}, R[3]={R_scatter[3]:.2e}",
+    )
+
+    # ── (d) Node-level Green's identity: right-edge nodes of Poisson u=x ──────
+    # volume residual: R_j = ∫ ∇x · ∇φ_j dΩ  (∇u=(1,0))
+    # boundary subtraction: − ∫_right φ_j ds  (traction t=1)
+    # By Green:  R_j_net = ∫_∂Ω φ_j n·∇u ds − ∫_right φ_j ds = 0
+    # because n·∇u = 1 on right, 0 on top/bottom, and −1 on left (Dirichlet,
+    # so those nodes are removed from the free set entirely).
+    # → net residual of free nodes (right-edge nodes 1 and 2) should be ≈ 0.
+    edge_left_24 = np.array([[3, 0]], dtype=np.int64)   # left edge: node3=(0,1)→node0=(0,0)
+
+    def _make_dom_24():
+        mock = types.SimpleNamespace()
+        mock.points = np.pad(verts_sq, ((0, 0), (0, 1)))
+        mock.cells_dict = {"triangle": FACES, "line": edge_right}
+        mock.cell_sets_dict = {}
+        mock.field_data = {}
+        dom = pinns.DomainMesh(mock)
+        # Dirichlet on left edge: u(0,y)=0 — removes nodes 0 and 3 from free set
+        dom.add_dirichlet(edge_left_24, value=0.0, component=0, name="left_u")
+        # Register right edge for boundary_fn lookup
+        dom.add_bc(edge_right, f=lambda *a: None, name="right")
+        return dom
+
+    def vol_fn_24(x, y, params, phi, grad_phi, derivative=None):
+        du_dx = derivative(y, x, 0, (0,))
+        du_dy = derivative(y, x, 0, (1,))
+        return du_dx * grad_phi[:, 0] + du_dy * grad_phi[:, 1]
+
+    def traction_24(x, y, params, phi, derivative):
+        return 1.0 * phi    # t = n·∇u = 1 on right edge
+
+    prob_24 = ProblemWeak(
+        domain=_make_dom_24(),
+        volume_fn=vol_fn_24,
+        input_names=["x", "y"], output_names=["u"],
+        cubature_order=3,
+        boundary_fn={"right": traction_24},
+    )
+
+    def u_and_grad_24(params, xy):
+        return xy[0], jnp.array([1.0, 0.0])
+
+    # Access the raw residual vector (before free-node masking) from loss internals.
+    # make_residual_vector_fn returns R for ALL n_dofs nodes; free nodes are at
+    # indices prob_24.free_nodes (nodes 1 and 2 = right-edge corners).
+    resid_fn = prob_24.make_residual_vector_fn(u_and_grad_24)
+    R_all  = np.array(resid_fn({}))     # (n_dofs,) residuals at all nodes
+    R_free = R_all[np.array(prob_24.free_nodes)]   # only free (right-edge) nodes
+
+    check(
+        "Green's identity: free-node net residuals ≈ 0 with traction subtraction",
+        np.max(np.abs(R_free)) < 1e-5,
+        f"max|R_free|={np.max(np.abs(R_free)):.2e}, R_free={R_free}",
+    )
+
+except Exception as e:
+    import traceback
+    print(f"  [FAIL]  Test 24 raised: {e}")
+    traceback.print_exc()
+
+
 print("\nDone.\n")

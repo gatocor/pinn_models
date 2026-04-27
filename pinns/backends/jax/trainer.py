@@ -319,6 +319,85 @@ class Trainer(BaseTrainer):
                 return self.problem.pde_fn(x, y, params_dict)
             finally:
                 clear_context()
+
+    def _compute_custom_bc_losses_dict(self, bc, x, y, params_dict, weights_dict=None):
+        """Return {output_name: weighted_loss} with full JAX autodiff."""
+        if getattr(bc, 'is_weak', False):
+            out_names = bc.output_names or [bc.name]
+            return {oname: 0.0 for oname in out_names}
+        model_apply = lambda p, xin: self.network.apply(p, xin, params_dict)
+        deriv_fn = make_derivative_fn(model_apply, self.network.params)
+        import inspect as _inspect
+        sig = _inspect.signature(bc.f)
+        n_params = len(sig.parameters)
+        if n_params >= 4:
+            residual = bc.f(x, y, params_dict, deriv_fn)
+        elif n_params == 3:
+            residual = bc.f(x, y, params_dict)
+        else:
+            residual = bc.f(x, y)
+        if not isinstance(residual, (list, tuple)):
+            residual = (residual,)
+        out_names = (bc.output_names or ([bc.name] * len(residual)))
+        default_w = (weights_dict or {}).get(bc.name, 1.0) if weights_dict else 1.0
+        return {
+            oname: (weights_dict or {}).get(oname, default_w) * self._mean_squared(r)
+            for r, oname in zip(residual, out_names)
+        }
+
+    def _compute_custom_bc_loss(self, bc, x, y, params_dict, weights_dict=None):
+        """Evaluate a MeshCustomBC residual with full JAX autodiff."""
+        if getattr(bc, 'is_weak', False):
+            return 0.0
+        model_apply = lambda p, xin: self.network.apply(p, xin, params_dict)
+        deriv_fn = make_derivative_fn(model_apply, self.network.params)
+        import inspect as _inspect
+        sig = _inspect.signature(bc.f)
+        n_params = len(sig.parameters)
+        if n_params >= 4:
+            residual = bc.f(x, y, params_dict, deriv_fn)
+        elif n_params == 3:
+            residual = bc.f(x, y, params_dict)
+        else:
+            residual = bc.f(x, y)
+        if isinstance(residual, (list, tuple)):
+            out_names = (bc.output_names or ([bc.name] * len(residual)))
+            default_w = (weights_dict or {}).get(bc.name, 1.0) if weights_dict else 1.0
+            losses = [
+                (weights_dict or {}).get(oname, default_w) * self._mean_squared(r)
+                for r, oname in zip(residual, out_names)
+            ]
+            return sum(losses)
+        default_w = (weights_dict or {}).get(bc.name, 1.0)
+        return default_w * self._mean_squared(residual)
+
+    def _evaluate_observables(self, x_np):
+        """Evaluate obs_fn with full JAX autodiff derivative support."""
+        import inspect as _inspect
+        obs_fn   = getattr(self.problem, 'obs_fn',    None)
+        obs_names = getattr(self.problem, 'obs_names', None) or []
+        if obs_fn is None or not obs_names:
+            return {}
+        x = jnp.array(x_np)
+        params_dict = self._build_params()
+        model_apply = lambda p, xin: self.network.apply(p, xin, params_dict)
+        y = self.network.apply(self.network.params, x, params_dict)
+        deriv_fn = make_derivative_fn(model_apply, self.network.params)
+        try:
+            sig = _inspect.signature(obs_fn)
+            n_params = len(sig.parameters)
+            if n_params >= 4:
+                vals = obs_fn(x, y, params_dict, deriv_fn)
+            elif n_params == 3:
+                vals = obs_fn(x, y, params_dict)
+            else:
+                vals = obs_fn(x, y)
+        except Exception:
+            return {}
+        return {
+            name: np.array(v).reshape(len(x_np), -1)
+            for name, v in zip(obs_names, vals)
+        }
     
     def _mean_squared(self, tensor):
         """Compute mean squared value of a JAX tensor."""
@@ -344,13 +423,14 @@ class Trainer(BaseTrainer):
     
     def _make_jit_train_step(self, weights, params_dict):
         """Create a JIT-compiled training step function."""
-        from pinns.boundary import NeumannBC, MeshNodeBC
+        from pinns.boundary import NeumannBC, MeshNodeBC, MeshCustomBC
 
         # Pre-extract BC info as static data
         bc_info = []
         dirichlet_bcs = []
         neumann_bcs = []
         mesh_neumann_bcs = []   # MeshNodeBC with bc_type="neumann"
+        custom_bc_list = []     # MeshCustomBC entries
         
         # Get precomputed targets for callable BCs
         train_targets = getattr(self, '_train_targets', {})
@@ -384,6 +464,13 @@ class Trainer(BaseTrainer):
                         mesh_neumann_bcs.append(bc_data)
                     continue
 
+                # MeshCustomBC: captured for the custom-BC loss block below
+                if isinstance(bc, MeshCustomBC):
+                    import inspect as _insp
+                    _n = len(_insp.signature(bc.f).parameters)
+                    custom_bc_list.append((bc, name, weights.get(name, 1.0), _n))
+                    continue
+
                 is_neumann = isinstance(bc, NeumannBC)
                 normal_info = bc.get_normal_direction() if is_neumann else (0, 1)
                 bc_data = {
@@ -412,11 +499,21 @@ class Trainer(BaseTrainer):
         # ── Weak-form: pre-build and JIT the FEM assembler loss ──────────
         if _is_weak:
             _network = self.network
-            def _u_and_grad(params, xy):
-                def u_single(z):
-                    return _network.apply(params, z[None])[0, 0]
-                return jax.value_and_grad(u_single)(xy)
-            _weak_loss_fn = jax.jit(self.problem.make_loss_fn(_u_and_grad))
+            _n_out = self.problem.n_outputs
+            if _n_out == 1:
+                def _u_and_grad(params, xy):
+                    def u_single(z):
+                        return _network.apply(params, z[None])[0, 0]
+                    return jax.value_and_grad(u_single)(xy)
+            else:
+                # Multi-output: return full Jacobian (n_out, n_dims)
+                def _u_and_grad(params, xy):
+                    def u_vec(z):
+                        return _network.apply(params, z[None])[0]  # (n_out,)
+                    u = u_vec(xy)
+                    jac = jax.jacobian(u_vec)(xy)  # (n_out, n_dims)
+                    return u, jac
+            _weak_loss_fn = jax.jit(self.problem.make_loss_fn(_u_and_grad, bc_weights=weights))
             self._weak_loss_fn = _weak_loss_fn
             self._weak_residual_fn = jax.jit(
                 self.problem.make_residual_vector_fn(_u_and_grad))
@@ -577,6 +674,31 @@ class Trainer(BaseTrainer):
                     bc_loss = jnp.mean((y_bc[:, comp] - mn_target) ** 2)
 
                 total_loss = total_loss + bc_data['weight'] * bc_loss
+
+            # ===== Custom Residual BC Loss (MeshCustomBC) =====
+            if custom_bc_list:
+                _deriv_fn = make_derivative_fn(model_apply_with_params, params)
+                for _bc, _bc_name, _bc_weight, _n in custom_bc_list:
+                    # Weak BCs (phi in signature) are handled by the Galerkin
+                    # assembler — skip pointwise evaluation entirely.
+                    if getattr(_bc, 'is_weak', False):
+                        continue
+                    _x_bc = train_data[_bc_name]
+                    _y_bc = model_apply_with_params(params, _x_bc)
+                    if _n >= 4:
+                        _residual = _bc.f(_x_bc, _y_bc, params_dict, _deriv_fn)
+                    elif _n == 3:
+                        _residual = _bc.f(_x_bc, _y_bc, params_dict)
+                    else:
+                        _residual = _bc.f(_x_bc, _y_bc)
+                    if isinstance(_residual, (list, tuple)):
+                        _out_names = _bc.output_names or ([_bc_name] * len(_residual))
+                        for _r, _oname in zip(_residual, _out_names):
+                            _w = weights.get(_oname, _bc_weight)
+                            total_loss = total_loss + _w * jnp.mean(_r ** 2)
+                    else:
+                        _bc_loss = jnp.mean(_residual ** 2)
+                        total_loss = total_loss + _bc_weight * _bc_loss
 
             return total_loss
 
@@ -1353,11 +1475,12 @@ def _initialize_lagrange_multipliers_impl(self):
         if self._lagrange_optimizer is not None:
             self._lagrange_opt_states['pde'] = self._lagrange_optimizer.init(self.lagrange_multipliers['pde'])
 
-    # For ProblemWeak the PDE residual has size n_free_nodes (no collocation pts)
+    # For ProblemWeak the PDE residual has size n_free_nodes * n_outputs
+    # (all component residuals are concatenated: [R1_free; R2_free; ...])
     from pinns.problem_weak import ProblemWeak as _ProblemWeak
     if isinstance(self.problem, _ProblemWeak):
         if ((self._lagrange_constraints is None) or ('pde' in self._lagrange_constraints)):
-            n = self.problem.n_free_nodes
+            n = self.problem.n_free_nodes * self.problem.n_outputs
             self.lagrange_multipliers['pde'] = jnp.zeros(n)
             if self._lagrange_optimizer is not None:
                 self._lagrange_opt_states['pde'] = self._lagrange_optimizer.init(self.lagrange_multipliers['pde'])
@@ -1388,15 +1511,30 @@ def _make_al_loss_fn_impl(self, params_dict):
     # remain identical to the strong form (point evaluation u − g).
     if _is_weak:
         network = self.network
+        _n_out = self.problem.n_outputs
 
-        def _u_and_grad(p, xy):
-            def _u(z): return network.apply(p, z[None])[0, 0]
-            return jax.value_and_grad(_u)(xy)
+        if _n_out == 1:
+            def _u_and_grad(p, xy):
+                def _u(z): return network.apply(p, z[None])[0, 0]
+                return jax.value_and_grad(_u)(xy)
+        else:
+            def _u_and_grad(p, xy):
+                def _u_vec(z): return network.apply(p, z[None])[0]  # (n_out,)
+                u = _u_vec(xy)
+                jac = jax.jacobian(_u_vec)(xy)  # (n_out, n_dims)
+                return u, jac
 
         _weak_res_fn = jax.jit(self.problem.make_residual_vector_fn(_u_and_grad))
         # Store for the residual plot
         self._weak_residual_fn = _weak_res_fn
-        _free_nodes_jax = jnp.array(self.problem.free_nodes, dtype=jnp.int32)
+        _n_dofs  = self.problem.n_dofs
+        _n_comp  = self.problem.n_outputs
+        # For multi-component: residual vector is [R1; R2; ...] of length n_dofs*n_comp
+        # Free indices span all components
+        _free_base = jnp.array(self.problem.free_nodes, dtype=jnp.int32)
+        _free_nodes_jax = jnp.concatenate(
+            [_free_base + k * _n_dofs for k in range(_n_comp)]
+        ) if _n_comp > 1 else _free_base
 
         def _model_apply(p, x):
             return network.apply(p, x)

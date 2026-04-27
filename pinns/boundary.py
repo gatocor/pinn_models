@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from dataclasses import dataclass
-from typing import Union, Callable, Tuple, Optional
+from typing import Union, Callable, Tuple, Optional, List
 
 def _call_value_function(value_fn, x: torch.Tensor) -> torch.Tensor:
     """
@@ -515,6 +515,42 @@ class MeshNodeBC:
             return np.asarray(result, dtype=np.float32).squeeze()
         n = x.shape[0]
         return np.full(n, self.value, dtype=np.float32)
+
+
+@dataclass
+class MeshCustomBC:
+    """
+    Custom boundary condition applied at a selected subset of mesh nodes.
+
+    Instead of a fixed ``value`` + ``component`` target, you provide a
+    **residual function** ``f`` with the same signature as ``pde_fn``::
+
+        f(x, y, params, derivative) -> residual  # shape (n,) or tuple of (n,)
+
+    The trainer minimises ``mean(f(...)²)``.  Use this for mixed BCs such as
+    traction conditions in elasticity where the residual involves derivatives
+    of several output components.
+
+    Created by :meth:`DomainMesh.add_bc`.
+
+    Args:
+        node_positions: ``(n_nodes, spatial_dims)`` sampled node coordinates.
+        f: Residual callable with signature
+           ``f(x, y, params, derivative) -> array`` **or** a tuple of arrays.
+        name: Label used in compile/weight dicts and plots.
+        edges: ``(n_edges, 2)`` vertex-pair array (for sampling, optional).
+        edge_lengths: ``(n_edges,)`` edge lengths (for sampling, optional).
+    """
+    node_positions: 'np.ndarray'         # (n_nodes, spatial_dims)
+    f:              Callable             # residual function
+    name:           Optional[str] = None
+    output_names:   Optional[List[str]] = None  # per-output names when f returns a tuple
+    t_mode:         Optional[str] = None  # None | "all" | "t_min" | "t_max"
+    edges:          Optional['np.ndarray'] = None
+    edge_lengths:   Optional['np.ndarray'] = None
+    # ── weak-form fields ───────────────────────────────────────────────────────
+    is_weak:        bool = False          # True if f accepts phi (line-integral RHS)
+    weak_fn:        Optional[Callable] = None  # original f with phi signature
 
 
 @dataclass
