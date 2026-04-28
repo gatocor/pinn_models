@@ -41,6 +41,8 @@ from .networks import (
 
 from .trainer import Trainer
 
+from .gnn_network import GNNMeshNetwork, _interpolate_mesh
+
 __all__ = [
     # Functional (same API as PyTorch)
     'derivative',
@@ -64,4 +66,7 @@ __all__ = [
     'get_activation',
     # Training (same API as PyTorch)
     'Trainer',
+    # Mesh GNN
+    'GNNMeshNetwork',
+    '_interpolate_mesh',
 ]

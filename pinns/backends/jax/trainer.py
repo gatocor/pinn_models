@@ -130,6 +130,7 @@ class Trainer(BaseTrainer):
         self._is_lagrangian_mode = bool(auto_lagrangian and has_al_request)
 
         self.lagrange_lr = lagrange_lr
+        self._lagrange_lr_ratio = lagrange_lr / max(self.learning_rate, 1e-12)
         self._lagrange_max = lagrange_max
         self._lagrange_optimizer_name = lagrange_optimizer
 
@@ -144,9 +145,9 @@ class Trainer(BaseTrainer):
             else:
                 # Lagrange lr may have changed — rebuild optimizer but keep λ values
                 if self._lagrange_optimizer_name == 'adam':
-                    self._lagrange_optimizer = optax.adam(self.lagrange_lr)
+                    self._lagrange_optimizer = optax.inject_hyperparams(optax.adam)(learning_rate=self.lagrange_lr)
                 elif self._lagrange_optimizer_name == 'sgd':
-                    self._lagrange_optimizer = optax.sgd(self.lagrange_lr)
+                    self._lagrange_optimizer = optax.inject_hyperparams(optax.sgd)(learning_rate=self.lagrange_lr)
                 else:
                     self._lagrange_optimizer = None
 
@@ -983,6 +984,14 @@ class Trainer(BaseTrainer):
                     new_hyperparams = dict(self.opt_state.hyperparams)
                     new_hyperparams['learning_rate'] = new_lr
                     self.opt_state = self.opt_state._replace(hyperparams=new_hyperparams)
+                # Scale lagrange_lr by the same ratio
+                self.lagrange_lr = self._lagrange_lr_ratio * new_lr
+                if self._lagrange_optimizer is not None:
+                    for k in self._lagrange_opt_states:
+                        if hasattr(self._lagrange_opt_states[k], 'hyperparams'):
+                            hp = dict(self._lagrange_opt_states[k].hyperparams)
+                            hp['learning_rate'] = self.lagrange_lr
+                            self._lagrange_opt_states[k] = self._lagrange_opt_states[k]._replace(hyperparams=hp)
             
             # Refresh pool with fresh samples if interval reached
             if pool_refresh_each > 0 and has_pool and epoch > 0 and epoch % pool_refresh_each == 0:
@@ -1534,9 +1543,9 @@ def _initialize_lagrange_multipliers_impl(self):
     self.lagrange_multipliers = {}
     self._lagrange_opt_states = {}
     if self._lagrange_optimizer_name == 'adam':
-        self._lagrange_optimizer = optax.adam(self.lagrange_lr)
+        self._lagrange_optimizer = optax.inject_hyperparams(optax.adam)(learning_rate=self.lagrange_lr)
     elif self._lagrange_optimizer_name == 'sgd':
-        self._lagrange_optimizer = optax.sgd(self.lagrange_lr)
+        self._lagrange_optimizer = optax.inject_hyperparams(optax.sgd)(learning_rate=self.lagrange_lr)
     else:
         self._lagrange_optimizer = None
 
@@ -1968,6 +1977,14 @@ def _train_lagrangian_mode_impl(self):
             hp = dict(self.opt_state.hyperparams)
             hp['learning_rate'] = new_lr
             self.opt_state = self.opt_state._replace(hyperparams=hp)
+            # Scale lagrange_lr by the same ratio
+            self.lagrange_lr = self._lagrange_lr_ratio * new_lr
+            if self._lagrange_optimizer is not None:
+                for k in self._lagrange_opt_states:
+                    if hasattr(self._lagrange_opt_states[k], 'hyperparams'):
+                        lhp = dict(self._lagrange_opt_states[k].hyperparams)
+                        lhp['learning_rate'] = self.lagrange_lr
+                        self._lagrange_opt_states[k] = self._lagrange_opt_states[k]._replace(hyperparams=lhp)
         if resample_each > 0 and epoch > start_epoch and epoch % resample_each == 0:
             self._sample_train_data()
             self._reinitialize_lagrange_if_needed()

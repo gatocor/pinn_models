@@ -38,6 +38,12 @@ from .domain import DomainCubic, DomainCubicPartition, DomainMesh, SubdomainInfo
 from .problem import Problem
 from .problem_weak import ProblemWeak
 
+# JAX-only mesh GNN (always available if JAX is installed)
+try:
+    from .backends.jax.gnn_network import GNNMeshNetwork
+except ImportError:
+    pass
+
 # Learning rate schedulers (backend-agnostic)
 from .backends import LRScheduler, ExponentialDecay, ReduceLROnPlateau
 
@@ -159,6 +165,8 @@ __all__ = [
     # Problems
     "Problem",
     "ProblemWeak",
+    # JAX-only mesh GNN
+    "GNNMeshNetwork",
     # Functional
     "derivative",
     "gradient",

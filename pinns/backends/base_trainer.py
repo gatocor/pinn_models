@@ -2892,12 +2892,13 @@ class BaseTrainer(ABC):
         if self.problem.solution is None:
             return None
         
-        # Sample points (uses abstract method - implemented by subclass)
-        x = np.random.uniform(
-            low=self.problem.xmin,
-            high=self.problem.xmax,
-            size=(n_points, self.problem.n_dims)
-        )
+        # For mesh domains: evaluate directly at the mesh nodes (same as the
+        # absolute-error plot) — avoids barycentric interpolation noise and is
+        # cheaper than random sampling.
+        if self._is_mesh_domain():
+            x = self.problem.domain._vertices
+        else:
+            x = self.problem.domain.sample_interior(n_points)
         
         y_pred = self.predict(x)
         y_true = self._call_solution(x)
@@ -2907,7 +2908,13 @@ class BaseTrainer(ABC):
         elif y_true.ndim == 1:
             y_true = y_true.reshape(-1, 1)
         
-        # Relative L2 error
-        error = np.sqrt(np.mean((y_pred - y_true) ** 2))
-        norm = np.sqrt(np.mean(y_true ** 2)) + 1e-10
-        return float(error / norm)
+        # Mask out rows where the reference returns NaN (e.g. points outside
+        # an irregular domain like a U-shape where the interpolator returns NaN).
+        valid = np.isfinite(y_true).all(axis=1) & np.isfinite(y_pred).all(axis=1)
+        if not valid.any():
+            return None
+        y_pred = y_pred[valid]
+        y_true = y_true[valid]
+
+        # MSE between predicted and reference solution
+        return float(np.mean((y_pred - y_true) ** 2))
