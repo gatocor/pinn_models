@@ -1323,6 +1323,174 @@ class ProblemWeak:
 
         return residual_fn
 
+    # ---------------------------------------------------------------------- #
+    #  LaTeX / display helpers                                               #
+    # ---------------------------------------------------------------------- #
+
+    def _latex_name(self, name: str) -> str:
+        """Convert a user-facing name into a LaTeX-safe label."""
+        if name is None:
+            return "unnamed"
+        name = str(name)
+        name = name.replace("\\", r"\backslash ")
+        name = name.replace("_", r"\_")
+        name = name.replace(" ", r"\ ")
+        return name
+
+    def _is_lagrange(self, name: str) -> bool:
+        """Check if a term name is in the lagrange_multipliers list."""
+        if not self.lagrange_multipliers:
+            return False
+        return name in self.lagrange_multipliers
+
+    def get_problem_latex(self, include_legend: bool = True) -> str:
+        """
+        Build a LaTeX representation of the weak-form optimization problem.
+
+        The loss has the structure::
+
+            min_theta  [max_lambda]  L(theta, lambda)
+
+        where each term is either a weighted quadratic ``w/N ||R||^2``
+        and/or an augmented-Lagrangian inner product
+        ``(1/N) <lambda, R>`` depending on ``lagrange_multipliers``.
+
+        The PDE term uses weak-form (integral) notation:
+
+            (w_pde / N_e) sum_e (∫_Ke ∇u_h · ∇φ dK)^2
+
+        Dirichlet BC terms use pointwise nodal residual notation.
+        Neumann BC terms are annotated as natural (line-integral) conditions.
+
+        Args:
+            include_legend: If True, append a legend block describing each symbol.
+
+        Returns:
+            A LaTeX string suitable for ``IPython.display.Math``.
+        """
+        terms = []
+        legend_terms = []
+        has_any_al = False
+        all_lambda_syms = []
+
+        # ── PDE (volume) term ────────────────────────────────────────────
+        pde_sym = self._latex_name("pde")
+        is_al_pde = self._is_lagrange("pde")
+
+        terms.append(
+            rf"\frac{{w_{{{pde_sym}}}}}{{N_e}}"
+            rf"\sum_e\!\left(\int_{{K_e}}\nabla u_h\cdot\nabla\phi\,dK\right)^2"
+        )
+        if is_al_pde:
+            has_any_al = True
+            all_lambda_syms.append(rf"\boldsymbol{{\lambda}}_{{{pde_sym}}}")
+            terms.append(
+                rf"\frac{{1}}{{N_e}}\langle\boldsymbol{{\lambda}}_{{{pde_sym}}},\,"
+                rf"\mathbf{{R}}_{{{pde_sym}}}\rangle"
+            )
+
+        if include_legend:
+            legend_terms.append(rf"K_e:\text{{ mesh element (triangle)}}")
+            legend_terms.append(rf"N_e:\text{{ number of elements}}")
+            legend_terms.append(rf"w_{{{pde_sym}}}:\text{{ PDE weight}}")
+            if is_al_pde:
+                legend_terms.append(
+                    rf"\boldsymbol{{\lambda}}_{{{pde_sym}}}:\text{{ Lagrange multipliers for PDE}}"
+                )
+
+        # ── Boundary condition terms ─────────────────────────────────────
+        # The quadratic ||B||^2 always appears (it is always in the loss).
+        # The Lagrange inner product <λ, B> is added only when the BC name
+        # is in lagrange_multipliers.
+        for bc in self.domain.boundary_conditions:
+            raw_name = getattr(bc, 'name', None) or "bc"
+            sym = self._latex_name(raw_name)
+            is_al_bc = self._is_lagrange(raw_name)
+            bc_type = getattr(bc, 'bc_type', 'dirichlet')
+
+            if bc_type == 'neumann':
+                # Natural BC — enters as a line integral on the RHS;
+                # shown as a boundary residual term ||R_N||^2
+                terms.append(
+                    rf"\frac{{w_{{{sym}}}}}{{N_{{{sym}}}}}"
+                    rf"\left\|\oint_{{\partial\Omega_{{{sym}}}}}"
+                    rf"\frac{{\partial u_h}}{{\partial n}}\phi\,dS\right\|_2^2"
+                )
+            else:
+                # Essential (Dirichlet) BC — pointwise nodal residual
+                terms.append(
+                    rf"\frac{{w_{{{sym}}}}}{{N_{{{sym}}}}}"
+                    rf"\left\|\mathcal{{B}}_{{{sym}}}\right\|_2^2"
+                )
+
+            if is_al_bc:
+                has_any_al = True
+                all_lambda_syms.append(rf"\boldsymbol{{\lambda}}_{{{sym}}}")
+                terms.append(
+                    rf"\frac{{1}}{{N_{{{sym}}}}}\langle\boldsymbol{{\lambda}}_{{{sym}}},\,"
+                    rf"\mathcal{{B}}_{{{sym}}}\rangle"
+                )
+
+            if include_legend:
+                if bc_type == 'neumann':
+                    legend_terms.append(
+                        rf"\partial\Omega_{{{sym}}}:\text{{ Neumann boundary segment }}{sym}"
+                    )
+                else:
+                    legend_terms.append(
+                        rf"\mathcal{{B}}_{{{sym}}}:\text{{ Dirichlet residual on }}{sym}"
+                    )
+                legend_terms.append(rf"N_{{{sym}}}:\text{{ BC nodes for }}{sym}")
+                legend_terms.append(rf"w_{{{sym}}}:\text{{ weight for }}{sym}")
+                if is_al_bc:
+                    legend_terms.append(
+                        rf"\boldsymbol{{\lambda}}_{{{sym}}}:\text{{ Lagrange multipliers for }}{sym}"
+                    )
+
+        # ── Assemble objective ───────────────────────────────────────────
+        obj_body = " + ".join(terms)
+        if has_any_al:
+            lam_vars = ",".join(all_lambda_syms)
+            operator = rf"\min_{{\theta}}\max_{{{lam_vars}}}\;"
+            objective = rf"\mathcal{{L}}(\theta,\boldsymbol{{\lambda}})={obj_body}"
+        else:
+            operator = rf"\min_{{\theta}}\;"
+            objective = rf"\mathcal{{L}}(\theta)={obj_body}"
+
+        lines = [rf"{operator}{objective}"]
+        if include_legend and legend_terms:
+            legend_block = (
+                r" \\[4pt] \begin{array}{l} "
+                + r" \\ ".join(legend_terms)
+                + r" \end{array}"
+            )
+            lines.append(legend_block)
+
+        return "".join(lines)
+
+    def show_problem(self, include_legend: bool = True) -> str:
+        """
+        Display the weak-form optimization problem in LaTeX.
+
+        Renders as a formatted math block in notebooks; falls back to
+        printing the LaTeX string in plain Python sessions.
+
+        Args:
+            include_legend: If True, append a legend for all symbols.
+
+        Returns:
+            The generated LaTeX string.
+        """
+        latex = self.get_problem_latex(include_legend=include_legend)
+        try:
+            from IPython.display import Math, display
+            display(Math(latex))
+        except Exception:
+            print(latex)
+        return latex
+
+    # ---------------------------------------------------------------------- #
+
     def __repr__(self):
         N = self.lagrange_order
         n_local = (N + 1) * (N + 2) // 2
