@@ -199,20 +199,26 @@ class Trainer(BaseTrainer):
     def _create_optimizer(self):
         """Create the optimizer with injectable hyperparameters for LR scheduling."""
         lr_scheduler = getattr(self, '_lr_scheduler', None)
-        
+        grad_clip    = getattr(self, '_grad_clip', None)
+
+        def _wrap(opt):
+            """Optionally prepend gradient clipping."""
+            if grad_clip is not None:
+                return optax.chain(optax.clip_by_global_norm(grad_clip), opt)
+            return opt
+
         if self.optimizer_name == "adam":
             if lr_scheduler is not None:
-                # Use inject_hyperparams to allow LR updates during training
-                return optax.inject_hyperparams(optax.adam)(learning_rate=self.learning_rate)
-            return optax.adam(self.learning_rate)
+                return _wrap(optax.inject_hyperparams(optax.adam)(learning_rate=self.learning_rate))
+            return _wrap(optax.adam(self.learning_rate))
         elif self.optimizer_name == "sgd":
             if lr_scheduler is not None:
-                return optax.inject_hyperparams(optax.sgd)(learning_rate=self.learning_rate)
-            return optax.sgd(self.learning_rate)
+                return _wrap(optax.inject_hyperparams(optax.sgd)(learning_rate=self.learning_rate))
+            return _wrap(optax.sgd(self.learning_rate))
         elif self.optimizer_name == "rmsprop":
             if lr_scheduler is not None:
-                return optax.inject_hyperparams(optax.rmsprop)(learning_rate=self.learning_rate)
-            return optax.rmsprop(self.learning_rate)
+                return _wrap(optax.inject_hyperparams(optax.rmsprop)(learning_rate=self.learning_rate))
+            return _wrap(optax.rmsprop(self.learning_rate))
         elif self.optimizer_name == "lbfgs":
             if not HAS_JAXOPT:
                 raise ImportError(
@@ -537,23 +543,36 @@ class Trainer(BaseTrainer):
         if _is_weak:
             _network = self.network
             _n_out = self.problem.n_outputs
-            if _n_out == 1:
-                def _u_and_grad(params, xy):
-                    def u_single(z):
-                        return _network.apply(params, z[None])[0, 0]
-                    return jax.value_and_grad(u_single)(xy)
+
+            if getattr(self.problem, 'n_time_steps', None) is not None:
+                # BPTT rollout mode: one scan over all time steps; no Lagrange needed.
+                # Override lagrangian mode — BCs are hard-constrained in the network.
+                self._is_lagrangian_mode = False
+                _weak_loss_fn = jax.jit(
+                    self.problem.make_rollout_loss_fn(_network)
+                )
+                self._weak_loss_fn   = _weak_loss_fn
+                self._weak_residual_fn = None
             else:
-                # Multi-output: return full Jacobian (n_out, n_dims)
-                def _u_and_grad(params, xy):
-                    def u_vec(z):
-                        return _network.apply(params, z[None])[0]  # (n_out,)
-                    u = u_vec(xy)
-                    jac = jax.jacobian(u_vec)(xy)  # (n_out, n_dims)
-                    return u, jac
-            _weak_loss_fn = jax.jit(self.problem.make_loss_fn(_u_and_grad, bc_weights=weights))
-            self._weak_loss_fn = _weak_loss_fn
-            self._weak_residual_fn = jax.jit(
-                self.problem.make_residual_vector_fn(_u_and_grad))
+                # Standard single-step weak-form path
+                _weak_params_dict = self.problem._build_params()
+                if _n_out == 1:
+                    def _u_and_grad(params, xy):
+                        def u_single(z):
+                            return _network.apply(params, z[None], _weak_params_dict)[0, 0]
+                        return jax.value_and_grad(u_single)(xy)
+                else:
+                    # Multi-output: return full Jacobian (n_out, n_dims)
+                    def _u_and_grad(params, xy):
+                        def u_vec(z):
+                            return _network.apply(params, z[None], _weak_params_dict)[0]  # (n_out,)
+                        u = u_vec(xy)
+                        jac = jax.jacobian(u_vec)(xy)  # (n_out, n_dims)
+                        return u, jac
+                _weak_loss_fn = jax.jit(self.problem.make_loss_fn(_u_and_grad, bc_weights=weights))
+                self._weak_loss_fn = _weak_loss_fn
+                self._weak_residual_fn = jax.jit(
+                    self.problem.make_residual_vector_fn(_u_and_grad))
         else:
             _weak_loss_fn = None
 
@@ -834,6 +853,41 @@ class Trainer(BaseTrainer):
             _train_lagrangian_mode_impl(self)
             return
 
+        # ── Time-step curriculum (BPTT rollout mode only) ────────────────
+        # If epochs_by_time_step is set, run progressive stages:
+        #   stage 1 → unroll 1 step  for epochs_by_time_step epochs
+        #   stage 2 → unroll 2 steps for epochs_by_time_step epochs
+        #   …
+        #   stage N → unroll N_TIME steps for epochs_by_time_step epochs
+        # Each stage re-JITs the rollout loss fn for the new scan length.
+        _ebt = getattr(self, '_epochs_by_time_step', None)
+        _n_time_max = getattr(self.problem, 'n_time_steps', None)
+        _in_curriculum = getattr(self, '_curriculum_running', False)
+        if _ebt is not None and _n_time_max is not None and not _in_curriculum:
+            self._curriculum_running = True
+            self._curriculum_total_epochs = _n_time_max * _ebt   # for display
+            saved_epochs = self._epochs
+            saved_n_time = self.problem.n_time_steps
+            try:
+                for _stage_steps in range(1, _n_time_max + 1):
+                    # Temporarily shrink n_time_steps so _make_jit_train_step
+                    # compiles the scan for exactly _stage_steps steps.
+                    self.problem.n_time_steps = _stage_steps
+                    self._epochs = _ebt
+                    # Expose stage info so print messages can show "Stage X/Y"
+                    self._curriculum_stage   = _stage_steps
+                    self._curriculum_n_stages = _n_time_max
+                    self.train()   # recursive call; _curriculum_running guards re-entry
+            finally:
+                self._curriculum_running = False
+                self._epochs = saved_epochs
+                self.problem.n_time_steps = saved_n_time
+                # Rebuild loss fn for the full rollout
+                self._weak_loss_fn = jax.jit(
+                    self.problem.make_rollout_loss_fn(self.network, n_steps=_n_time_max)
+                )
+            return
+
         epochs = self._epochs
         print_each = self._print_each
         show_plots = self._show_plots
@@ -854,19 +908,22 @@ class Trainer(BaseTrainer):
         n_batches = self._get_n_batches()
         use_batching = n_batches > 1
         
+        _in_cur = getattr(self, '_curriculum_running', False)
         if is_full_jit:
             train_step = result
-            if use_batching:
-                print(f"Starting training for {epochs} epochs, {n_batches} batches/epoch (JIT-compiled)...")
-            else:
-                print(f"Starting training for {epochs} epochs (JIT-compiled)...")
+            if not _in_cur:
+                if use_batching:
+                    print(f"Starting training for {epochs} epochs, {n_batches} batches/epoch (JIT-compiled)...")
+                else:
+                    print(f"Starting training for {epochs} epochs (JIT-compiled)...")
         else:
             grad_fn, apply_updates = result
-            if use_batching:
-                print(f"Starting training for {epochs} epochs, {n_batches} batches/epoch...")
-            else:
-                print(f"Starting training for {epochs} epochs...")
-                print("Note: For faster training, define PDE with 4th 'derivative' argument")
+            if not _in_cur:
+                if use_batching:
+                    print(f"Starting training for {epochs} epochs, {n_batches} batches/epoch...")
+                else:
+                    print(f"Starting training for {epochs} epochs...")
+                    print("Note: For faster training, define PDE with 4th 'derivative' argument")
         
         start_time = time.time()
         start_epoch = self._global_epoch
@@ -955,7 +1012,13 @@ class Trainer(BaseTrainer):
                 sol_error = self._compute_solution_error()
                 self.history['solution_error'].append(sol_error)
             
-            msg = (f"Epoch 0/{epochs + start_epoch} | "
+            _cur_stage  = getattr(self, '_curriculum_stage', None)
+            _n_stages   = getattr(self, '_curriculum_n_stages', None)
+            _tot_epochs = getattr(self, '_curriculum_total_epochs', None)
+            _stage_pfx  = f"Stage {_cur_stage}/{_n_stages} | " if _cur_stage is not None else ""
+            _ep_total   = _tot_epochs if _tot_epochs is not None else epochs
+            msg = (_stage_pfx +
+                   f"Epoch {start_epoch}/{_ep_total} | "
                    f"Loss: {full_train_loss:.2e} | "
                    f"MSE Loss: {full_train_loss:.2e} | "
                    f"PDE: {pde_loss:.2e} | "
@@ -1107,7 +1170,13 @@ class Trainer(BaseTrainer):
                     for name in bc_names
                 )
                 
-                msg = (f"Epoch {global_epoch + 1}/{epochs + start_epoch} | "
+                _cur_stage  = getattr(self, '_curriculum_stage', None)
+                _n_stages   = getattr(self, '_curriculum_n_stages', None)
+                _tot_epochs = getattr(self, '_curriculum_total_epochs', None)
+                _stage_pfx  = f"Stage {_cur_stage}/{_n_stages} | " if _cur_stage is not None else ""
+                _ep_total   = _tot_epochs if _tot_epochs is not None else epochs + start_epoch
+                msg = (_stage_pfx +
+                       f"Epoch {global_epoch + 1}/{_ep_total} | "
                        f"Loss: {full_train_loss:.2e} | "
                        f"MSE Loss: {full_train_loss:.2e} | "
                        f"PDE: {pde_loss:.2e} | "
@@ -1118,7 +1187,12 @@ class Trainer(BaseTrainer):
                 if self.problem.solution is not None:
                     msg += f" | Error: {self.history['solution_error'][-1]:.2e}"
                 print(msg)
-                
+
+                # User-supplied periodic callback: plot_callback(epoch, trainer)
+                _cb = getattr(self, '_plot_callback', None)
+                if _cb is not None:
+                    _cb(global_epoch + 1, self)
+
                 if show_plots or save_plots:
                     if save_plots:
                         plot_path = f"{save_plots}_epoch{global_epoch:05d}.png"
@@ -1133,13 +1207,23 @@ class Trainer(BaseTrainer):
                     )
         
         self._global_epoch += epochs
-        print(f"Training complete in {time.time() - start_time:.1f}s")
+        if not getattr(self, '_curriculum_running', False):
+            print(f"Training complete in {time.time() - start_time:.1f}s")
         self._curriculum_restore()
         
         # Close figure to prevent duplicate display in notebooks
         if is_notebook() and show_plots and self._fig is not None:
             plt.close(self._fig)
-    
+
+    def _curriculum_restore(self):
+        """Clear per-stage display attributes after a stage's train() call ends."""
+        # Only clear when not inside an active curriculum loop.
+        # The outer curriculum dispatcher will set _curriculum_stage for the next stage.
+        if not getattr(self, '_curriculum_running', False):
+            self._curriculum_stage         = None
+            self._curriculum_n_stages      = None
+            self._curriculum_total_epochs  = None
+
     def _train_lbfgs(self, epochs, print_each, show_plots, save_plots, 
                      params_dict, weights):
         """

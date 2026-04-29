@@ -677,6 +677,8 @@ class ProblemWeak:
     obs_fn: Optional[Callable] = field(default=None)
     obs_names: Optional[List[str]] = field(default=None)
     obs_spatial: Optional[List[str]] = field(default=None)
+    n_time_points: Optional[int] = None
+    n_time_steps: Optional[int] = None
 
     # ── filled by __post_init__ ──────────────────────────────────────────
     cubature_data:    Dict       = field(init=False, default_factory=dict)
@@ -921,6 +923,47 @@ class ProblemWeak:
         self.node_norm = _node_norm.astype(np.float32)
         del self._support_vol_tmp   # no longer needed
 
+        # ── Space-time extension: tile spatial cubature with time samples ─────
+        # When domain has a t_interval the cubature points are extended from
+        # (F, Q, 2) to (n_t*F, Q, n_dims) by tiling faces for each sampled
+        # time value.  test functions (φ, ∇φ) are purely spatial and simply
+        # repeated.  Weights are scaled by Δt so the einsum integrates over
+        # [t_min, t_max] correctly.
+        _t_min = getattr(self.domain, '_t_min', None)
+        _t_max = getattr(self.domain, '_t_max', None)
+        if _t_min is not None and _t_max is not None:
+            n_t = self.n_time_points if (self.n_time_points is not None) else 10
+            _dt = (_t_max - _t_min) / n_t
+            # Mid-point rule: t_i = t_min + (i + 0.5)*dt
+            t_vals = _t_min + (np.arange(n_t) + 0.5) * _dt  # (n_t,)
+            cd = self.cubature_data
+            F, Q, _ = cd['pts'].shape
+            # pts: (F, Q, 2) → (n_t, F, Q, 3) → (n_t*F, Q, 3)
+            pts_xy   = cd['pts']                                    # (F, Q, 2)
+            t_col    = np.broadcast_to(
+                t_vals[:, None, None, None], (n_t, F, Q, 1)
+            ).copy()                                                 # (n_t, F, Q, 1)
+            pts_xy4d = np.broadcast_to(
+                pts_xy[None], (n_t, F, Q, 2)
+            ).copy()                                                 # (n_t, F, Q, 2)
+            pts_st   = np.concatenate([pts_xy4d, t_col], axis=-1)   # (n_t, F, Q, 3)
+            pts_st   = pts_st.reshape(n_t * F, Q, 3).astype(np.float32)
+            # weights scaled by dt (time integration weight)
+            weights_st  = np.tile(cd['weights'],   (n_t, 1)) * _dt  # (n_t*F, Q)
+            phi_st      = np.tile(cd['phi'],       (n_t, 1, 1))     # (n_t*F, Q, L)
+            gphi_st     = np.tile(cd['grad_phi'],  (n_t, 1, 1, 1))  # (n_t*F, Q, L, 2)
+            node_ids_st = np.tile(cd['node_ids'],  (n_t, 1))        # (n_t*F, L)
+            self.cubature_data = {
+                'pts':       pts_st,
+                'weights':   weights_st.astype(np.float32),
+                'phi':       phi_st.astype(np.float32),
+                'grad_phi':  gphi_st.astype(np.float32),
+                'node_ids':  node_ids_st,
+                'dof_coords':   cd['dof_coords'],
+                'edge_to_dofs': cd['edge_to_dofs'],
+                'free_mask':    cd['free_mask'],
+            }
+
         # ── output_range ────────────────────────────────────────────────
         if self.output_range is not None:
             if (isinstance(self.output_range, tuple)
@@ -959,6 +1002,106 @@ class ProblemWeak:
             "infer":    {},
             "internal": internal or {'global_step': 0, 'step': 0},
         }
+
+    def make_rollout_loss_fn(self, network, n_steps=None):
+        """
+        Return a JIT-able ``loss_fn(params) -> scalar`` that unrolls the GNN
+        state-integrator over ``n_time_steps`` steps via ``jax.lax.scan`` and
+        backpropagates through the entire trajectory (BPTT).
+
+        The GNN must have been built with ``use_state=True``; the current
+        nodal state is kept as the scan carry and updated by calling
+        ``network.apply`` at mesh-node positions after each step.
+
+        Parameters
+        ----------
+        network : GNNMeshNetwork
+            The state-integrator network.  Its ``apply(params, x, params_dict)``
+            is called with ``params_dict["fixed"]["u_prev_nodes"]`` set to the
+            current carry.
+        n_steps : int, optional
+            Number of time steps to unroll.  If ``None`` (default) the value
+            of ``self.n_time_steps`` is used.  Pass an explicit value to
+            implement a time-step curriculum without changing the problem.
+
+        Returns
+        -------
+        loss_fn : callable
+            ``loss_fn(params) -> scalar`` — suitable for ``jax.jit`` and
+            ``jax.value_and_grad``.
+        """
+        if self.n_time_steps is None:
+            raise ValueError(
+                "make_rollout_loss_fn requires n_time_steps to be set on ProblemWeak."
+            )
+        import jax
+        import jax.numpy as jnp
+
+        cd     = self.cubature_data
+        _phi   = jnp.asarray(cd['phi'],      dtype=jnp.float32)  # (F, Q, L)
+        _gph   = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)  # (F, Q, L, 2)
+        _wts   = jnp.asarray(cd['weights'],  dtype=jnp.float32)  # (F, Q)
+        _nid   = jnp.asarray(cd['node_ids'], dtype=jnp.int32)    # (F, L)
+        _pts   = jnp.asarray(cd['pts'],      dtype=jnp.float32)  # (F, Q, 2)
+
+        F, Q, L   = _phi.shape
+        N_cub_pts = F * Q
+        n_dofs    = self.n_dofs
+
+        _phi_f = _phi.reshape(N_cub_pts, L)
+        _gph_f = _gph.reshape(N_cub_pts, L, 2)
+        _wts_f = _wts.reshape(N_cub_pts)
+        _pts_f = _pts.reshape(N_cub_pts, 2)
+        _nid_f = jnp.tile(_nid[:, None, :], (1, Q, 1)).reshape(N_cub_pts, L)
+
+        _free   = jnp.asarray(self.free_nodes, dtype=jnp.int32)
+        _dt     = jnp.float32(self.params["dt"])
+        _kappa  = jnp.float32(self.params.get("kappa", 1.0))
+        _n_time = n_steps if n_steps is not None else self.n_time_steps
+        _net    = network
+        _mesh   = jnp.asarray(self.domain._vertices, dtype=jnp.float32)
+
+        def loss_fn(params):
+            def step_fn(u_nodes, _):
+                # P1-interpolate u^n to cubature points
+                u_prev_cub = jnp.sum(_phi_f * u_nodes[_nid_f], axis=-1)   # (Nc,)
+
+                pdict = {"fixed": {
+                    "u_prev_nodes": u_nodes,
+                    "u_prev":       u_prev_cub,
+                    "dt":           _dt,
+                    "kappa":        _kappa,
+                    "t_cur":        jnp.float32(0.0),
+                }}
+
+                # ── Single GNN call at all mesh nodes ────────────────────
+                # Avoids per-cubature-point vmap+AD (which was N_cub GNN calls).
+                u_next_nodes = _net.apply(params, _mesh, pdict)[:, 0]   # (n_dofs,)
+
+                # P1 interpolate u^{n+1} to cubature points
+                u_vals = jnp.sum(_phi_f * u_next_nodes[_nid_f], axis=-1)   # (Nc,)
+
+                # P1 gradient at cubature points: grad_u = sum_j u_j * grad_phi_j
+                # _gph_f: (Nc, L, 2), _nid_f: (Nc, L), u_next_nodes[_nid_f]: (Nc, L)
+                grad_u = jnp.einsum('kl,kli->ki', u_next_nodes[_nid_f], _gph_f)  # (Nc, 2)
+
+                # Assemble Galerkin residual vector
+                mass_term = _phi_f * ((u_vals - u_prev_cub) / _dt)[:, None]        # (Nc, L)
+                diff_term = _kappa * jnp.einsum('ki,kli->kl', grad_u, _gph_f)      # (Nc, L)
+                contrib   = (mass_term + diff_term) * _wts_f[:, None]               # (Nc, L)
+
+                R = jnp.zeros(n_dofs, dtype=jnp.float32)
+                R = R.at[_nid_f.reshape(-1)].add(contrib.reshape(-1))
+
+                step_loss = jnp.mean(R[_free] ** 2)
+
+                return u_next_nodes, step_loss
+
+            u0 = jnp.zeros(n_dofs, dtype=jnp.float32)   # IC: u = 0
+            _, step_losses = jax.lax.scan(step_fn, u0, None, length=_n_time)
+            return jnp.mean(step_losses)
+
+        return loss_fn
 
     def make_loss_fn(self, u_and_grad_fn, bc_weights: dict = None):
         """
@@ -1025,8 +1168,10 @@ class ProblemWeak:
                 'free_nodes': jnp.asarray(bc_free, dtype=jnp.int32) if bc_free else None,
             })
 
+        _n_pts_dims = pts_jax.shape[-1]  # 2 for spatial-only, 3 for space-time
+
         def loss_fn(params):
-            pts_flat = pts_jax.reshape(-1, 2)                         # (F*Q, 2)
+            pts_flat = pts_jax.reshape(-1, _n_pts_dims)               # (F*Q, n_dims)
 
             # Evaluate u and ∇u / full Jacobian at all quadrature points
             u_flat, grad_u_flat = jax.vmap(
@@ -1093,7 +1238,8 @@ class ProblemWeak:
 
             # ── Subtract boundary traction RHS  ∫_Γ t_k · φ_j ds ──────────────
             for _bj in _bdata_jax:
-                _bpts_flat  = _bj['pts'].reshape(-1, 2)          # (E*Q, 2)
+                _bp_ndims   = _bj['pts'].shape[-1]
+                _bpts_flat  = _bj['pts'].reshape(-1, _bp_ndims)   # (E*Q, n_dims)
                 _bw         = _bj['weights']                     # (E, Q)
                 _bphi_mat   = _bj['phi']                         # (E, Q, 2)
                 _beid       = _bj['edge_ids']                    # (E, 2)
@@ -1220,8 +1366,10 @@ class ProblemWeak:
                 'fn':       _bd['fn'],
             })
 
+        _n_pts_dims_r = pts_jax.shape[-1]
+
         def residual_fn(params):
-            pts_flat = pts_jax.reshape(-1, 2)
+            pts_flat = pts_jax.reshape(-1, _n_pts_dims_r)
             u_flat, grad_u_flat = jax.vmap(
                 lambda xy: u_and_grad_fn(params, xy))(pts_flat)
 
@@ -1273,7 +1421,8 @@ class ProblemWeak:
 
             # ── Subtract boundary traction RHS  ∫_Γ t_k · φ_j ds ──────────────
             for _bj in _bdata_jax:
-                _bpts_flat  = _bj['pts'].reshape(-1, 2)
+                _bp_ndims_r = _bj['pts'].shape[-1]
+                _bpts_flat  = _bj['pts'].reshape(-1, _bp_ndims_r)
                 _bw         = _bj['weights']
                 _bphi_mat   = _bj['phi']
                 _beid       = _bj['edge_ids']

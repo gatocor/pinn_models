@@ -325,6 +325,7 @@ class GNNMeshNetwork:
         input_transform: Optional[Callable] = None,
         output_transform: Optional[Callable] = None,
         hard_constraints: bool = True,
+        use_state: bool = False,
     ):
         if domain._spatial_dims != 2:
             raise NotImplementedError(
@@ -332,12 +333,23 @@ class GNNMeshNetwork:
                 f"(got spatial_dims={domain._spatial_dims})."
             )
 
+        # ---- Time interval (optional) --------------------------------------
+        t_interval = getattr(domain, 't_interval', None)
+        self.has_time = t_interval is not None
+        if self.has_time:
+            self.t_min = float(t_interval[0])
+            self.t_max = float(t_interval[1])
+        else:
+            self.t_min = None
+            self.t_max = None
+
         self.hidden_dim     = hidden_dim
         self.poly_order     = poly_order
         self.message_steps  = message_steps
         self.n_outputs      = n_outputs
         self.activation     = activation
         self.encoder_act    = encoder_act
+        self.use_state      = use_state
         self.normalize_input = normalize_input
         self.input_transform = input_transform
         self.output_transform = output_transform
@@ -392,8 +404,13 @@ class GNNMeshNetwork:
         self._edge_weights = jnp.array(edge_w, dtype=jnp.float32)
 
         # ---- Flax GNN module ------------------------------------------------
+        # When a time interval is present the encoder receives an extra
+        # normalised time feature broadcast to every node: (x, y, t_norm).
+        # When use_state is True the previous solution u^n is concatenated as
+        # additional node features, making the GNN a learned step-integrator.
+        encoder_input_dims = self.spatial_dims + (1 if self.has_time else 0) + (n_outputs if use_state else 0)
         self._module = _GNNModule(
-            spatial_dims  = self.spatial_dims,
+            spatial_dims  = encoder_input_dims,
             hidden_dim    = hidden_dim,
             poly_order    = poly_order,
             message_steps = message_steps,
@@ -418,6 +435,12 @@ class GNNMeshNetwork:
             from pinns.boundary import MeshNodeBC
             for bc in getattr(domain, 'boundary_conditions', []):
                 if not (isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet'):
+                    continue
+                # Only hard-constrain BCs that apply at ALL times (or spatial-only).
+                # BCs with t_mode="t_min"/"t_max" are time-restricted (e.g. initial
+                # conditions) and must be soft-enforced by the trainer instead.
+                t_mode = getattr(bc, 't_mode', None)
+                if t_mode not in (None, 'all'):
                     continue
                 comp = bc.component
                 if comp >= n_outputs:
@@ -459,9 +482,21 @@ class GNNMeshNetwork:
         -------
         dict : Flax parameter tree
         """
+        # Use the correct node feature shape for parameter initialisation.
+        # For time-augmented domains pass a dummy t=0 column so the encoder
+        # sees (x_norm, y_norm, t_norm) with the right dimensionality.
+        if self.has_time:
+            dummy_t = jnp.zeros((self.n_nodes, 1), dtype=jnp.float32)
+            init_feats = jnp.concatenate([self._nodes_norm, dummy_t], axis=-1)
+        else:
+            init_feats = self._nodes_norm
+        if self.use_state:
+            dummy_state = jnp.zeros((self.n_nodes, self.n_outputs), dtype=jnp.float32)
+            init_feats = jnp.concatenate([init_feats, dummy_state], axis=-1)
+
         return self._module.init(
             rng,
-            self._nodes_norm,
+            init_feats,
             self._edge_src,
             self._edge_dst,
             self._edge_weights,
@@ -506,19 +541,44 @@ class GNNMeshNetwork:
         if self.input_transform is not None:
             x = self.input_transform(x, params_dict)
 
-        # Normalise query coords to [-1, 1]
+        # Normalise query coords to [-1, 1].
+        # Slice input_min/max to x.shape[-1] so that purely-spatial BC queries
+        # (shape (n, 2)) and space-time queries (shape (n, 3)) both work when
+        # the domain carries a t_interval (making input_min shape (3,)).
         if self.normalize_input and self.input_min is not None:
-            x_norm = (2.0 * (x - self.input_min)
-                      / (self.input_max - self.input_min + 1e-8) - 1.0)
+            n_q_dims = x.shape[-1]
+            imin = self.input_min[:n_q_dims]
+            imax = self.input_max[:n_q_dims]
+            x_norm = (2.0 * (x - imin) / (imax - imin + 1e-8) - 1.0)
         else:
             x_norm = x   # use as-is for spatial interpolation below
 
         # --- GNN forward pass on fixed mesh ---------------------------------
-        # Node features are always the normalised *mesh* node coordinates,
-        # independent of the query batch.
+        # Node features are the normalised mesh node coordinates.
+        # When the domain has a time interval, the mean t of the query batch
+        # is normalised to [-1, 1] and broadcast as an extra feature to every
+        # node: node_feats shape (n_nodes, spatial_dims + 1).
+        if self.has_time:
+            t_raw = jnp.mean(x_original[:, self.spatial_dims])
+            t_norm_val = (2.0 * (t_raw - self.t_min)
+                          / (self.t_max - self.t_min + 1e-8) - 1.0)
+            t_broadcast = jnp.full((self.n_nodes, 1), t_norm_val, dtype=jnp.float32)
+            node_feats = jnp.concatenate([self._nodes_norm, t_broadcast], axis=-1)
+        else:
+            node_feats = self._nodes_norm
+        # State-integrator mode: append u^n nodal values as extra node features.
+        # u_prev_nodes is read from params_dict["fixed"]["u_prev_nodes"] and
+        # has shape (n_nodes, n_outputs) or (n_nodes,) for scalar problems.
+        if self.use_state:
+            u_prev_nodes = params_dict["fixed"]["u_prev_nodes"]  # (n_nodes, n_out) or (n_nodes,)
+            u_prev_nodes = jnp.asarray(u_prev_nodes, dtype=jnp.float32)
+            if u_prev_nodes.ndim == 1:
+                u_prev_nodes = u_prev_nodes[:, None]              # (n_nodes, n_out)
+            node_feats = jnp.concatenate([node_feats, u_prev_nodes], axis=-1)
+
         node_coeffs = self._module.apply(
             params,
-            self._nodes_norm,
+            node_feats,
             self._edge_src,
             self._edge_dst,
             self._edge_weights,
@@ -597,9 +657,14 @@ class GNNMeshNetwork:
         -------
         np.ndarray, shape ``(n_nodes, n_outputs)``
         """
+        if self.has_time:
+            dummy_t = jnp.zeros((self.n_nodes, 1), dtype=jnp.float32)
+            feats = jnp.concatenate([self._nodes_norm, dummy_t], axis=-1)
+        else:
+            feats = self._nodes_norm
         coeffs = self._module.apply(
             params,
-            self._nodes_norm,
+            feats,
             self._edge_src,
             self._edge_dst,
             self._edge_weights,
@@ -620,10 +685,12 @@ class GNNMeshNetwork:
         return self
 
     def __repr__(self) -> str:
+        time_str = (f", t_interval=[{self.t_min}, {self.t_max}]"
+                    if self.has_time else "")
         return (
             f"GNNMeshNetwork("
             f"n_nodes={self.n_nodes}, n_faces={self.n_faces}, "
             f"hidden_dim={self.hidden_dim}, poly_order={self.poly_order}, "
             f"message_steps={self.message_steps}, n_outputs={self.n_outputs}, "
-            f"hard_constraints={self.hard_constraints})"
+            f"hard_constraints={self.hard_constraints}{time_str})"
         )

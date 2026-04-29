@@ -340,6 +340,7 @@ class BaseTrainer(ABC):
         self._epochs = 1000
         self._print_each = 100
         self._show_plots = False
+        self._plot_callback = None
         self._save_plots = None
         self._show_subdomains = {'solution': False, 'residuals': False, 'zoom': False}
         self._show_sampling_points = {'solution': False, 'residuals': False, 'zoom': False}
@@ -642,6 +643,15 @@ class BaseTrainer(ABC):
         plot_kwargs: Optional[Dict[str, Any]] = None,
         # Plot style
         plot_style: Optional[Dict[str, Any]] = None,
+        # Periodic callback: called as plot_callback(epoch, trainer) every print_each steps
+        plot_callback: Optional[callable] = None,
+        # Time-step curriculum for BPTT rollout mode
+        # Train epochs_by_time_step epochs with 1 step, then 2 steps, …, up to n_time_steps.
+        # Each stage runs epochs_by_time_step epochs.  Set to None to disable.
+        epochs_by_time_step: Optional[int] = None,
+        # Gradient clipping: clip global gradient norm to this value. Useful for BPTT.
+        # Set to None (default) to disable.
+        grad_clip: Optional[float] = None,
     ):
         """
         Configure training parameters.
@@ -674,6 +684,11 @@ class BaseTrainer(ABC):
             adaptive_c: Offset for uniform sampling in RAR mode. Higher c = more uniform. Default: 1.0.
             adaptive_factor: Oversampling factor for RAR mode. Sample factor*n points, then select n. Default: 2.
             lr_scheduler: Learning rate scheduler (e.g., ExponentialDecay). If None, constant learning rate.
+            epochs_by_time_step: Time-step curriculum for BPTT rollout mode.  When set to an
+                integer N, ``train()`` runs N epochs with 1 rollout step, then N epochs
+                with 2 rollout steps, …, up to ``problem.n_time_steps`` rollout steps.
+                Each stage re-JITs the scan for the new length.  Set to ``None`` (default)
+                to train on the full rollout from the start.
             curriculum_t_ends: Progressive domain schedule — list of end values for the chosen
                 input dimension (e.g. [2.0, 5.0, 10.0]). Training starts sampling up to
                 curriculum_t_ends[0], advances to curriculum_t_ends[1] after
@@ -785,6 +800,12 @@ class BaseTrainer(ABC):
         # Check if SOAP params changed
         if soap_params is not None and soap_params != old_soap_params:
             optimizer_changed = True
+
+        # Check if grad_clip changed
+        old_grad_clip = getattr(self, '_grad_clip', None)
+        self._grad_clip = grad_clip
+        if grad_clip != old_grad_clip:
+            optimizer_changed = True
         
         if self.optimizer is None or optimizer_changed:
             self.optimizer = self._create_optimizer()
@@ -794,6 +815,8 @@ class BaseTrainer(ABC):
         self._print_each = print_each
         self._show_plots = show_plots
         self._save_plots = save_plots
+        self._plot_callback = plot_callback
+        self._epochs_by_time_step = epochs_by_time_step
         self._plot_kwargs = plot_kwargs if plot_kwargs is not None else {}
         self._plot_style = plot_style if plot_style is not None else {}
         
