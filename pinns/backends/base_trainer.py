@@ -652,6 +652,11 @@ class BaseTrainer(ABC):
         # Gradient clipping: clip global gradient norm to this value. Useful for BPTT.
         # Set to None (default) to disable.
         grad_clip: Optional[float] = None,
+        # Mini-batch over test functions (faces) for BPTT rollout.
+        # Each training step uses a random subset of face_batch_size elements instead
+        # of all F faces.  Reduces per-step cost; acts as stochastic regularisation.
+        # Set to None (default) to use all faces (full Galerkin).
+        face_batch_size: Optional[int] = None,
     ):
         """
         Configure training parameters.
@@ -806,6 +811,11 @@ class BaseTrainer(ABC):
         self._grad_clip = grad_clip
         if grad_clip != old_grad_clip:
             optimizer_changed = True
+
+        old_face_batch = getattr(self, '_rollout_face_batch', None)
+        self._rollout_face_batch = face_batch_size
+        if face_batch_size != old_face_batch:
+            optimizer_changed = True   # force recompile of loss fn
         
         if self.optimizer is None or optimizer_changed:
             self.optimizer = self._create_optimizer()

@@ -1003,32 +1003,28 @@ class ProblemWeak:
             "internal": internal or {'global_step': 0, 'step': 0},
         }
 
-    def make_rollout_loss_fn(self, network, n_steps=None):
+    def make_rollout_loss_fn(self, network, n_steps=None, face_batch_size=None):
         """
-        Return a JIT-able ``loss_fn(params) -> scalar`` that unrolls the GNN
-        state-integrator over ``n_time_steps`` steps via ``jax.lax.scan`` and
-        backpropagates through the entire trajectory (BPTT).
-
-        The GNN must have been built with ``use_state=True``; the current
-        nodal state is kept as the scan carry and updated by calling
-        ``network.apply`` at mesh-node positions after each step.
+        Return a JIT-able loss function that unrolls the GNN state-integrator
+        over ``n_steps`` time steps via ``jax.lax.scan`` (BPTT).
 
         Parameters
         ----------
         network : GNNMeshNetwork
-            The state-integrator network.  Its ``apply(params, x, params_dict)``
-            is called with ``params_dict["fixed"]["u_prev_nodes"]`` set to the
-            current carry.
         n_steps : int, optional
-            Number of time steps to unroll.  If ``None`` (default) the value
-            of ``self.n_time_steps`` is used.  Pass an explicit value to
-            implement a time-step curriculum without changing the problem.
+            Number of time steps to unroll (defaults to ``self.n_time_steps``).
+        face_batch_size : int, optional
+            If set, ``loss_fn`` expects a second argument ``face_idx`` of shape
+            ``(face_batch_size,)`` containing the face indices to use for the
+            residual in each training step.  The GNN forward pass always runs on
+            **all** mesh nodes; only the weak-form assembly is restricted to the
+            selected faces.  Pass ``None`` (default) to use all faces.
 
         Returns
         -------
         loss_fn : callable
-            ``loss_fn(params) -> scalar`` — suitable for ``jax.jit`` and
-            ``jax.value_and_grad``.
+            * No batching: ``loss_fn(params) -> scalar``
+            * With batching: ``loss_fn(params, face_idx) -> scalar``
         """
         if self.n_time_steps is None:
             raise ValueError(
@@ -1037,22 +1033,15 @@ class ProblemWeak:
         import jax
         import jax.numpy as jnp
 
-        cd     = self.cubature_data
-        _phi   = jnp.asarray(cd['phi'],      dtype=jnp.float32)  # (F, Q, L)
-        _gph   = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)  # (F, Q, L, 2)
-        _wts   = jnp.asarray(cd['weights'],  dtype=jnp.float32)  # (F, Q)
-        _nid   = jnp.asarray(cd['node_ids'], dtype=jnp.int32)    # (F, L)
-        _pts   = jnp.asarray(cd['pts'],      dtype=jnp.float32)  # (F, Q, 2)
+        cd   = self.cubature_data
+        # Keep face-level arrays (F, Q, L) so we can index by face_idx
+        _phi = jnp.asarray(cd['phi'],      dtype=jnp.float32)  # (F, Q, L)
+        _gph = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)  # (F, Q, L, 2)
+        _wts = jnp.asarray(cd['weights'],  dtype=jnp.float32)  # (F, Q)
+        _nid = jnp.asarray(cd['node_ids'], dtype=jnp.int32)    # (F, L)
 
-        F, Q, L   = _phi.shape
-        N_cub_pts = F * Q
-        n_dofs    = self.n_dofs
-
-        _phi_f = _phi.reshape(N_cub_pts, L)
-        _gph_f = _gph.reshape(N_cub_pts, L, 2)
-        _wts_f = _wts.reshape(N_cub_pts)
-        _pts_f = _pts.reshape(N_cub_pts, 2)
-        _nid_f = jnp.tile(_nid[:, None, :], (1, Q, 1)).reshape(N_cub_pts, L)
+        F, Q, L = _phi.shape
+        n_dofs  = self.n_dofs
 
         _free   = jnp.asarray(self.free_nodes, dtype=jnp.int32)
         _dt     = jnp.float32(self.params["dt"])
@@ -1061,11 +1050,40 @@ class ProblemWeak:
         _net    = network
         _mesh   = jnp.asarray(self.domain._vertices, dtype=jnp.float32)
 
-        def loss_fn(params):
-            def step_fn(u_nodes, _):
-                # P1-interpolate u^n to cubature points
-                u_prev_cub = jnp.sum(_phi_f * u_nodes[_nid_f], axis=-1)   # (Nc,)
+        # ── Helper: assemble residual from (possibly subsetted) face arrays ──
+        def _step_body(u_nodes, phi_b, gph_b, wts_b, nid_b):
+            """One implicit-Euler scan step.  *_b arrays cover a subset of faces."""
+            B = phi_b.shape[0]           # faces in this batch
+            Nc = B * Q
+            phi_f = phi_b.reshape(Nc, L)
+            gph_f = gph_b.reshape(Nc, L, 2)
+            wts_f = wts_b.reshape(Nc)
+            nid_f = jnp.tile(nid_b[:, None, :], (1, Q, 1)).reshape(Nc, L)
 
+            u_prev_cub = jnp.sum(phi_f * u_nodes[nid_f], axis=-1)   # (Nc,)
+
+            pdict = {"fixed": {
+                "u_prev_nodes": u_nodes,
+                "u_prev":       u_prev_cub,
+                "dt":           _dt,
+                "kappa":        _kappa,
+                "t_cur":        jnp.float32(0.0),
+            }}
+
+            # GNN forward on ALL mesh nodes (BCs hard-constrained in GNN)
+            u_next_nodes = _net.apply(u_nodes_params := None or {}, _mesh, pdict)
+            # ↑ _net.apply takes (params, x, params_dict); params passed via closure below
+
+        # _step_body above uses a closure trick; define proper versions below.
+        # ── Full-batch version ───────────────────────────────────────────────
+        _phi_f_full = _phi.reshape(F * Q, L)
+        _gph_f_full = _gph.reshape(F * Q, L, 2)
+        _wts_f_full = _wts.reshape(F * Q)
+        _nid_f_full = jnp.tile(_nid[:, None, :], (1, Q, 1)).reshape(F * Q, L)
+
+        def _make_step_fn(phi_f, gph_f, wts_f, nid_f):
+            def step_fn(u_nodes, _):
+                u_prev_cub = jnp.sum(phi_f * u_nodes[nid_f], axis=-1)
                 pdict = {"fixed": {
                     "u_prev_nodes": u_nodes,
                     "u_prev":       u_prev_cub,
@@ -1073,33 +1091,62 @@ class ProblemWeak:
                     "kappa":        _kappa,
                     "t_cur":        jnp.float32(0.0),
                 }}
+                u_next_nodes = _net.apply(step_fn._params, _mesh, pdict)
+                # params injected at call time via the carry trick below
+                raise RuntimeError("unreachable")
+            return step_fn
 
-                # ── Single GNN call at all mesh nodes ────────────────────
-                # Avoids per-cubature-point vmap+AD (which was N_cub GNN calls).
-                u_next_nodes = _net.apply(params, _mesh, pdict)[:, 0]   # (n_dofs,)
-
-                # P1 interpolate u^{n+1} to cubature points
-                u_vals = jnp.sum(_phi_f * u_next_nodes[_nid_f], axis=-1)   # (Nc,)
-
-                # P1 gradient at cubature points: grad_u = sum_j u_j * grad_phi_j
-                # _gph_f: (Nc, L, 2), _nid_f: (Nc, L), u_next_nodes[_nid_f]: (Nc, L)
-                grad_u = jnp.einsum('kl,kli->ki', u_next_nodes[_nid_f], _gph_f)  # (Nc, 2)
-
-                # Assemble Galerkin residual vector
-                mass_term = _phi_f * ((u_vals - u_prev_cub) / _dt)[:, None]        # (Nc, L)
-                diff_term = _kappa * jnp.einsum('ki,kli->kl', grad_u, _gph_f)      # (Nc, L)
-                contrib   = (mass_term + diff_term) * _wts_f[:, None]               # (Nc, L)
-
+        # Proper implementation without the helper trick:
+        def _build_step_fn(phi_f, gph_f, wts_f, nid_f):
+            def step_fn(carry, _):
+                params, u_nodes = carry
+                u_prev_cub = jnp.sum(phi_f * u_nodes[nid_f], axis=-1)
+                pdict = {"fixed": {
+                    "u_prev_nodes": u_nodes,
+                    "u_prev":       u_prev_cub,
+                    "dt":           _dt,
+                    "kappa":        _kappa,
+                    "t_cur":        jnp.float32(0.0),
+                }}
+                u_next_nodes = _net.apply(params, _mesh, pdict)[:, 0]
+                grad_u    = jnp.einsum('kl,kli->ki', u_next_nodes[nid_f], gph_f)
+                u_vals    = jnp.sum(phi_f * u_next_nodes[nid_f], axis=-1)
+                mass_term = phi_f * ((u_vals - u_prev_cub) / _dt)[:, None]
+                diff_term = _kappa * jnp.einsum('ki,kli->kl', grad_u, gph_f)
+                contrib   = (mass_term + diff_term) * wts_f[:, None]
                 R = jnp.zeros(n_dofs, dtype=jnp.float32)
-                R = R.at[_nid_f.reshape(-1)].add(contrib.reshape(-1))
-
+                R = R.at[nid_f.reshape(-1)].add(contrib.reshape(-1))
                 step_loss = jnp.mean(R[_free] ** 2)
+                return (params, u_next_nodes), step_loss
+            return step_fn
 
-                return u_next_nodes, step_loss
+        if face_batch_size is None:
+            # ── Full-batch: loss_fn(params) ──────────────────────────────
+            _step = _build_step_fn(_phi_f_full, _gph_f_full, _wts_f_full, _nid_f_full)
 
-            u0 = jnp.zeros(n_dofs, dtype=jnp.float32)   # IC: u = 0
-            _, step_losses = jax.lax.scan(step_fn, u0, None, length=_n_time)
-            return jnp.mean(step_losses)
+            def loss_fn(params):
+                u0 = jnp.zeros(n_dofs, dtype=jnp.float32)
+                (_, _), step_losses = jax.lax.scan(_step, (params, u0), None, length=_n_time)
+                return jnp.mean(step_losses)
+
+        else:
+            # ── Mini-batch: loss_fn(params, face_idx) ────────────────────
+            # face_idx: (face_batch_size,) int32 — sampled at Python level each step
+
+            def loss_fn(params, face_idx):
+                phi_b = _phi[face_idx]            # (B, Q, L)
+                gph_b = _gph[face_idx]            # (B, Q, L, 2)
+                wts_b = _wts[face_idx]            # (B, Q)
+                nid_b = _nid[face_idx]            # (B, L)
+                B = face_batch_size
+                phi_f = phi_b.reshape(B * Q, L)
+                gph_f = gph_b.reshape(B * Q, L, 2)
+                wts_f = wts_b.reshape(B * Q)
+                nid_f = jnp.tile(nid_b[:, None, :], (1, Q, 1)).reshape(B * Q, L)
+                _step = _build_step_fn(phi_f, gph_f, wts_f, nid_f)
+                u0 = jnp.zeros(n_dofs, dtype=jnp.float32)
+                (_, _), step_losses = jax.lax.scan(_step, (params, u0), None, length=_n_time)
+                return jnp.mean(step_losses)
 
         return loss_fn
 

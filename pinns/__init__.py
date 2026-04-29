@@ -38,9 +38,10 @@ from .domain import DomainCubic, DomainCubicPartition, DomainMesh, SubdomainInfo
 from .problem import Problem
 from .problem_weak import ProblemWeak
 
-# JAX-only mesh GNN (always available if JAX is installed)
+# JAX-only mesh networks (always available if JAX is installed)
 try:
     from .backends.jax.gnn_network import GNNMeshNetwork
+    from .backends.jax.alpha_pinn_network import AlphaPINNNetwork
 except ImportError:
     pass
 
@@ -167,6 +168,7 @@ __all__ = [
     "ProblemWeak",
     # JAX-only mesh GNN
     "GNNMeshNetwork",
+    "AlphaPINNNetwork",
     # Functional
     "derivative",
     "gradient",

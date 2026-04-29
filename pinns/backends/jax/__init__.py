@@ -42,6 +42,7 @@ from .networks import (
 from .trainer import Trainer
 
 from .gnn_network import GNNMeshNetwork, _interpolate_mesh
+from .alpha_pinn_network import AlphaPINNNetwork
 
 __all__ = [
     # Functional (same API as PyTorch)
@@ -66,7 +67,8 @@ __all__ = [
     'get_activation',
     # Training (same API as PyTorch)
     'Trainer',
-    # Mesh GNN
+    # Mesh networks
     'GNNMeshNetwork',
     '_interpolate_mesh',
+    'AlphaPINNNetwork',
 ]

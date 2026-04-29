@@ -548,10 +548,23 @@ class Trainer(BaseTrainer):
                 # BPTT rollout mode: one scan over all time steps; no Lagrange needed.
                 # Override lagrangian mode — BCs are hard-constrained in the network.
                 self._is_lagrangian_mode = False
+                _face_batch = getattr(self, '_rollout_face_batch', None)
+                _n_faces    = self.problem.cubature_data['phi'].shape[0]  # F
+                self._rollout_n_faces = _n_faces
+                # Full-batch version (used for metrics)
                 _weak_loss_fn = jax.jit(
                     self.problem.make_rollout_loss_fn(_network)
                 )
-                self._weak_loss_fn   = _weak_loss_fn
+                self._weak_loss_fn = _weak_loss_fn
+                # Training version (may be mini-batch)
+                if _face_batch is not None:
+                    _weak_loss_fn_train = jax.jit(
+                        self.problem.make_rollout_loss_fn(_network, face_batch_size=_face_batch)
+                    )
+                    self._weak_loss_fn_train = _weak_loss_fn_train
+                else:
+                    self._weak_loss_fn_train = _weak_loss_fn
+                    _weak_loss_fn_train = _weak_loss_fn
                 self._weak_residual_fn = None
             else:
                 # Standard single-step weak-form path
@@ -613,13 +626,22 @@ class Trainer(BaseTrainer):
         # Precompute n_dims from first BC if available
         n_dims = self.problem.n_dims
 
+        _is_rollout_batch = (_is_weak and
+                              getattr(self, '_rollout_face_batch', None) is not None and
+                              getattr(self.problem, 'n_time_steps', None) is not None)
+        _weak_loss_fn_train = getattr(self, '_weak_loss_fn_train', _weak_loss_fn)
+
         def compute_loss(params, train_data, targets_dict, lm_params=None):
             total_loss = 0.0
 
             # ===== PDE / Weak-form Loss =====
             if _is_weak:
                 # Weak-form: cubature assembly, no collocation points needed
-                pde_loss = _weak_loss_fn(params)
+                if _is_rollout_batch:
+                    face_idx = train_data['_rollout_face_idx']
+                    pde_loss = _weak_loss_fn_train(params, face_idx)
+                else:
+                    pde_loss = _weak_loss_fn(params)
                 total_loss = total_loss + pde_weight * pde_loss
             elif 'pde' in train_data:
                 x_pde = train_data['pde']
@@ -813,7 +835,7 @@ class Trainer(BaseTrainer):
             # Strip 'pde' so base never tries to call problem.pde_fn
             bc_data = {k: v for k, v in data.items() if k != 'pde'}
             total_loss, losses = super()._compute_total_loss(bc_data, params_dict, weights_dict)
-            # Add weak PDE residual
+            # Add weak PDE residual — always use full-batch loss fn for metrics
             pde_weight = weights_dict.get('pde', 1.0)
             weak_pde_loss = float(self._weak_loss_fn(self.network.params))
             losses['pde'] = pde_weight * weak_pde_loss
@@ -1078,13 +1100,25 @@ class Trainer(BaseTrainer):
                 if use_batching and getattr(self, '_adaptive_mode', 'replace') == 'add':
                     n_batches = self._get_n_batches()
             
+            # ── Rollout face mini-batching: sample fresh indices each epoch ──────────
+            _rfb = getattr(self, '_rollout_face_batch', None)
+            _rnf = getattr(self, '_rollout_n_faces', None)
+            if _rfb is not None and _rnf is not None:
+                _face_idx = np.random.choice(_rnf, size=_rfb, replace=False).astype(np.int32)
+                self._train_data['_rollout_face_idx'] = jnp.array(_face_idx)
+
             if use_batching:
                 # Shuffle data and targets at the start of each epoch
                 shuffle_key, subkey = jax.random.split(shuffle_key)
                 shuffled_train_data = {}
                 shuffled_train_targets = {}
                 train_targets = getattr(self, '_train_targets', {})
+                # Keys that should not be shuffled/batched (non-point arrays)
+                _no_shuffle_keys = {'_rollout_face_idx'}
                 for name, data in self._train_data.items():
+                    if name in _no_shuffle_keys:
+                        shuffled_train_data[name] = data  # pass through as-is
+                        continue
                     n_points = len(data)
                     perm = jax.random.permutation(subkey, n_points)
                     shuffled_train_data[name] = data[perm]
@@ -1100,6 +1134,9 @@ class Trainer(BaseTrainer):
                     batch_data = {}
                     batch_targets = {}
                     for name, data in shuffled_train_data.items():
+                        if name in _no_shuffle_keys:
+                            batch_data[name] = data  # same face indices for every mini-batch
+                            continue
                         n_points = len(data)
                         start_idx, end_idx = self._get_batch_indices(n_points, batch_idx, n_batches)
                         batch_data[name] = data[start_idx:end_idx]
