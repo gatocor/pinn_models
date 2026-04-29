@@ -752,8 +752,14 @@ class ProblemWeak:
         dirichlet_vertex_set: set = set()
 
         # Pass 1 — vertex DOFs
+        # NOTE: BCs with t_mode='t_min' or 't_max' are time-face conditions
+        # (e.g. initial conditions).  They must remain as *soft* penalty
+        # terms and must NOT be added to the hard Dirichlet set, otherwise
+        # they constrain all nodes globally and leave free_nodes empty.
         for bc in self.domain.boundary_conditions:
             if isinstance(bc, MeshNodeBC) and bc.bc_type == "dirichlet":
+                if getattr(bc, 't_mode', None) in ('t_min', 't_max'):
+                    continue   # time-face BC — keep as soft constraint only
                 if bc.edges is not None:
                     for i0, i1 in bc.edges:
                         dirichlet_vertex_set.add(int(i0))
@@ -769,6 +775,8 @@ class ProblemWeak:
         if self.lagrange_order >= 2:
             for bc in self.domain.boundary_conditions:
                 if isinstance(bc, MeshNodeBC) and bc.bc_type == "dirichlet":
+                    if getattr(bc, 't_mode', None) in ('t_min', 't_max'):
+                        continue   # time-face BC — soft only
                     if bc.edges is not None:
                         for i0, i1 in bc.edges:
                             key = (min(int(i0), int(i1)), max(int(i0), int(i1)))

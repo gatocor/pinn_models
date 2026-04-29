@@ -156,6 +156,15 @@ class AlphaPINNNetwork:
         Must be ``True`` for the time-stepping (state-integrator) role.
         When ``False``, the FNN maps a **learned** spectral code (stored in
         the network parameters) to nodal values — useful for static PDEs.
+    use_time : bool
+        When ``True``, the FNN maps a **normalized scalar time** $t\in[0,1]$
+        directly to spectral coefficients $\alpha(t)\in\mathbb{R}^K$:
+
+        .. math:: u(x,t) = \Phi\,\alpha(t), \quad \alpha(t)=\text{FNN}(t)
+
+        This avoids Method of Lines / BPTT entirely — the network learns the
+        full space-time solution in one pass, and time derivatives are obtained
+        via autodiff.  Requires the domain to have a ``t_interval``.
     normalize_input : bool
         Normalise query coordinates to ``[-1, 1]`` before interpolation.
     input_transform : callable, optional
@@ -178,7 +187,8 @@ class AlphaPINNNetwork:
         activation: str = 'tanh',
         n_outputs: int = 1,
         hard_constraints: bool = True,
-        use_state: bool = True,
+        use_state: bool = False,
+        use_time: bool = False,
         normalize_input: bool = True,
         input_transform: Optional[Callable] = None,
         output_transform: Optional[Callable] = None,
@@ -193,10 +203,13 @@ class AlphaPINNNetwork:
         self.hidden_dim      = hidden_dim
         self.n_layers        = n_layers
         self.activation      = activation
-        self.n_outputs       = n_outputs
+        self.n_outputs        = n_outputs
         self.hard_constraints = hard_constraints
-        self.use_state       = use_state
-        self.normalize_input = normalize_input
+        self.use_state        = use_state
+        self.use_time         = use_time
+        self.normalize_input  = normalize_input
+        if use_time and use_state:
+            raise ValueError("use_time and use_state are mutually exclusive.")
         self.input_transform = input_transform
         self.output_transform = output_transform
 
@@ -230,13 +243,16 @@ class AlphaPINNNetwork:
         self._Phi_T   = jnp.array(_Phi.T,   dtype=jnp.float32)   # (K, n_nodes)
         print("done.")
 
-        # ── FNN: K*n_outputs  →  hidden ×n_layers  →  K*n_outputs ──────────
-        # (We flatten multi-output spectral codes: α has shape K*n_outputs)
+        # ── FNN ─────────────────────────────────────────────────────────────
+        # Input dimension depends on mode:
+        #   use_time=True  → scalar t  (first Dense layer: 1 → hidden_dim)
+        #   use_state=True → Φᵀ u^n   (first Dense layer: K*n_out → hidden_dim)
+        #   static          → zero vec (first Dense layer: K*n_out → hidden_dim)
+        # Output always: K*n_outputs spectral coefficients
         alpha_dim = n_eigenvectors * n_outputs
-        # Input: spectral code of u^n (state mode) or zeros (static mode)
-        # Output: spectral code of u^{n+1}
         fnn_features = [hidden_dim] * n_layers + [alpha_dim]
         self._module = _MLPModule(features=fnn_features, activation=activation)
+        self._alpha_dim = alpha_dim
 
         # ── Input/output normalisation (set by trainer) ──────────────────
         self.input_min  = None
@@ -282,12 +298,15 @@ class AlphaPINNNetwork:
         """
         Initialise network parameters.
 
-        The FNN is initialised with a dummy zero spectral code as input so
-        that Flax can infer all layer shapes.
+        Uses a dummy input whose shape matches the chosen mode:
+        - ``use_time=True``  → shape ``(1,)`` — a single normalised time value.
+        - ``use_state / static`` → shape ``(K*n_outputs,)`` — spectral code.
         """
-        alpha_dim = self.n_eigenvectors * self.n_outputs
-        dummy_alpha = jnp.zeros((alpha_dim,), dtype=jnp.float32)
-        return self._module.init(rng, dummy_alpha)
+        if self.use_time:
+            dummy_in = jnp.zeros((1,), dtype=jnp.float32)
+        else:
+            dummy_in = jnp.zeros((self._alpha_dim,), dtype=jnp.float32)
+        return self._module.init(rng, dummy_in)
 
     def apply(
         self,
@@ -324,25 +343,85 @@ class AlphaPINNNetwork:
         if self.input_transform is not None:
             x = self.input_transform(x, params_dict)
 
+        nodes_orig = jnp.array(self._nodes_np)
+        faces_arr  = jnp.array(self._faces_np)
+        x_spatial  = x_original[:, :self.spatial_dims]
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Branch A — use_time: FNN(t) → α(t) → u(x,t) = Φ(x)·α(t)
+        #
+        # Efficient factored evaluation (no giant intermediate tensor):
+        #   1. Interpolate each eigenvector mode at the spatial query pts:
+        #        Phi_x  = interp(Φ,  nodes, faces, x)  →  (n_query, K)
+        #      If hard BCs are on, also interpolate the BC correction:
+        #        Phi_free_x = interp(Φ*(1-bc_mask), ...)  →  (n_query, K)
+        #        bc_x       = interp(bc_values, ...)      →  (n_query, n_out)
+        #   2. Batch FNN: α(t) = FNN(t_norm)            →  (n_query, K*n_out)
+        #   3. Dot:  y = einsum('qk,qko->qo', Phi_free_x, α) + bc_x
+        #
+        # Complexity: O(n_query × n_faces) for step 1 (same as a single
+        # network forward), O(n_query × K) for step 3 — versus the old
+        # O(n_query × n_nodes × K) decode+vmap interpolation.
+        # ═══════════════════════════════════════════════════════════════════
+        if self.use_time:
+            t_col  = self.spatial_dims
+            t_vals = x_original[:, t_col]      # (n_query,)
+            t_min  = self.t_min if self.has_time else 0.0
+            t_max  = self.t_max if self.has_time else 1.0
+            t_norm = (t_vals - t_min) / (t_max - t_min + 1e-8)  # (n_query,)
+
+            # ── Step 1: interpolate Φ rows at spatial query locations ──────
+            if self.hard_constraints:
+                # Φ_free[node, k] = Φ[node, k] * (1 - bc_mask[node, 0])
+                # bc_values: (n_nodes, n_out)
+                Phi_free_nodes = self._Phi * (1.0 - self._bc_mask_jnp[:, :1])  # (N, K)
+                Phi_free_x = _interpolate_mesh(
+                    Phi_free_nodes, nodes_orig, faces_arr, x_spatial)  # (n_query, K)
+                bc_x = _interpolate_mesh(
+                    self._bc_values_jnp, nodes_orig, faces_arr, x_spatial)  # (n_query, n_out)
+            else:
+                Phi_free_x = _interpolate_mesh(
+                    self._Phi, nodes_orig, faces_arr, x_spatial)       # (n_query, K)
+                bc_x = jnp.zeros((x_spatial.shape[0], self.n_outputs),
+                                  dtype=jnp.float32)
+
+            # ── Step 2: batch FNN  t → α(t) ────────────────────────────────
+            t_input = t_norm[:, None]                                   # (n_query, 1)
+            alphas  = self._module.apply(params, t_input)               # (n_query, K*n_out)
+            alphas_3d = alphas.reshape(-1, self.n_eigenvectors, self.n_outputs)
+            # (n_query, K, n_out)
+
+            # ── Step 3: dot Φ(x) · α(t) + bc(x) ──────────────────────────
+            y = jnp.einsum('qk,qko->qo', Phi_free_x, alphas_3d) + bc_x
+            # y: (n_query, n_out)
+
+            # Optional output un-normalisation
+            if self.output_min is not None:
+                y = (y + 1.0) / 2.0 * (self.output_max - self.output_min) + self.output_min
+
+            if self.output_transform is not None:
+                y = self.output_transform(x_original, y, params_dict)
+            return y
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Branch B — use_state / static: single α shared by all query pts
+        # ═══════════════════════════════════════════════════════════════════
+
         # ── 1. Build spectral code from current state ─────────────────────
         if self.use_state and params_dict is not None:
             u_prev = params_dict["fixed"]["u_prev_nodes"]   # (n_nodes,) or (n_nodes, n_out)
             u_prev = jnp.asarray(u_prev, dtype=jnp.float32)
             if u_prev.ndim == 1:
                 u_prev = u_prev[:, None]                    # (n_nodes, 1)
-            # Project each output channel independently, then flatten
-            # alpha_n: (K * n_outputs,)
             alpha_n = (self._Phi_T @ u_prev).ravel()        # (K*n_out,)
         else:
             # Static mode: zero input → network learns a constant spectral code
-            alpha_n = jnp.zeros(self.n_eigenvectors * self.n_outputs,
-                                 dtype=jnp.float32)
+            alpha_n = jnp.zeros(self._alpha_dim, dtype=jnp.float32)
 
         # ── 2. FNN: spectral space evolution ─────────────────────────────
         alpha_next = self._module.apply(params, alpha_n)    # (K*n_out,)
 
         # ── 3. Decode to nodal values ─────────────────────────────────────
-        # Reshape alpha to (K, n_outputs) so Φ @ alpha → (n_nodes, n_outputs)
         alpha_next_2d = alpha_next.reshape(self.n_eigenvectors, self.n_outputs)
         node_coeffs   = self._Phi @ alpha_next_2d           # (n_nodes, n_outputs)
 
@@ -352,10 +431,6 @@ class AlphaPINNNetwork:
                            + self._bc_values_jnp * self._bc_mask_jnp)
 
         # ── 5. Barycentric interpolation at query points ──────────────────
-        nodes_orig = jnp.array(self._nodes_np)
-        faces_arr  = jnp.array(self._faces_np)
-        x_spatial  = x_original[:, :self.spatial_dims]
-
         y = _interpolate_mesh(node_coeffs, nodes_orig, faces_arr, x_spatial)
         # y: (n_query, n_outputs)
 
@@ -414,5 +489,5 @@ class AlphaPINNNetwork:
             f"hidden_dim={self.hidden_dim}, n_layers={self.n_layers}, "
             f"n_outputs={self.n_outputs}, "
             f"hard_constraints={self.hard_constraints}, "
-            f"use_state={self.use_state})"
+            f"use_state={self.use_state}, use_time={self.use_time})"
         )
