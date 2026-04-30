@@ -1620,6 +1620,10 @@ class BaseTrainer(ABC):
                 names.append(f'bc_{i}')
         return names
 
+    def _get_bc_plot_names(self) -> List[str]:
+        """BC names used for plot labels/legend. Override to filter entries."""
+        return self._get_bc_names()
+
     def _get_output_name(self, output_idx: int) -> str:
         """Get the name of an output by index."""
         if hasattr(self.problem, 'output_names') and self.problem.output_names is not None:
@@ -1957,7 +1961,7 @@ class BaseTrainer(ABC):
                 ax.semilogy(epochs, pde_losses, '--', label='PDE')
         
         # BC losses with names
-        bc_names = self._get_bc_names()
+        bc_names = self._get_bc_plot_names()
         bc_losses = self.history.get('loss_bcs', [])
         if bc_losses and len(bc_losses) > 0:
             bc_losses_array = np.array(bc_losses)
@@ -2008,7 +2012,7 @@ class BaseTrainer(ABC):
                 ax.semilogy(epochs, pde_losses, 'b--', label='PDE')
         
         # BC MSE losses with names
-        bc_names = self._get_bc_names()
+        bc_names = self._get_bc_plot_names()
         bc_losses = self.history.get('loss_bcs', [])
         if bc_losses and len(bc_losses) > 0:
             bc_losses_array = np.array(bc_losses)

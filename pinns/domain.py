@@ -1400,6 +1400,22 @@ class DomainMesh:
         t_interval: Optional ``[t_min, t_max]``. When given, the domain is
                     ``(spatial mesh) × [t_min, t_max]`` and ``n_dims`` equals
                     ``spatial_dims + 1``.
+        t_sampling_method: How to place time quadrature points when
+                    ``t_interval`` is given and ``ProblemWeak`` assembles the
+                    space-time weak form.  Mirrors ``DomainCubic.sampling_method``.
+                    Supported values:
+
+                    - ``"uniform"`` *(default)*: draw ``n_time_points`` random
+                      samples per epoch (Monte-Carlo time integration).
+                    - ``"midpoint"``: fixed mid-point rule — time levels
+                      :math:`t_i = t_{\\min} + (i+\\tfrac{1}{2})\\Delta t` computed
+                      once at construction (original behaviour).
+                    - ``"latin_hypercube"`` / ``"lhs"``, ``"sobol"``,
+                      ``"halton"``: quasi-random sequences, re-sampled each
+                      epoch just like ``"uniform"``.
+                    - Callable ``(n, rng) -> np.ndarray`` of shape ``(n,)`` in
+                      ``[0, 1]``: custom per-epoch sampler that is scaled to
+                      ``[t_min, t_max]`` inside ``ProblemWeak``.
 
     Example::
 
@@ -1465,7 +1481,7 @@ class DomainMesh:
             "Provide a pymesh, trimesh, meshio, or (vertices, faces) object."
         )
 
-    def __init__(self, mesh, t_interval=None):
+    def __init__(self, mesh, t_interval=None, t_sampling_method="midpoint"):
         vertices, faces = self._extract_vertices_faces(mesh)
         self._vertices = vertices
         self._spatial_dims = vertices.shape[1]
@@ -1501,6 +1517,7 @@ class DomainMesh:
         sp_min = vertices.min(axis=0)
         sp_max = vertices.max(axis=0)
 
+        self._t_sampling_method = t_sampling_method
         if t_interval is not None:
             self._t_min = float(t_interval[0])
             self._t_max = float(t_interval[1])
@@ -2103,4 +2120,75 @@ class DomainMesh:
         t_info = (f" × t∈[{self._t_min}, {self._t_max}]"
                   if self._t_min is not None else "")
         return (f"DomainMesh({sp}{t_info}, "
+                f"n_nodes={len(self._vertices)}, n_conditions={n_bcs})")
+
+
+class DomainMeshContinuous(DomainMesh):
+    """
+    Mesh domain with a **continuous** time interval  ``[t_min, t_max]``.
+
+    Intended for space-time PINNs where the network predicts :math:`u(x, t)`
+    globally.  ``ProblemWeak`` assembles the space-time weak form by sampling
+    ``n_time_points`` time levels each epoch according to *t_sampling_method*.
+
+    Args:
+        mesh: Mesh object (see :class:`DomainMesh`).
+        t_interval: ``[t_min, t_max]`` — the time window.
+        t_sampling_method: How time levels are placed each epoch.  Supported
+            values mirror ``DomainCubic.sampling_method``:
+
+            - ``"uniform"`` *(default)* — random uniform per epoch.
+            - ``"midpoint"`` — fixed mid-point rule, built once at
+              construction.
+            - ``"latin_hypercube"`` / ``"lhs"`` — stratified random.
+            - ``"sobol"`` / ``"halton"`` — quasi-random (requires scipy).
+            - Callable ``(n, rng) -> ndarray`` in ``[0, 1]``.
+
+        n_time_points: Default number of time levels passed to
+            :class:`~pinns.problem_weak.ProblemWeak` (can be overridden
+            there via ``n_time_points`` argument).  Defaults to 10.
+    """
+
+    def __init__(self, mesh, t_interval, t_sampling_method="uniform",
+                 n_time_points=10):
+        super().__init__(mesh, t_interval=t_interval,
+                         t_sampling_method=t_sampling_method)
+        self.n_time_points = n_time_points
+
+    def __repr__(self):
+        n_bcs = len(self.boundary_conditions)
+        sp = f"{self._spatial_dims}D"
+        smeth = getattr(self, '_t_sampling_method', 'uniform')
+        return (f"DomainMeshContinuous({sp} × t∈[{self._t_min}, {self._t_max}], "
+                f"sampling={smeth!r}, n_time_points={self.n_time_points}, "
+                f"n_nodes={len(self._vertices)}, n_conditions={n_bcs})")
+
+
+class DomainMeshDiscrete(DomainMesh):
+    """
+    Mesh domain with a **discrete** time axis defined by a fixed time-step.
+
+    Intended for Method-of-Lines GNN networks that advance the state one step
+    at a time via an implicit (or explicit) ODE integrator and BPTT.
+    ``ProblemWeak`` automatically reads ``domain.n_steps`` and ``domain.dt``
+    and routes to :meth:`~pinns.problem_weak.ProblemWeak.make_rollout_loss_fn`.
+
+    Args:
+        mesh: Mesh object (see :class:`DomainMesh`).
+        dt: Time-step size.
+        n_steps: Total number of time steps to unroll.
+        t_start: Start time (default ``0.0``).
+    """
+
+    def __init__(self, mesh, dt: float, n_steps: int, t_start: float = 0.0):
+        t_interval = [t_start, t_start + dt * n_steps]
+        super().__init__(mesh, t_interval=t_interval, t_sampling_method='midpoint')
+        self.dt = float(dt)
+        self.n_steps = int(n_steps)
+
+    def __repr__(self):
+        n_bcs = len(self.boundary_conditions)
+        sp = f"{self._spatial_dims}D"
+        return (f"DomainMeshDiscrete({sp}, dt={self.dt}, n_steps={self.n_steps}, "
+                f"t∈[{self._t_min}, {self._t_max}], "
                 f"n_nodes={len(self._vertices)}, n_conditions={n_bcs})")

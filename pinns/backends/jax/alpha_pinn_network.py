@@ -1,5 +1,5 @@
 """
-AlphaPINNNetwork — Laplace-spectral state integrator for mesh-based PINNs (JAX/Flax).
+AlphaPINN — Laplace-spectral state integrator for mesh-based PINNs (JAX/Flax).
 
 Architecture
 ------------
@@ -25,8 +25,7 @@ motivated for diffusion-type PDEs.
 Public API mirrors ``GNNMeshNetwork`` / ``FNN`` exactly so it can be swapped
 in place with no other code changes::
 
-    net = AlphaPINNNetwork(domain, n_eigenvectors=32, hidden_dim=128,
-                           n_layers=4, use_state=True)
+    net = AlphaPINN(domain, n_eigenvectors=32, hidden_dims=[128, 128, 128, 128], use_state=True)
     params = net.init(jax.random.PRNGKey(0))
     y      = net.apply(params, x_query, params_dict)
 """
@@ -40,7 +39,7 @@ from flax import linen as nn
 from typing import Dict, Optional, Sequence, Callable, Any
 
 from .gnn_network import _interpolate_mesh
-from .networks import get_activation
+from .networks import get_activation, FNN
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,194 +118,202 @@ def _compute_laplace_eigenvectors(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public AlphaPINNNetwork class
+# LaplacianFeatures — mesh-based spectral input encoder
 # ─────────────────────────────────────────────────────────────────────────────
 
-class AlphaPINNNetwork:
+class LaplacianFeatures:
     """
-    Laplace-spectral state integrator for mesh-based PINNs.
+    Laplacian spectral feature encoding for mesh-based PINNs.
 
-    The network projects the current state u^n (at mesh nodes) onto the K
-    smallest Laplace eigenvectors, applies a standard FNN in that spectral
-    space, and decodes back to nodal values u^{n+1}.
+    Maps spatial query points ``(x, y)`` [or ``(x, y, t)``] to the K smallest
+    Laplace–Beltrami eigenvectors of the mesh graph, evaluated via barycentric
+    interpolation, producing a geometry-aware feature vector.
 
-    Identical public API to ``GNNMeshNetwork`` — can be swapped in with no
-    other code changes.
+    Drop-in replacement for :class:`FourierFeatures` — identical callable API::
+
+        enc = LaplacianFeatures(domain, n_features=32)
+        net = AlphaPINN(domain, n_features=32, hidden_dims=[128, 128, 128, 1])
+
+    **Time handling** — if *domain* carries a ``t_interval``:
+
+    * ``n_features - 1`` eigenvectors are computed (spatial modes).
+    * The last feature column is the raw time coordinate ``t``.
+    * ``output_dim == n_features`` in both cases.
+
+    So ``n_features`` always controls network input width, regardless of whether
+    the domain is purely spatial or space-time.
 
     Parameters
     ----------
     domain : DomainMesh
-        2-D triangular mesh domain.
-    n_eigenvectors : int
-        Number of Laplace eigenvectors K.  Controls the spectral resolution
-        of the state representation.  Larger values = richer modes but a
-        higher-dimensional FNN input.  Typical range: 16–128.
-    hidden_dim : int
-        Width of each hidden layer in the FNN.
-    n_layers : int
-        Number of hidden layers.  The MLP is:
-        K  →  [hidden_dim] × n_layers  →  K
+        2-D triangular mesh domain.  Must expose ``_vertices``, ``_faces``,
+        ``_spatial_dims``, and optionally ``t_interval``.
+    n_features : int
+        Total output dimension.  Spatial eigenvectors = ``n_features`` (no time)
+        or ``n_features - 1`` (with time).
+    """
+
+    def __init__(self, domain, n_features: int = 32):
+        t_interval = getattr(domain, 't_interval', None)
+        self.has_time     = t_interval is not None
+        self.spatial_dims = domain._spatial_dims
+        self.n_features   = n_features
+        self.n_eig        = n_features - 1 if self.has_time else n_features
+        self.output_dim   = n_features
+
+        if self.has_time:
+            self.t_min = float(t_interval[0])
+            self.t_max = float(t_interval[1])
+
+        verts = domain._vertices[:, :self.spatial_dims].astype(np.float32)
+        faces = domain._faces.astype(np.int32)
+        self._nodes_np = verts
+        self._faces_np = faces
+
+        print(
+            f"LaplacianFeatures: computing {self.n_eig} Laplace eigenvectors "
+            f"for mesh with {len(verts)} nodes … ", end="", flush=True
+        )
+        _Phi = _compute_laplace_eigenvectors(verts, faces, self.n_eig)
+        self._Phi = jnp.array(_Phi, dtype=jnp.float32)   # (n_nodes, n_eig)
+        print("done.")
+
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        params_dict: Optional[Dict] = None,
+    ) -> jnp.ndarray:
+        """
+        Encode query coordinates into Laplacian spectral features.
+
+        Parameters
+        ----------
+        x : (n_pts, spatial_dims) or (n_pts, spatial_dims+1)
+            Query coordinates.  The time column (if present) is appended as
+            the last output feature.
+        params_dict : ignored (API compatibility with ``input_transform``).
+
+        Returns
+        -------
+        (n_pts, n_features)
+        """
+        nodes = jnp.array(self._nodes_np)
+        faces = jnp.array(self._faces_np)
+        x_spatial = x[:, :self.spatial_dims]
+
+        phi_x = _interpolate_mesh(self._Phi, nodes, faces, x_spatial)  # (n_pts, n_eig)
+
+        if self.has_time:
+            t_col = x[:, self.spatial_dims : self.spatial_dims + 1]    # (n_pts, 1)
+            return jnp.concatenate([phi_x, t_col], axis=-1)            # (n_pts, n_features)
+        return phi_x
+
+    def __repr__(self) -> str:
+        mode = f"{self.n_eig} eigenvectors + t" if self.has_time else f"{self.n_eig} eigenvectors"
+        return f"LaplacianFeatures(output_dim={self.output_dim}, mode='{mode}')"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public AlphaPINN class
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AlphaPINN:
+    """
+    Laplace-spectral PINN — a standard FNN with a :class:`LaplacianFeatures`
+    input encoding.
+
+    The :class:`LaplacianFeatures` encoder maps each query point ``(x, y[, t])``
+    to the K smallest Laplace eigenvectors of the mesh graph (evaluated via
+    barycentric interpolation), plus the raw ``t`` coordinate when the domain
+    is space-time.  The result is fed into a plain fully-connected network.
+
+    **This is equivalent to** ``FNN([n_features]+hidden_dims+[n_outputs],
+    normalize_input=False, feature_encoding=LaplacianFeatures(domain,
+    n_features))`` — and in fact that is exactly the internal implementation.
+
+    Hard boundary constraints (output clamping) should be specified via
+    ``output_transform`` — typically obtained from
+    ``ProblemWeak(..., hard_constraints=True).output_transform`` and passed
+    in here.
+
+    Parameters
+    ----------
+    domain : DomainMesh
+        2-D triangular mesh domain.  Time mode is auto-detected from
+        ``domain.t_interval``.
+    n_features : int
+        Spectral feature dimension (= FNN input width).  If domain has a time
+        interval: ``n_features - 1`` eigenvectors + 1 time column.
+    hidden_dims : sequence of int
+        Width of each hidden layer, e.g. ``[128, 128, 128, 128]``.
     activation : str
-        Activation function inside the FNN (default ``'tanh'``).
+        Activation function (default ``'tanh'``).
     n_outputs : int
-        Number of PDE unknowns / output channels per node (default 1).
-    hard_constraints : bool
-        Enforce Dirichlet BCs by static condensation (same as GNNMeshNetwork).
-    use_state : bool
-        Must be ``True`` for the time-stepping (state-integrator) role.
-        When ``False``, the FNN maps a **learned** spectral code (stored in
-        the network parameters) to nodal values — useful for static PDEs.
-    use_time : bool
-        When ``True``, the FNN maps a **normalized scalar time** $t\in[0,1]$
-        directly to spectral coefficients $\alpha(t)\in\mathbb{R}^K$:
-
-        .. math:: u(x,t) = \Phi\,\alpha(t), \quad \alpha(t)=\text{FNN}(t)
-
-        This avoids Method of Lines / BPTT entirely — the network learns the
-        full space-time solution in one pass, and time derivatives are obtained
-        via autodiff.  Requires the domain to have a ``t_interval``.
-    normalize_input : bool
-        Normalise query coordinates to ``[-1, 1]`` before interpolation.
-    input_transform : callable, optional
-        Applied to query coordinates before normalisation.
+        Number of PDE unknowns per query point (default 1).
     output_transform : callable, optional
-        Hard-constraint transform applied after interpolation.
-
-    Notes
-    -----
-    *Eigenvector computation* (scipy, CPU, done once at construction) can take
-    a few seconds for large meshes.  The result is stored as a fixed JAX array.
+        Hard-constraint or other post-processing transform applied *after*
+        the FNN.  Signature: ``f(x_original, y, params_dict) → y``.
+        Pass ``problem.output_transform`` here when hard BCs are needed.
+    input_transform : callable, optional
+        Applied to raw query coordinates *before* the feature encoding.
     """
 
     def __init__(
         self,
         domain,
-        n_eigenvectors: int = 32,
-        hidden_dim: int = 128,
-        n_layers: int = 4,
+        n_features: int = 32,
+        hidden_dims: Sequence[int] = (128, 128, 128, 128),
         activation: str = 'tanh',
         n_outputs: int = 1,
-        hard_constraints: bool = True,
-        use_state: bool = False,
-        use_time: bool = False,
-        normalize_input: bool = True,
-        input_transform: Optional[Callable] = None,
         output_transform: Optional[Callable] = None,
+        input_transform: Optional[Callable] = None,
     ):
         if domain._spatial_dims != 2:
             raise NotImplementedError(
-                "AlphaPINNNetwork supports 2-D spatial meshes only "
+                "AlphaPINN supports 2-D spatial meshes only "
                 f"(got spatial_dims={domain._spatial_dims})."
             )
 
-        self.n_eigenvectors  = n_eigenvectors
-        self.hidden_dim      = hidden_dim
-        self.n_layers        = n_layers
-        self.activation      = activation
-        self.n_outputs        = n_outputs
-        self.hard_constraints = hard_constraints
-        self.use_state        = use_state
-        self.use_time         = use_time
-        self.normalize_input  = normalize_input
-        if use_time and use_state:
-            raise ValueError("use_time and use_state are mutually exclusive.")
-        self.input_transform = input_transform
-        self.output_transform = output_transform
+        self.n_features  = n_features
+        self.hidden_dims = list(hidden_dims)
+        self.n_outputs   = n_outputs
+        self.activation  = activation
 
-        # Time interval (optional — same handling as GNNMeshNetwork)
-        t_interval = getattr(domain, 't_interval', None)
-        self.has_time = t_interval is not None
-        if self.has_time:
-            self.t_min = float(t_interval[0])
-            self.t_max = float(t_interval[1])
+        # ── Spectral encoder ──────────────────────────────────────────────
+        self.laplacian_features = LaplacianFeatures(domain, n_features)
 
-        # ── Fixed mesh arrays ──────────────────────────────────────────────
-        verts = domain._vertices[:, :domain._spatial_dims].astype(np.float32)
-        faces = domain._faces.astype(np.int32)
+        # ── FNN backbone ──────────────────────────────────────────────────
+        # normalize_input=False: LaplacianFeatures operates on raw coords.
+        # unnormalize_output=False: no output rescaling (PINN outputs are raw).
+        layer_sizes = [n_features] + list(hidden_dims) + [n_outputs]
+        self._fnn = FNN(
+            layer_sizes       = layer_sizes,
+            activation        = activation,
+            normalize_input   = False,
+            unnormalize_output= False,
+            feature_encoding  = self.laplacian_features,
+            input_transform   = input_transform,
+            output_transform  = output_transform,
+        )
 
-        self._nodes_np = verts
-        self._faces_np = faces
-        self.n_nodes   = verts.shape[0]
-        self.n_faces   = faces.shape[0]
+        # Expose for repr / trainer introspection
+        self.n_nodes      = self.laplacian_features._nodes_np.shape[0]
         self.spatial_dims = domain._spatial_dims
+        self.has_time     = self.laplacian_features.has_time
 
-        node_min = verts.min(axis=0)
-        node_max = verts.max(axis=0)
-        self._node_min = jnp.array(node_min, dtype=jnp.float32)
-        self._node_max = jnp.array(node_max, dtype=jnp.float32)
-
-        # ── Laplace eigenvectors ──────────────────────────────────────────
-        print(f"AlphaPINNNetwork: computing {n_eigenvectors} Laplace eigenvectors "
-              f"for mesh with {self.n_nodes} nodes … ", end="", flush=True)
-        _Phi = _compute_laplace_eigenvectors(verts, faces, n_eigenvectors)  # (n_nodes, K)
-        self._Phi     = jnp.array(_Phi,     dtype=jnp.float32)   # (n_nodes, K)
-        self._Phi_T   = jnp.array(_Phi.T,   dtype=jnp.float32)   # (K, n_nodes)
-        print("done.")
-
-        # ── FNN ─────────────────────────────────────────────────────────────
-        # Input dimension depends on mode:
-        #   use_time=True  → scalar t  (first Dense layer: 1 → hidden_dim)
-        #   use_state=True → Φᵀ u^n   (first Dense layer: K*n_out → hidden_dim)
-        #   static          → zero vec (first Dense layer: K*n_out → hidden_dim)
-        # Output always: K*n_outputs spectral coefficients
-        alpha_dim = n_eigenvectors * n_outputs
-        fnn_features = [hidden_dim] * n_layers + [alpha_dim]
-        self._module = _MLPModule(features=fnn_features, activation=activation)
-        self._alpha_dim = alpha_dim
-
-        # ── Input/output normalisation (set by trainer) ──────────────────
-        self.input_min  = None
-        self.input_max  = None
-        self.output_min = None
-        self.output_max = None
-
-        # ── Hard Dirichlet BCs (static condensation) ─────────────────────
-        bc_mask   = np.zeros((self.n_nodes, n_outputs), dtype=np.float32)
-        bc_values = np.zeros((self.n_nodes, n_outputs), dtype=np.float32)
-        if hard_constraints:
-            from pinns.boundary import MeshNodeBC
-            for bc in getattr(domain, 'boundary_conditions', []):
-                if not (isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet'):
-                    continue
-                t_mode = getattr(bc, 't_mode', None)
-                if t_mode not in (None, 'all'):
-                    continue
-                comp = bc.component
-                if comp >= n_outputs:
-                    continue
-                node_idx = np.unique(bc.edges)
-                node_pos = verts[node_idx]
-                vals = bc.get_value(node_pos)
-                bc_mask[node_idx, comp]   = 1.0
-                bc_values[node_idx, comp] = vals
-        self._bc_mask_jnp   = jnp.array(bc_mask,   dtype=jnp.float32)
-        self._bc_values_jnp = jnp.array(bc_values, dtype=jnp.float32)
-
-    # ──────────────────────────────────────────────────────────────────────── #
-    #  Trainer-compatible API                                                  #
-    # ──────────────────────────────────────────────────────────────────────── #
+    # ── Trainer-compatible API (delegate to _fnn) ─────────────────────── #
 
     def set_input_range(self, xmin: np.ndarray, xmax: np.ndarray):
-        self.input_min = jnp.array(xmin, dtype=jnp.float32)
-        self.input_max = jnp.array(xmax, dtype=jnp.float32)
+        self._fnn.set_input_range(xmin, xmax)
 
     def set_output_range(self, ymin: np.ndarray, ymax: np.ndarray):
-        self.output_min = jnp.array(ymin, dtype=jnp.float32)
-        self.output_max = jnp.array(ymax, dtype=jnp.float32)
+        self._fnn.set_output_range(ymin, ymax)
 
     def init(self, rng: jax.random.PRNGKey, dummy_input=None) -> Dict:
-        """
-        Initialise network parameters.
-
-        Uses a dummy input whose shape matches the chosen mode:
-        - ``use_time=True``  → shape ``(1,)`` — a single normalised time value.
-        - ``use_state / static`` → shape ``(K*n_outputs,)`` — spectral code.
-        """
-        if self.use_time:
-            dummy_in = jnp.zeros((1,), dtype=jnp.float32)
-        else:
-            dummy_in = jnp.zeros((self._alpha_dim,), dtype=jnp.float32)
-        return self._module.init(rng, dummy_in)
+        """Initialise FNN parameters."""
+        if dummy_input is None:
+            dummy_input = jnp.zeros((1, self.n_features), dtype=jnp.float32)
+        return self._fnn._module.init(rng, dummy_input)
 
     def apply(
         self,
@@ -314,180 +321,40 @@ class AlphaPINNNetwork:
         x: jnp.ndarray,
         params_dict: Optional[Dict] = None,
     ) -> jnp.ndarray:
-        """
-        Evaluate the network at query points *x*.
-
-        Steps
-        -----
-        1. Encode current state u^n to spectral coefficients α^n = Φᵀ u^n
-           (only in ``use_state=True`` mode; otherwise uses a zero code that
-           the FNN maps to a learned static solution).
-        2. FNN: α^n → α^{n+1}  (spectral evolution).
-        3. Decode: u^{n+1} = Φ α^{n+1}  (n_nodes, n_outputs).
-        4. Hard BC enforcement (static condensation).
-        5. Barycentric interpolation at spatial coordinates of *x*.
-
-        Parameters
-        ----------
-        params : dict           – Flax parameter tree from :meth:`init`.
-        x : (n_query, n_dims)   – query coordinates (spatial first).
-        params_dict : dict      – must contain ``params_dict["fixed"]["u_prev_nodes"]``
-                                  when ``use_state=True``.
-
-        Returns
-        -------
-        (n_query, n_outputs)
-        """
-        x_original = x
-
-        if self.input_transform is not None:
-            x = self.input_transform(x, params_dict)
-
-        nodes_orig = jnp.array(self._nodes_np)
-        faces_arr  = jnp.array(self._faces_np)
-        x_spatial  = x_original[:, :self.spatial_dims]
-
-        # ═══════════════════════════════════════════════════════════════════
-        # Branch A — use_time: FNN(t) → α(t) → u(x,t) = Φ(x)·α(t)
-        #
-        # Efficient factored evaluation (no giant intermediate tensor):
-        #   1. Interpolate each eigenvector mode at the spatial query pts:
-        #        Phi_x  = interp(Φ,  nodes, faces, x)  →  (n_query, K)
-        #      If hard BCs are on, also interpolate the BC correction:
-        #        Phi_free_x = interp(Φ*(1-bc_mask), ...)  →  (n_query, K)
-        #        bc_x       = interp(bc_values, ...)      →  (n_query, n_out)
-        #   2. Batch FNN: α(t) = FNN(t_norm)            →  (n_query, K*n_out)
-        #   3. Dot:  y = einsum('qk,qko->qo', Phi_free_x, α) + bc_x
-        #
-        # Complexity: O(n_query × n_faces) for step 1 (same as a single
-        # network forward), O(n_query × K) for step 3 — versus the old
-        # O(n_query × n_nodes × K) decode+vmap interpolation.
-        # ═══════════════════════════════════════════════════════════════════
-        if self.use_time:
-            t_col  = self.spatial_dims
-            t_vals = x_original[:, t_col]      # (n_query,)
-            t_min  = self.t_min if self.has_time else 0.0
-            t_max  = self.t_max if self.has_time else 1.0
-            t_norm = (t_vals - t_min) / (t_max - t_min + 1e-8)  # (n_query,)
-
-            # ── Step 1: interpolate Φ rows at spatial query locations ──────
-            if self.hard_constraints:
-                # Φ_free[node, k] = Φ[node, k] * (1 - bc_mask[node, 0])
-                # bc_values: (n_nodes, n_out)
-                Phi_free_nodes = self._Phi * (1.0 - self._bc_mask_jnp[:, :1])  # (N, K)
-                Phi_free_x = _interpolate_mesh(
-                    Phi_free_nodes, nodes_orig, faces_arr, x_spatial)  # (n_query, K)
-                bc_x = _interpolate_mesh(
-                    self._bc_values_jnp, nodes_orig, faces_arr, x_spatial)  # (n_query, n_out)
-            else:
-                Phi_free_x = _interpolate_mesh(
-                    self._Phi, nodes_orig, faces_arr, x_spatial)       # (n_query, K)
-                bc_x = jnp.zeros((x_spatial.shape[0], self.n_outputs),
-                                  dtype=jnp.float32)
-
-            # ── Step 2: batch FNN  t → α(t) ────────────────────────────────
-            t_input = t_norm[:, None]                                   # (n_query, 1)
-            alphas  = self._module.apply(params, t_input)               # (n_query, K*n_out)
-            alphas_3d = alphas.reshape(-1, self.n_eigenvectors, self.n_outputs)
-            # (n_query, K, n_out)
-
-            # ── Step 3: dot Φ(x) · α(t) + bc(x) ──────────────────────────
-            y = jnp.einsum('qk,qko->qo', Phi_free_x, alphas_3d) + bc_x
-            # y: (n_query, n_out)
-
-            # Optional output un-normalisation
-            if self.output_min is not None:
-                y = (y + 1.0) / 2.0 * (self.output_max - self.output_min) + self.output_min
-
-            if self.output_transform is not None:
-                y = self.output_transform(x_original, y, params_dict)
-            return y
-
-        # ═══════════════════════════════════════════════════════════════════
-        # Branch B — use_state / static: single α shared by all query pts
-        # ═══════════════════════════════════════════════════════════════════
-
-        # ── 1. Build spectral code from current state ─────────────────────
-        if self.use_state and params_dict is not None:
-            u_prev = params_dict["fixed"]["u_prev_nodes"]   # (n_nodes,) or (n_nodes, n_out)
-            u_prev = jnp.asarray(u_prev, dtype=jnp.float32)
-            if u_prev.ndim == 1:
-                u_prev = u_prev[:, None]                    # (n_nodes, 1)
-            alpha_n = (self._Phi_T @ u_prev).ravel()        # (K*n_out,)
-        else:
-            # Static mode: zero input → network learns a constant spectral code
-            alpha_n = jnp.zeros(self._alpha_dim, dtype=jnp.float32)
-
-        # ── 2. FNN: spectral space evolution ─────────────────────────────
-        alpha_next = self._module.apply(params, alpha_n)    # (K*n_out,)
-
-        # ── 3. Decode to nodal values ─────────────────────────────────────
-        alpha_next_2d = alpha_next.reshape(self.n_eigenvectors, self.n_outputs)
-        node_coeffs   = self._Phi @ alpha_next_2d           # (n_nodes, n_outputs)
-
-        # ── 4. Hard Dirichlet BC enforcement ─────────────────────────────
-        if self.hard_constraints:
-            node_coeffs = (node_coeffs * (1.0 - self._bc_mask_jnp)
-                           + self._bc_values_jnp * self._bc_mask_jnp)
-
-        # ── 5. Barycentric interpolation at query points ──────────────────
-        y = _interpolate_mesh(node_coeffs, nodes_orig, faces_arr, x_spatial)
-        # y: (n_query, n_outputs)
-
-        # Optional output un-normalisation
-        if self.output_min is not None:
-            y = (y + 1.0) / 2.0 * (self.output_max - self.output_min) + self.output_min
-
-        # Optional hard-constraint transform
-        if self.output_transform is not None:
-            y = self.output_transform(x_original, y, params_dict)
-
-        return y
+        """Evaluate network at query points *x* — delegates to inner FNN."""
+        return self._fnn.apply(params, x, params_dict)
 
     def forward(self, x: jnp.ndarray, params_dict=None) -> jnp.ndarray:
-        """Forward pass using stored ``self.params``."""
         return self.apply(self.params, x, params_dict)
 
     def predict(self, x_np: np.ndarray, params_dict=None) -> np.ndarray:
-        """Predict with NumPy I/O."""
-        return np.array(self.forward(jnp.array(x_np), params_dict))
+        return np.array(self.apply(self.params, jnp.array(x_np), params_dict))
 
-    def get_node_coefficients(self, params: Dict) -> np.ndarray:
-        """
-        Return the decoded nodal values for the *zero* spectral input (static).
-
-        Useful for inspecting the learned static solution (``use_state=False``).
-        """
-        alpha_zero = jnp.zeros(self.n_eigenvectors * self.n_outputs, dtype=jnp.float32)
-        alpha_out  = self._module.apply(params, alpha_zero)
-        alpha_2d   = alpha_out.reshape(self.n_eigenvectors, self.n_outputs)
-        return np.array(self._Phi @ alpha_2d)
-
-    def to(self, device=None, dtype=None, seed: int = 0) -> 'AlphaPINNNetwork':
-        """PyTorch-compatible no-op for JAX."""
+    def to(self, device=None, dtype=None, seed: int = 0) -> 'AlphaPINN':
         if not hasattr(self, 'params') or self.params is None:
             self.params = self.init(jax.random.PRNGKey(seed))
         return self
 
     @property
     def mesh_nodes(self) -> np.ndarray:
-        return self._nodes_np.copy()
-
-    @property
-    def mesh_faces(self) -> np.ndarray:
-        return self._faces_np.copy()
+        return self.laplacian_features._nodes_np.copy()
 
     @property
     def eigenvectors(self) -> np.ndarray:
-        """Laplace eigenvectors Φ, shape ``(n_nodes, K)``."""
-        return np.array(self._Phi)
+        """Laplace eigenvectors Φ, shape ``(n_nodes, n_eig)``."""
+        return np.array(self.laplacian_features._Phi)
 
     def __repr__(self) -> str:
+        mode = "space-time" if self.has_time else "spatial"
         return (
-            f"AlphaPINNNetwork("
-            f"n_nodes={self.n_nodes}, K={self.n_eigenvectors}, "
-            f"hidden_dim={self.hidden_dim}, n_layers={self.n_layers}, "
+            f"AlphaPINN("
+            f"n_nodes={self.n_nodes}, "
+            f"encoding={self.laplacian_features!r}, "
+            f"hidden_dims={self.hidden_dims}, "
             f"n_outputs={self.n_outputs}, "
-            f"hard_constraints={self.hard_constraints}, "
-            f"use_state={self.use_state}, use_time={self.use_time})"
+            f"mode={mode!r})"
         )
+
+
+# Backward-compatibility alias
+AlphaPINNNetwork = AlphaPINN

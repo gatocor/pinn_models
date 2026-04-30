@@ -679,6 +679,7 @@ class ProblemWeak:
     obs_spatial: Optional[List[str]] = field(default=None)
     n_time_points: Optional[int] = None
     n_time_steps: Optional[int] = None
+    hard_constraints: bool = True
 
     # ── filled by __post_init__ ──────────────────────────────────────────
     cubature_data:    Dict       = field(init=False, default_factory=dict)
@@ -688,7 +689,7 @@ class ProblemWeak:
     dirichlet_nodes:  np.ndarray = field(init=False, default=None)
 
     def __post_init__(self):
-        from .domain import DomainMesh
+        from .domain import DomainMesh, DomainMeshContinuous, DomainMeshDiscrete
         from .boundary import MeshNodeBC
 
         if not isinstance(self.domain, DomainMesh):
@@ -696,6 +697,14 @@ class ProblemWeak:
                 "ProblemWeak requires a DomainMesh domain; "
                 f"got {type(self.domain).__name__}."
             )
+
+        # ── Auto-populate from typed subclasses ──────────────────────────────
+        # DomainMeshDiscrete: read n_steps → n_time_steps
+        if isinstance(self.domain, DomainMeshDiscrete) and self.n_time_steps is None:
+            self.n_time_steps = self.domain.n_steps
+        # DomainMeshContinuous: read n_time_points from domain if not set
+        if isinstance(self.domain, DomainMeshContinuous) and self.n_time_points is None:
+            self.n_time_points = self.domain.n_time_points
         if self.basis != "lagrange":
             raise ValueError(
                 f"Only 'lagrange' basis is currently supported; "
@@ -816,6 +825,30 @@ class ProblemWeak:
 
         # Store free_mask in cubature_data for easy access
         self.cubature_data['free_mask'] = free_mask
+
+        # ── Hard-constraint BC mask ───────────────────────────────────────────
+        # Build nodal bc_mask / bc_values from 'all'-time Dirichlet BCs.
+        # Exposed via self.output_transform as a callable for use as
+        # output_transform in any network (FNN, AlphaPINN, …).
+        n_out = len(self.output_names)
+        _bc_mask   = np.zeros((len(verts), n_out), dtype=np.float32)
+        _bc_values = np.zeros((len(verts), n_out), dtype=np.float32)
+        if self.hard_constraints:
+            for bc in self.domain.boundary_conditions:
+                if not (isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet'):
+                    continue
+                if getattr(bc, 't_mode', None) not in (None, 'all'):
+                    continue   # skip IC / final-time BCs
+                comp = getattr(bc, 'component', 0)
+                if comp >= n_out:
+                    continue
+                node_idx = np.unique(bc.edges)
+                node_pos = verts[node_idx]
+                vals = bc.get_value(node_pos)
+                _bc_mask[node_idx, comp]   = 1.0
+                _bc_values[node_idx, comp] = vals
+        self._bc_mask_np   = _bc_mask
+        self._bc_values_np = _bc_values
 
         # ── Nodal support volumes + boundary edge lengths ─────────────────────
         # For each node j we build a normaliser that makes R̂_j = R_j / norm_j
@@ -939,38 +972,51 @@ class ProblemWeak:
         # [t_min, t_max] correctly.
         _t_min = getattr(self.domain, '_t_min', None)
         _t_max = getattr(self.domain, '_t_max', None)
+        self._t_min = _t_min
+        self._t_max = _t_max
+        _t_sampling = getattr(self.domain, '_t_sampling_method', 'midpoint')
+        self._t_sampling_method = _t_sampling
+        # "midpoint" → fixed tiling at construction; anything else → dynamic
+        # per-epoch random/quasi-random sampling inside make_loss_fn.
+        _random_time_sampling = (_t_sampling != 'midpoint')
+        self._random_time_sampling = _random_time_sampling
         if _t_min is not None and _t_max is not None:
             n_t = self.n_time_points if (self.n_time_points is not None) else 10
-            _dt = (_t_max - _t_min) / n_t
-            # Mid-point rule: t_i = t_min + (i + 0.5)*dt
-            t_vals = _t_min + (np.arange(n_t) + 0.5) * _dt  # (n_t,)
-            cd = self.cubature_data
-            F, Q, _ = cd['pts'].shape
-            # pts: (F, Q, 2) → (n_t, F, Q, 3) → (n_t*F, Q, 3)
-            pts_xy   = cd['pts']                                    # (F, Q, 2)
-            t_col    = np.broadcast_to(
-                t_vals[:, None, None, None], (n_t, F, Q, 1)
-            ).copy()                                                 # (n_t, F, Q, 1)
-            pts_xy4d = np.broadcast_to(
-                pts_xy[None], (n_t, F, Q, 2)
-            ).copy()                                                 # (n_t, F, Q, 2)
-            pts_st   = np.concatenate([pts_xy4d, t_col], axis=-1)   # (n_t, F, Q, 3)
-            pts_st   = pts_st.reshape(n_t * F, Q, 3).astype(np.float32)
-            # weights scaled by dt (time integration weight)
-            weights_st  = np.tile(cd['weights'],   (n_t, 1)) * _dt  # (n_t*F, Q)
-            phi_st      = np.tile(cd['phi'],       (n_t, 1, 1))     # (n_t*F, Q, L)
-            gphi_st     = np.tile(cd['grad_phi'],  (n_t, 1, 1, 1))  # (n_t*F, Q, L, 2)
-            node_ids_st = np.tile(cd['node_ids'],  (n_t, 1))        # (n_t*F, L)
-            self.cubature_data = {
-                'pts':       pts_st,
-                'weights':   weights_st.astype(np.float32),
-                'phi':       phi_st.astype(np.float32),
-                'grad_phi':  gphi_st.astype(np.float32),
-                'node_ids':  node_ids_st,
-                'dof_coords':   cd['dof_coords'],
-                'edge_to_dofs': cd['edge_to_dofs'],
-                'free_mask':    cd['free_mask'],
-            }
+            self._n_t = n_t
+            if _random_time_sampling:
+                # Keep spatial-only cubature; dynamic tiling done inside make_loss_fn
+                pass
+            else:
+                _dt = (_t_max - _t_min) / n_t
+                # Mid-point rule: t_i = t_min + (i + 0.5)*dt
+                t_vals = _t_min + (np.arange(n_t) + 0.5) * _dt  # (n_t,)
+                cd = self.cubature_data
+                F, Q, _ = cd['pts'].shape
+                # pts: (F, Q, 2) → (n_t, F, Q, 3) → (n_t*F, Q, 3)
+                pts_xy   = cd['pts']                                    # (F, Q, 2)
+                t_col    = np.broadcast_to(
+                    t_vals[:, None, None, None], (n_t, F, Q, 1)
+                ).copy()                                                 # (n_t, F, Q, 1)
+                pts_xy4d = np.broadcast_to(
+                    pts_xy[None], (n_t, F, Q, 2)
+                ).copy()                                                 # (n_t, F, Q, 2)
+                pts_st   = np.concatenate([pts_xy4d, t_col], axis=-1)   # (n_t, F, Q, 3)
+                pts_st   = pts_st.reshape(n_t * F, Q, 3).astype(np.float32)
+                # weights scaled by dt (time integration weight)
+                weights_st  = np.tile(cd['weights'],   (n_t, 1)) * _dt  # (n_t*F, Q)
+                phi_st      = np.tile(cd['phi'],       (n_t, 1, 1))     # (n_t*F, Q, L)
+                gphi_st     = np.tile(cd['grad_phi'],  (n_t, 1, 1, 1))  # (n_t*F, Q, L, 2)
+                node_ids_st = np.tile(cd['node_ids'],  (n_t, 1))        # (n_t*F, L)
+                self.cubature_data = {
+                    'pts':       pts_st,
+                    'weights':   weights_st.astype(np.float32),
+                    'phi':       phi_st.astype(np.float32),
+                    'grad_phi':  gphi_st.astype(np.float32),
+                    'node_ids':  node_ids_st,
+                    'dof_coords':   cd['dof_coords'],
+                    'edge_to_dofs': cd['edge_to_dofs'],
+                    'free_mask':    cd['free_mask'],
+                }
 
         # ── output_range ────────────────────────────────────────────────
         if self.output_range is not None:
@@ -985,6 +1031,24 @@ class ProblemWeak:
     def n_free_nodes(self) -> int:
         """Number of free (non-Dirichlet) DOFs = number of test functions."""
         return len(self.free_nodes)
+
+    @property
+    def hard_bc_names(self) -> set:
+        """Names of BCs that are hard-constrained (t_mode='all' Dirichlet).
+
+        These BCs are satisfied exactly by the network's output_transform and
+        contribute zero residual, so they should be excluded from soft-loss
+        computation.
+        """
+        from .boundary import MeshNodeBC
+        names = set()
+        for bc in self.domain.boundary_conditions:
+            if (isinstance(bc, MeshNodeBC)
+                    and bc.bc_type == 'dirichlet'
+                    and getattr(bc, 't_mode', None) not in ('t_min', 't_max')
+                    and getattr(bc, 'name', None) is not None):
+                names.add(bc.name)
+        return names
 
     @property
     def n_dofs(self) -> int:
@@ -1010,6 +1074,47 @@ class ProblemWeak:
             "infer":    {},
             "internal": internal or {'global_step': 0, 'step': 0},
         }
+
+    @property
+    def output_transform(self):
+        """
+        Hard-constraint output transform derived from Dirichlet BCs on the domain.
+
+        Returns a callable ``f(x_original, y, params_dict) -> y`` that clamps
+        network outputs to their prescribed Dirichlet values at constrained
+        boundary nodes (only ``t_mode='all'`` BCs).
+
+        Pass directly to a network::
+
+            net = AlphaPINN(domain, n_features=32, hidden_dims=[128]*4,
+                            output_transform=problem.output_transform)
+
+        Returns ``None`` when ``hard_constraints=False`` or when there are no
+        eligible Dirichlet BCs on the domain.
+        """
+        if not self.hard_constraints or not np.any(self._bc_mask_np):
+            return None
+
+        import jax.numpy as _jnp
+        _verts = self.domain._vertices[:, :self.domain._spatial_dims].astype(np.float32)
+        _faces = self.domain._faces.astype(np.int32)
+        _bc_mask   = np.array(self._bc_mask_np,   dtype=np.float32)
+        _bc_values = np.array(self._bc_values_np, dtype=np.float32)
+
+        def _transform(x_original, y, params_dict=None):
+            from .backends.jax.gnn_network import _interpolate_mesh
+            import jax.numpy as jnp
+            nodes = jnp.array(_verts)
+            faces = jnp.array(_faces)
+            bc_mask_jnp   = jnp.array(_bc_mask)
+            bc_values_jnp = jnp.array(_bc_values)
+            spatial_dims = _verts.shape[1]
+            x_spatial = x_original[:, :spatial_dims]
+            mask_x = _interpolate_mesh(bc_mask_jnp,   nodes, faces, x_spatial)
+            val_x  = _interpolate_mesh(bc_values_jnp, nodes, faces, x_spatial)
+            return (1.0 - mask_x) * y + mask_x * val_x
+
+        return _transform
 
     def make_rollout_loss_fn(self, network, n_steps=None, face_batch_size=None):
         """
@@ -1158,34 +1263,33 @@ class ProblemWeak:
 
         return loss_fn
 
-    def make_loss_fn(self, u_and_grad_fn, bc_weights: dict = None):
+    def make_loss_fn(self, u_and_grad_fn, bc_weights: dict = None, node_batch_size: int = None):
         """
-        Return a JAX-jittable ``loss_fn(params) -> scalar`` that assembles
-        the full weak-form residual and returns the MSE over free nodes.
+        Return a JAX-jittable loss function that assembles the full weak-form
+        residual and returns the MSE over free nodes.
 
-        Parameters
-        ----------
-        u_and_grad_fn : callable
-            Single-point evaluator with signature::
+        When ``random_time_sampling=False`` the returned function has signature
+        ``loss_fn(params) -> scalar``.
 
-                u_and_grad_fn(params, xy) -> (u_scalar, grad_u_2d)
+        When ``random_time_sampling=True`` the returned function has signature
+        ``loss_fn(params, t_vals) -> scalar``.
 
-            where ``xy`` is a 1-D array of shape ``(n_dims,)``,
-            ``u_scalar`` is a scalar, and ``grad_u_2d`` has shape ``(n_dims,)``.
-            Typically built with ``jax.value_and_grad``.
-
-        Returns
-        -------
-        loss_fn : callable
-            ``loss_fn(params) -> scalar`` — suitable for ``jax.jit`` and
-            ``jax.value_and_grad``.
+        When ``node_batch_size`` is set (only valid with ``random_time_sampling=True``)
+        the returned function has signature
+        ``loss_fn(params, node_idx, t_per_node) -> scalar``.
+        ``node_idx`` selects which free nodes (test functions) to include;
+        ``t_per_node`` assigns one random time level per selected node.
+        This gives an unbiased estimate of the full loss and only evaluates
+        the small patch of faces that support each selected test function.
         """
         import jax
         import jax.numpy as jnp
 
+        _random_time = self._random_time_sampling
+
         cd             = self.cubature_data
-        pts_jax        = jnp.asarray(cd['pts'],      dtype=jnp.float32)   # (F, Q, 2)
-        weights_jax    = jnp.asarray(cd['weights'],  dtype=jnp.float32)   # (F, Q)
+        pts_jax        = jnp.asarray(cd['pts'],      dtype=jnp.float32)   # (F, Q, 2) or (n_t*F, Q, 3)
+        weights_jax    = jnp.asarray(cd['weights'],  dtype=jnp.float32)   # (F, Q) or (n_t*F, Q)
         phi_jax        = jnp.asarray(cd['phi'],      dtype=jnp.float32)   # (F, Q, L)
         grad_phi_jax   = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)   # (F, Q, L, 2)
         node_ids_jax   = jnp.asarray(cd['node_ids'], dtype=jnp.int32)     # (F, L)
@@ -1204,6 +1308,11 @@ class ProblemWeak:
         params_dict = self._build_params()
 
         _bc_weights = bc_weights or {}
+
+        # Spatial-only dimensions for random-time tiling
+        _sp_F = n_faces   # spatial faces (same as n_faces when random_time_sampling)
+        _sp_Q = n_qpts
+        _t_interval_f = float((self._t_max or 1.0) - (self._t_min or 0.0)) if _random_time else 1.0
 
         # Pre-convert boundary data to JAX arrays (outside closure for efficiency)
         # Also precompute the set of free nodes belonging to each weak-BC boundary
@@ -1225,8 +1334,114 @@ class ProblemWeak:
 
         _n_pts_dims = pts_jax.shape[-1]  # 2 for spatial-only, 3 for space-time
 
-        def loss_fn(params):
-            pts_flat = pts_jax.reshape(-1, _n_pts_dims)               # (F*Q, n_dims)
+        if _random_time:
+            if node_batch_size is not None:
+                # ── Node-level mini-batch ────────────────────────────────────────
+                # For each free node j, precompute the list of (face_idx, local_a)
+                # pairs that contribute to its residual R_j.
+                import numpy as _np
+                _cd_nids_np = np.array(cd['node_ids'])   # (F, L)
+                _F, _L = _cd_nids_np.shape
+                _free_set = {int(v): i for i, v in enumerate(np.array(self.free_nodes))}
+                _N_free = len(self.free_nodes)
+                _patch_list = [[] for _ in range(_N_free)]
+                for _f in range(_F):
+                    for _a in range(_L):
+                        _gn = int(_cd_nids_np[_f, _a])
+                        if _gn in _free_set:
+                            _patch_list[_free_set[_gn]].append((_f, _a))
+                _max_K = max(len(p) for p in _patch_list) if _patch_list else 1
+                _pf_np  = np.zeros((_N_free, _max_K), dtype=np.int32)
+                _pa_np  = np.zeros((_N_free, _max_K), dtype=np.int32)
+                _pm_np  = np.zeros((_N_free, _max_K), dtype=np.float32)
+                for _fi, _patches in enumerate(_patch_list):
+                    for _k, (_f, _a) in enumerate(_patches):
+                        _pf_np[_fi, _k] = _f
+                        _pa_np[_fi, _k] = _a
+                        _pm_np[_fi, _k] = 1.0
+                _patch_faces_j = jnp.asarray(_pf_np)    # (N_free, max_K)
+                _patch_local_j = jnp.asarray(_pa_np)    # (N_free, max_K)
+                _patch_mask_j  = jnp.asarray(_pm_np)    # (N_free, max_K)
+                _Q_val  = n_qpts
+                _K_val  = _max_K
+
+                def loss_fn(params, node_idx, t_per_node):
+                    # node_idx: (B,)  t_per_node: (B,)
+                    B    = node_idx.shape[0]
+                    pf   = _patch_faces_j[node_idx]   # (B, K)
+                    pa   = _patch_local_j[node_idx]   # (B, K)
+                    pm   = _patch_mask_j[node_idx]    # (B, K)
+                    # Build space-time quad points: one t per node, broadcast to all its patches
+                    pts_xy  = pts_jax[pf]             # (B, K, Q, 2)
+                    t_bkq   = jnp.reshape(t_per_node, (B, 1, 1, 1)) * jnp.ones((1, _K_val, _Q_val, 1))
+                    pts_st  = jnp.concatenate([pts_xy, t_bkq], axis=-1)  # (B, K, Q, 3)
+                    BK      = B * _K_val
+                    # Evaluate network at all (B*K*Q) quadrature points
+                    u_f, gu_f = jax.vmap(
+                        lambda xy: u_and_grad_fn(params, xy))(
+                        pts_st.reshape(BK * _Q_val, 3))
+                    _scalar = (u_f.ndim == 1)
+                    if _scalar:
+                        y_bkq  = u_f.reshape(BK, _Q_val, 1)          # (BK, Q, 1)
+                        gu_bkq = gu_f.reshape(BK, _Q_val, gu_f.shape[-1])  # (BK, Q, n_dims)
+                    else:
+                        y_bkq  = u_f.reshape(BK, _Q_val, u_f.shape[-1])
+                        gu_bkq = gu_f.reshape(BK, _Q_val, u_f.shape[-1], gu_f.shape[-1])
+                    # Gather test-function arrays for each (b, k)
+                    phi_bk   = phi_jax[pf, :, pa]          # (B, K, Q)
+                    gphi_bk  = grad_phi_jax[pf, :, pa, :]  # (B, K, Q, 2)
+                    w_bk     = weights_jax[pf]              # (B, K, Q)
+                    # Per-element scalar integral via vmap
+                    def single_elem(y_q, gu_q, phi_q, gphi_q, w_q, pts_q):
+                        # shapes: (Q,1), (Q,n), (Q,), (Q,2), (Q,), (Q,3)
+                        if _scalar:
+                            def _d(Y, X, comp, order):
+                                dim = order[0] if isinstance(order, (tuple, list)) else order
+                                return gu_q[:, dim]
+                        else:
+                            def _d(Y, X, comp, order):
+                                dim = order[0] if isinstance(order, (tuple, list)) else order
+                                return gu_q[:, comp, dim]
+                        ig = volume_fn(pts_q, y_q, params_dict, phi_q, gphi_q, _d)
+                        return jnp.sum(w_q * ig)
+                    elem_ints = jax.vmap(single_elem)(
+                        y_bkq,
+                        gu_bkq,
+                        phi_bk.reshape(BK, _Q_val),
+                        gphi_bk.reshape(BK, _Q_val, 2),
+                        w_bk.reshape(BK, _Q_val),
+                        pts_st.reshape(BK, _Q_val, 3),
+                    )  # (BK,)
+                    # Scale by time-interval length (MC weight for unbiased time integral)
+                    elem_ints = (elem_ints * _t_interval_f).reshape(B, _K_val)
+                    # Sum patches per node (masked)
+                    R = jnp.sum(elem_ints * pm, axis=1)   # (B,)
+                    # Normalise by node support volume (same as full _assemble path)
+                    norm_b = node_norm_jax[free_nodes_jax[node_idx]]  # (B,)
+                    R_norm = R / norm_b
+                    return jnp.mean(R_norm ** 2)
+            else:
+                def loss_fn(params, t_vals):
+                    # Dynamically tile spatial cubature with sampled time levels
+                    n_t = t_vals.shape[0]
+                    dt_w = _t_interval_f / n_t                           # MC time weight
+                    t4d  = jnp.reshape(t_vals, (n_t, 1, 1, 1)) * jnp.ones((_sp_F, _sp_Q, 1))
+                    pts_xy4d = jnp.broadcast_to(pts_jax[None], (n_t, _sp_F, _sp_Q, 2))
+                    pts_st   = jnp.concatenate([pts_xy4d, t4d], axis=-1).reshape(n_t * _sp_F, _sp_Q, 3)
+                    _eff_pts   = pts_st
+                    _eff_w     = jnp.tile(weights_jax, (n_t, 1)) * dt_w  # (n_t*F, Q)
+                    _eff_phi   = jnp.tile(phi_jax,     (n_t, 1, 1))      # (n_t*F, Q, L)
+                    _eff_gphi  = jnp.tile(grad_phi_jax,(n_t, 1, 1, 1))   # (n_t*F, Q, L, 2)
+                    _eff_nids  = jnp.tile(node_ids_jax,(n_t, 1))         # (n_t*F, L)
+                    _eff_nf    = n_t * _sp_F
+                    _eff_nq    = _sp_Q
+                    return _assemble(params, _eff_pts, _eff_w, _eff_phi, _eff_gphi, _eff_nids, _eff_nf, _eff_nq)
+        else:
+            def loss_fn(params):
+                return _assemble(params, pts_jax, weights_jax, phi_jax, grad_phi_jax, node_ids_jax, n_faces, n_qpts)
+
+        def _assemble(params, _eff_pts, _eff_w, _eff_phi, _eff_gphi, _eff_nids, _eff_nf, _eff_nq):
+            pts_flat = _eff_pts.reshape(-1, _eff_pts.shape[-1])               # (F*Q, n_dims)
 
             # Evaluate u and ∇u / full Jacobian at all quadrature points
             u_flat, grad_u_flat = jax.vmap(
@@ -1258,8 +1473,8 @@ class ProblemWeak:
             # The loss is the mean of MSE across all component residual vectors.
             R_sample = volume_fn(
                 pts_flat, y_flat, params_dict,
-                phi_jax[:, :, 0].reshape(-1),
-                grad_phi_jax[:, :, 0, :].reshape(-1, 2),
+                _eff_phi[:, :, 0].reshape(-1),
+                _eff_gphi[:, :, 0, :].reshape(-1, 2),
                 deriv,
             )
             _multi = isinstance(R_sample, (tuple, list))
@@ -1267,8 +1482,8 @@ class ProblemWeak:
 
             Rs = [jnp.zeros(n_dofs, dtype=jnp.float32) for _ in range(_n_comp)]
             for a in range(n_local):
-                phi_a  = phi_jax[:, :, a]                             # (F, Q)
-                gphi_a = grad_phi_jax[:, :, a, :]                     # (F, Q, 2)
+                phi_a  = _eff_phi[:, :, a]                            # (F, Q)
+                gphi_a = _eff_gphi[:, :, a, :]                        # (F, Q, 2)
 
                 integrand = volume_fn(
                     pts_flat,
@@ -1282,14 +1497,14 @@ class ProblemWeak:
                 if _multi:
                     for k, ig in enumerate(integrand):
                         elem_int = jnp.einsum(
-                            'fq,fq->f', weights_jax,
-                            ig.reshape(n_faces, n_qpts))
-                        Rs[k] = Rs[k].at[node_ids_jax[:, a]].add(elem_int)
+                            'fq,fq->f', _eff_w,
+                            ig.reshape(_eff_nf, _eff_nq))
+                        Rs[k] = Rs[k].at[_eff_nids[:, a]].add(elem_int)
                 else:
                     elem_int = jnp.einsum(
-                        'fq,fq->f', weights_jax,
-                        integrand.reshape(n_faces, n_qpts))
-                    Rs[0] = Rs[0].at[node_ids_jax[:, a]].add(elem_int)
+                        'fq,fq->f', _eff_w,
+                        integrand.reshape(_eff_nf, _eff_nq))
+                    Rs[0] = Rs[0].at[_eff_nids[:, a]].add(elem_int)
 
             # ── Subtract boundary traction RHS  ∫_Γ t_k · φ_j ds ──────────────
             for _bj in _bdata_jax:

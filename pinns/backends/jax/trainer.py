@@ -102,6 +102,19 @@ class Trainer(BaseTrainer):
                 resolved.append(bc_name)
         return resolved
 
+    def _get_soft_bc_names(self) -> list:
+        """BC names to show in plots/history — hard-constrained BCs excluded for ProblemWeak."""
+        names = super()._get_bc_names()
+        from pinns.problem_weak import ProblemWeak as _PW
+        if isinstance(self.problem, _PW):
+            _hard = self.problem.hard_bc_names
+            names = [n for n in names if n not in _hard]
+        return names
+
+    def _get_bc_plot_names(self) -> list:
+        """Use soft (filtered) names for plot labels."""
+        return self._get_soft_bc_names()
+
     def compile(
         self,
         *args,
@@ -110,14 +123,52 @@ class Trainer(BaseTrainer):
         lagrange_lr: float = 1.0,
         lagrange_max: float = 1e6,
         lagrange_optimizer: str = "adam",
+        train_samples: dict = None,
+        test_samples=None,
         **kwargs,
     ):
         """
         Compile trainer in a single-class setup.
 
         Standard or AL mode is selected within this class (no delegation).
+
+        Parameters
+        ----------
+        train_samples : dict, optional
+            Per-component sample counts.  Currently supports:
+            ``{'time': N}`` — override the number of random time points sampled
+            per epoch when ``problem.random_time_sampling=True``.
+            ``{'pde': N}`` — mini-batch N free nodes per epoch (unbiased estimator).
+        test_samples : dict or list, optional
+            Same format as ``train_samples``.  For ``ProblemWeak``, the ``pde``
+            key is accepted and silently ignored — test metrics always evaluate
+            the full-domain weak loss for stability.  Other BC keys are forwarded
+            to the base class as usual.
         """
-        super().compile(*args, **kwargs)
+        # For ProblemWeak: strip 'pde' from test_samples before base class sees it.
+        # The weak-form test loss always uses all nodes (no mini-batching in metrics).
+        from pinns.problem_weak import ProblemWeak as _PW
+        _is_weak = isinstance(self.problem, _PW)
+        _user_wants_test = test_samples is not None
+        if _is_weak and isinstance(test_samples, dict):
+            test_samples = {k: v for k, v in test_samples.items() if k != 'pde'} or None
+
+        super().compile(*args, test_samples=test_samples, **kwargs)
+        # Flag: ProblemWeak test loss uses the full weak-form (no test data needed)
+        self._weak_test_loss = bool(_is_weak and _user_wants_test)
+
+        # For ProblemWeak: remove hard-constrained BC data — output_transform
+        # satisfies them exactly so their soft loss is always zero.
+        if _is_weak:
+            _hard = self.problem.hard_bc_names
+            for _k in _hard:
+                self._train_data.pop(_k, None)
+                self._train_targets.pop(_k, None)
+                if self._test_data:
+                    self._test_data.pop(_k, None)
+                    self._test_targets.pop(_k, None)
+
+        self._train_samples = train_samples or {}
 
         resolved_constraints = lagrange_constraints
         if resolved_constraints is None:
@@ -478,8 +529,15 @@ class Trainer(BaseTrainer):
                         'x_deriv_dim':   bc.dim,
                     })
 
+        from pinns.problem_weak import ProblemWeak as _ProblemWeak
+        _hard_bc_names = (self.problem.hard_bc_names
+                          if isinstance(self.problem, _ProblemWeak) else set())
+
         for name in self._train_data.keys():
             if name == 'pde':
+                continue
+            # Hard-constrained BCs (ProblemWeak + output_transform) → skip soft loss
+            if name in _hard_bc_names:
                 continue
             bc = self._get_bc_by_name(name)
             if bc is not None:
@@ -584,6 +642,30 @@ class Trainer(BaseTrainer):
                         return u, jac
                 _weak_loss_fn = jax.jit(self.problem.make_loss_fn(_u_and_grad, bc_weights=weights))
                 self._weak_loss_fn = _weak_loss_fn
+                _is_random_time = getattr(self.problem, '_random_time_sampling', False)
+                if _is_random_time:
+                    _rts_t_min = float(getattr(self.problem, '_t_min', 0.0))
+                    _rts_t_max = float(getattr(self.problem, '_t_max', 1.0))
+                    _rts_n_t   = int(getattr(self.problem, '_n_t', 10))
+                    _rts_n_t   = int(getattr(self, '_train_samples', {}).get('time', _rts_n_t))
+                    _rts_method = getattr(self.problem, '_t_sampling_method', 'uniform')
+                    self._rts_t_min = _rts_t_min
+                    self._rts_t_max = _rts_t_max
+                    self._rts_n_t   = _rts_n_t
+                    self._rts_sampling_method = _rts_method
+                    # Node mini-batching: triggered by train_samples={'pde': N}
+                    _rts_n_nodes = getattr(self, '_train_samples', {}).get('pde', None)
+                    if _rts_n_nodes is not None:
+                        _rts_n_nodes = int(_rts_n_nodes)
+                        _n_free = len(self.problem.free_nodes)
+                        self._rts_n_nodes = _rts_n_nodes
+                        self._rts_n_free_nodes = _n_free
+                        self._weak_loss_fn_train = jax.jit(
+                            self.problem.make_loss_fn(
+                                _u_and_grad, bc_weights=weights,
+                                node_batch_size=_rts_n_nodes,
+                            )
+                        )
                 self._weak_residual_fn = jax.jit(
                     self.problem.make_residual_vector_fn(_u_and_grad))
         else:
@@ -629,6 +711,9 @@ class Trainer(BaseTrainer):
         _is_rollout_batch = (_is_weak and
                               getattr(self, '_rollout_face_batch', None) is not None and
                               getattr(self.problem, 'n_time_steps', None) is not None)
+        _is_random_time  = getattr(self, '_rts_t_min', None) is not None
+        _is_node_batch   = getattr(self, '_rts_n_nodes', None) is not None
+        _rts_sampling_method = getattr(self, '_rts_sampling_method', 'uniform')
         _weak_loss_fn_train = getattr(self, '_weak_loss_fn_train', _weak_loss_fn)
 
         def compute_loss(params, train_data, targets_dict, lm_params=None):
@@ -640,6 +725,11 @@ class Trainer(BaseTrainer):
                 if _is_rollout_batch:
                     face_idx = train_data['_rollout_face_idx']
                     pde_loss = _weak_loss_fn_train(params, face_idx)
+                elif _is_random_time:
+                    if _is_node_batch:
+                        pde_loss = _weak_loss_fn_train(params, train_data['_node_idx'], train_data['_t_vals'])
+                    else:
+                        pde_loss = _weak_loss_fn(params, train_data['_t_vals'])
                 else:
                     pde_loss = _weak_loss_fn(params)
                 total_loss = total_loss + pde_weight * pde_loss
@@ -832,12 +922,20 @@ class Trainer(BaseTrainer):
         """Override to include weak-form PDE residual in metrics for ProblemWeak."""
         from pinns.problem_weak import ProblemWeak as _ProblemWeak
         if isinstance(self.problem, _ProblemWeak) and hasattr(self, '_weak_loss_fn'):
-            # Strip 'pde' so base never tries to call problem.pde_fn
-            bc_data = {k: v for k, v in data.items() if k != 'pde'}
+            # Strip 'pde' and hard-constrained BCs (output_transform satisfies them exactly)
+            _hard = self.problem.hard_bc_names
+            bc_data = {k: v for k, v in data.items() if k != 'pde' and k not in _hard}
             total_loss, losses = super()._compute_total_loss(bc_data, params_dict, weights_dict)
             # Add weak PDE residual — always use full-batch loss fn for metrics
             pde_weight = weights_dict.get('pde', 1.0)
-            weak_pde_loss = float(self._weak_loss_fn(self.network.params))
+            if getattr(self, '_rts_t_min', None) is not None:
+                import numpy as _np
+                _t_vals = jnp.array(
+                    _np.linspace(self._rts_t_min, self._rts_t_max, self._rts_n_t)
+                )
+                weak_pde_loss = float(self._weak_loss_fn(self.network.params, _t_vals))
+            else:
+                weak_pde_loss = float(self._weak_loss_fn(self.network.params))
             losses['pde'] = pde_weight * weak_pde_loss
             extra = pde_weight * weak_pde_loss
             total_loss = extra if total_loss is None else total_loss + extra
@@ -848,13 +946,21 @@ class Trainer(BaseTrainer):
         """Override so the weak-form PDE loss is computed once, not per-batch."""
         from pinns.problem_weak import ProblemWeak as _ProblemWeak
         if isinstance(self.problem, _ProblemWeak) and hasattr(self, '_weak_loss_fn'):
-            # Strip 'pde' so base never tries to call problem.pde_fn
-            bc_data = {k: v for k, v in data.items() if k != 'pde'}
+            # Strip 'pde' and hard-constrained BCs (output_transform satisfies them exactly)
+            _hard = self.problem.hard_bc_names
+            bc_data = {k: v for k, v in data.items() if k != 'pde' and k not in _hard}
             total_loss, losses = super()._compute_total_loss_batched(
                 bc_data, params_dict, weights_dict, batch_size)
             # Add weak residual exactly once
             pde_weight = weights_dict.get('pde', 1.0)
-            weak_pde_loss = float(self._weak_loss_fn(self.network.params))
+            if getattr(self, '_rts_t_min', None) is not None:
+                import numpy as _np
+                _t_vals = jnp.array(
+                    _np.linspace(self._rts_t_min, self._rts_t_max, self._rts_n_t)
+                )
+                weak_pde_loss = float(self._weak_loss_fn(self.network.params, _t_vals))
+            else:
+                weak_pde_loss = float(self._weak_loss_fn(self.network.params))
             losses['pde'] = pde_weight * weak_pde_loss
             total_loss = (total_loss or 0.0) + pde_weight * weak_pde_loss
             return total_loss, losses
@@ -1010,7 +1116,7 @@ class Trainer(BaseTrainer):
                 self._train_data, params_dict, weights, batch_size=metrics_batch_size
             )
             pde_loss = float(individual_losses.get('pde', 0.0))
-            bc_names = self._get_bc_names()
+            bc_names = self._get_soft_bc_names()
             bc_losses_str = ", ".join(
                 f"{name}: {individual_losses.get(name, 0.0):.2e}" 
                 for name in bc_names
@@ -1020,13 +1126,14 @@ class Trainer(BaseTrainer):
             self.history['train_loss'].append(float(full_train_loss))
             self.history['loss'].append(float(full_train_loss))
             self.history['loss_pde'].append(pde_loss)
-            bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde']
+            bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde' and not name.startswith('_')]
             self.history['loss_bcs'].append(bc_losses)
             
-            if any(s > 0 for s in self.test_samples) and self._test_data:
-                test_weights = {k: 1.0 for k in self._test_data.keys()}
+            if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
+                _tw_data = self._test_data if self._test_data else {}
+                test_weights = {k: 1.0 for k in _tw_data.keys()}
                 test_total, _ = self._compute_total_loss_batched(
-                    self._test_data, params_dict, test_weights, batch_size=metrics_batch_size
+                    _tw_data, params_dict, test_weights, batch_size=metrics_batch_size
                 )
                 self.history['test_loss'].append(float(test_total))
             
@@ -1107,6 +1214,43 @@ class Trainer(BaseTrainer):
                 _face_idx = np.random.choice(_rnf, size=_rfb, replace=False).astype(np.int32)
                 self._train_data['_rollout_face_idx'] = jnp.array(_face_idx)
 
+            # ── Node mini-batching (train_samples={'pde': N}) ──────────────────────
+            _rts_n_nodes = getattr(self, '_rts_n_nodes', None)
+            if _rts_n_nodes is not None:
+                _n_free = self._rts_n_free_nodes
+                _node_idx = np.random.choice(_n_free, size=_rts_n_nodes, replace=_rts_n_nodes > _n_free).astype(np.int32)
+                self._train_data['_node_idx'] = jnp.array(_node_idx)
+                # One independent random time per sampled node
+                _t_per_node = (self._rts_t_min + np.random.uniform(0, 1, _rts_n_nodes) * (self._rts_t_max - self._rts_t_min)).astype(np.float32)
+                self._train_data['_t_vals'] = jnp.array(_t_per_node)
+
+            # ── Random time sampling: draw fresh t_vals each epoch ────────────────
+            _rts_t_min = getattr(self, '_rts_t_min', None)
+            if _rts_t_min is not None and _rts_n_nodes is None:  # skip when node-batching (handled above)
+                _rts_t_max    = self._rts_t_max
+                _rts_n_t      = self._rts_n_t
+                _rts_method   = getattr(self, '_rts_sampling_method', 'uniform')
+                if callable(_rts_method):
+                    _u = _rts_method(_rts_n_t, np.random.default_rng())
+                elif _rts_method in ('latin_hypercube', 'lhs'):
+                    _u = (np.arange(_rts_n_t) + np.random.uniform(0, 1, _rts_n_t)) / _rts_n_t
+                elif _rts_method == 'sobol':
+                    try:
+                        from scipy.stats.qmc import Sobol as _Sobol
+                        _u = _Sobol(d=1, scramble=True).random(_rts_n_t).ravel()
+                    except Exception:
+                        _u = np.random.uniform(0, 1, _rts_n_t)
+                elif _rts_method == 'halton':
+                    try:
+                        from scipy.stats.qmc import Halton as _Halton
+                        _u = _Halton(d=1, scramble=True).random(_rts_n_t).ravel()
+                    except Exception:
+                        _u = np.random.uniform(0, 1, _rts_n_t)
+                else:  # "uniform" or any unknown string
+                    _u = np.random.uniform(0, 1, _rts_n_t)
+                _t_vals = (_rts_t_min + _u * (_rts_t_max - _rts_t_min)).astype(np.float32)
+                self._train_data['_t_vals'] = jnp.array(_t_vals)
+
             if use_batching:
                 # Shuffle data and targets at the start of each epoch
                 shuffle_key, subkey = jax.random.split(shuffle_key)
@@ -1114,7 +1258,7 @@ class Trainer(BaseTrainer):
                 shuffled_train_targets = {}
                 train_targets = getattr(self, '_train_targets', {})
                 # Keys that should not be shuffled/batched (non-point arrays)
-                _no_shuffle_keys = {'_rollout_face_idx'}
+                _no_shuffle_keys = {'_rollout_face_idx', '_t_vals', '_node_idx'}
                 for name, data in self._train_data.items():
                     if name in _no_shuffle_keys:
                         shuffled_train_data[name] = data  # pass through as-is
@@ -1181,7 +1325,7 @@ class Trainer(BaseTrainer):
                     self._train_data, params_dict, weights, batch_size=metrics_batch_size
                 )
                 pde_loss = float(individual_losses.get('pde', 0.0))
-                bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde']
+                bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde' and not name.startswith('_')]
                 
                 self.history['epoch'].append(global_epoch)
                 self.history['train_loss'].append(float(full_train_loss))
@@ -1190,10 +1334,11 @@ class Trainer(BaseTrainer):
                 self.history['loss_bcs'].append(bc_losses)
                 
                 # Test loss (if test data available)
-                if any(s > 0 for s in self.test_samples) and self._test_data:
-                    test_weights = {k: 1.0 for k in self._test_data.keys()}
+                if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
+                    _tw_data = self._test_data if self._test_data else {}
+                    test_weights = {k: 1.0 for k in _tw_data.keys()}
                     test_total, _ = self._compute_total_loss_batched(
-                        self._test_data, params_dict, test_weights, batch_size=metrics_batch_size
+                        _tw_data, params_dict, test_weights, batch_size=metrics_batch_size
                     )
                     self.history['test_loss'].append(float(test_total))
                 
@@ -1201,7 +1346,7 @@ class Trainer(BaseTrainer):
                     sol_error = self._compute_solution_error()
                     self.history['solution_error'].append(sol_error)
                 
-                bc_names = self._get_bc_names()
+                bc_names = self._get_soft_bc_names()
                 bc_losses_str = ", ".join(
                     f"{name}: {individual_losses.get(name, 0.0):.2e}" 
                     for name in bc_names
@@ -1337,7 +1482,7 @@ class Trainer(BaseTrainer):
                 self._train_data, params_dict, weights, batch_size=metrics_batch_size
             )
             pde_loss = float(individual_losses.get('pde', 0.0))
-            bc_names = self._get_bc_names()
+            bc_names = self._get_soft_bc_names()
             bc_losses_str = ", ".join(
                 f"{name}: {individual_losses.get(name, 0.0):.2e}" 
                 for name in bc_names
@@ -1347,13 +1492,14 @@ class Trainer(BaseTrainer):
             self.history['train_loss'].append(float(full_train_loss))
             self.history['loss'].append(float(full_train_loss))
             self.history['loss_pde'].append(pde_loss)
-            bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde']
+            bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde' and not name.startswith('_')]
             self.history['loss_bcs'].append(bc_losses)
             
-            if any(s > 0 for s in self.test_samples) and self._test_data:
-                test_weights = {k: 1.0 for k in self._test_data.keys()}
+            if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
+                _tw_data = self._test_data if self._test_data else {}
+                test_weights = {k: 1.0 for k in _tw_data.keys()}
                 test_total, _ = self._compute_total_loss_batched(
-                    self._test_data, params_dict, test_weights, batch_size=metrics_batch_size
+                    _tw_data, params_dict, test_weights, batch_size=metrics_batch_size
                 )
                 self.history['test_loss'].append(float(test_total))
             
@@ -1395,7 +1541,7 @@ class Trainer(BaseTrainer):
                     self._train_data, params_dict, weights, batch_size=metrics_batch_size
                 )
                 pde_loss = float(individual_losses.get('pde', 0.0))
-                bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde']
+                bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde' and not name.startswith('_')]
                 
                 self.history['epoch'].append(global_epoch)
                 self.history['train_loss'].append(float(loss))
@@ -1404,10 +1550,11 @@ class Trainer(BaseTrainer):
                 self.history['loss_bcs'].append(bc_losses)
                 
                 # Test loss
-                if any(s > 0 for s in self.test_samples) and self._test_data:
-                    test_weights = {k: 1.0 for k in self._test_data.keys()}
+                if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
+                    _tw_data = self._test_data if self._test_data else {}
+                    test_weights = {k: 1.0 for k in _tw_data.keys()}
                     test_total, _ = self._compute_total_loss_batched(
-                        self._test_data, params_dict, test_weights, batch_size=metrics_batch_size
+                        _tw_data, params_dict, test_weights, batch_size=metrics_batch_size
                     )
                     self.history['test_loss'].append(float(test_total))
                 
@@ -1415,7 +1562,7 @@ class Trainer(BaseTrainer):
                     sol_error = self._compute_solution_error()
                     self.history['solution_error'].append(sol_error)
                 
-                bc_names = self._get_bc_names()
+                bc_names = self._get_soft_bc_names()
                 bc_losses_str = ", ".join(
                     f"{name}: {individual_losses.get(name, 0.0):.2e}" 
                     for name in bc_names
@@ -1462,7 +1609,11 @@ class Trainer(BaseTrainer):
         dirichlet_bcs = []
         neumann_bcs = []
         mesh_neumann_bcs = []   # MeshNodeBC with bc_type="neumann"
-        bc_names = self._get_bc_names()
+        bc_names = self._get_soft_bc_names()
+
+        from pinns.problem_weak import ProblemWeak as _ProblemWeak
+        _hard_bc_names_lbfgs = (self.problem.hard_bc_names
+                                 if isinstance(self.problem, _ProblemWeak) else set())
         
         # Get precomputed targets for callable BCs
         train_targets = getattr(self, '_train_targets', {})
@@ -1479,6 +1630,10 @@ class Trainer(BaseTrainer):
                 continue
             name = bc_names[_bc_name_idx5]
             _bc_name_idx5 += 1
+
+            # Hard-constrained BCs (ProblemWeak + output_transform) → skip soft loss
+            if name in _hard_bc_names_lbfgs:
+                continue
 
             if isinstance(bc, MeshNodeBC):
                 if bc.bc_type == "dirichlet":
@@ -2068,7 +2223,7 @@ def _train_lagrangian_mode_impl(self):
     if print_each > 0:
         _, compute_residuals = self._make_al_loss_fn(params_dict)
         residuals0 = compute_residuals(self.network.params, self._train_data, train_targets)
-        bc_names = self._get_bc_names()
+        bc_names = self._get_soft_bc_names()
         pde_mse0 = float(jnp.mean(residuals0['pde'] ** 2)) if 'pde' in residuals0 else 0.0
         bc_mse0 = [float(jnp.mean(residuals0[n] ** 2)) if n in residuals0 else 0.0 for n in bc_names]
         mse0 = float(sum(jnp.mean(g ** 2) for g in residuals0.values()))
@@ -2077,11 +2232,12 @@ def _train_lagrangian_mode_impl(self):
         self.history['train_loss'].append(mse0)
         self.history['loss_pde'].append([pde_mse0])
         self.history['loss_bcs'].append(bc_mse0)
-        if any(s > 0 for s in self.test_samples) and self._test_data:
+        if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
             metrics_batch_size = self._batch_size if self._batch_size and self._batch_size > 0 else 1000
-            test_weights0 = {k: 1.0 for k in self._test_data.keys()}
+            _tw_data0 = self._test_data if self._test_data else {}
+            test_weights0 = {k: 1.0 for k in _tw_data0.keys()}
             test_total0, _ = self._compute_total_loss_batched(
-                self._test_data, params_dict, test_weights0, batch_size=metrics_batch_size
+                _tw_data0, params_dict, test_weights0, batch_size=metrics_batch_size
             )
             self.history['test_loss'].append(float(test_total0))
         bc_losses_str0 = ", ".join(f"{bc_names[i]}: {bc_mse0[i]:.2e}" for i in range(len(bc_names)))
@@ -2121,7 +2277,7 @@ def _train_lagrangian_mode_impl(self):
         if print_each > 0 and ((epoch + 1) % print_each == 0 or epoch == start_epoch + epochs - 1):
             al_loss_val = float(loss)
             mse_loss_val = float(sum(jnp.mean(g ** 2) for g in residuals.values()))
-            bc_names = self._get_bc_names()
+            bc_names = self._get_soft_bc_names()
             pde_mse = float(jnp.mean(residuals['pde'] ** 2)) if 'pde' in residuals else 0.0
             bc_mse_losses = [float(jnp.mean(residuals[name] ** 2)) if name in residuals else 0.0 for name in bc_names]
             self.history['epoch'].append(epoch)
@@ -2134,11 +2290,12 @@ def _train_lagrangian_mode_impl(self):
             self.history.setdefault('al_bcs_lagrangian', []).append([float(losses.get(f'{name}_lagrangian', 0.0)) for name in bc_names])
             self.history['loss_pde'].append([pde_mse])
             self.history['loss_bcs'].append(bc_mse_losses)
-            if any(s > 0 for s in self.test_samples) and self._test_data:
+            if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
                 metrics_batch_size = self._batch_size if self._batch_size and self._batch_size > 0 else 1000
-                test_weights = {k: 1.0 for k in self._test_data.keys()}
+                _tw_data = self._test_data if self._test_data else {}
+                test_weights = {k: 1.0 for k in _tw_data.keys()}
                 test_total, _ = self._compute_total_loss_batched(
-                    self._test_data, params_dict, test_weights, batch_size=metrics_batch_size
+                    _tw_data, params_dict, test_weights, batch_size=metrics_batch_size
                 )
                 self.history['test_loss'].append(float(test_total))
 

@@ -34,14 +34,14 @@ _BACKEND = os.environ.get('PINNS_BACKEND', 'torch').lower()
 _backend_classes = {}
 
 # Domain and Problem are backend-agnostic
-from .domain import DomainCubic, DomainCubicPartition, DomainMesh, SubdomainInfo, bump
+from .domain import DomainCubic, DomainCubicPartition, DomainMesh, DomainMeshContinuous, DomainMeshDiscrete, SubdomainInfo, bump
 from .problem import Problem
 from .problem_weak import ProblemWeak
 
 # JAX-only mesh networks (always available if JAX is installed)
 try:
     from .backends.jax.gnn_network import GNNMeshNetwork
-    from .backends.jax.alpha_pinn_network import AlphaPINNNetwork
+    from .backends.jax.alpha_pinn_network import AlphaPINN, AlphaPINNNetwork, LaplacianFeatures
 except ImportError:
     pass
 
@@ -168,7 +168,9 @@ __all__ = [
     "ProblemWeak",
     # JAX-only mesh GNN
     "GNNMeshNetwork",
+    "AlphaPINN",
     "AlphaPINNNetwork",
+    "LaplacianFeatures",
     # Functional
     "derivative",
     "gradient",
