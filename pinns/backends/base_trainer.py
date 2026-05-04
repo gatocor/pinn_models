@@ -1674,12 +1674,22 @@ class BaseTrainer(ABC):
             else:
                 result.append(data['pde'])
             
+            # Collect hard-constrained BC names (weight is irrelevant for these)
+            _hard_names: set = set()
+            if isinstance(self.problem, _ProblemWeak):
+                _hard_names = (
+                    getattr(self.problem, 'hard_bc_names', set()) |
+                    getattr(self.problem, 'hard_ic_names', set())
+                )
+
             # Then BC values in order
             for i, bc_name in enumerate(bc_names):
                 if bc_name in data:
                     result.append(data[bc_name])
                 elif f'bc_{i}' in data:
                     result.append(data[f'bc_{i}'])
+                elif bc_name in _hard_names:
+                    result.append(0.0)   # hard-constrained — weight has no effect
                 else:
                     raise ValueError(
                         f"{param_name} dict missing key '{bc_name}' (or 'bc_{i}'). "

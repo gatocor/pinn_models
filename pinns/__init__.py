@@ -41,7 +41,7 @@ from . import meshes
 
 # JAX-only mesh networks (always available if JAX is installed)
 try:
-    from .backends.jax.gnn_network import GNNMeshNetwork
+    from .backends.jax.gnn_network import GNNMeshNetwork, GNNFeatures
     from .backends.jax.alpha_pinn_network import AlphaPINN, AlphaPINNNetwork, LaplacianFeatures
 except ImportError:
     pass
@@ -171,6 +171,7 @@ __all__ = [
     "ProblemWeak",
     # JAX-only mesh GNN
     "GNNMeshNetwork",
+    "GNNFeatures",
     "AlphaPINN",
     "AlphaPINNNetwork",
     "LaplacianFeatures",

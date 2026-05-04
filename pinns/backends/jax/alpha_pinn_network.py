@@ -38,7 +38,7 @@ import scipy.sparse.linalg as spla
 from flax import linen as nn
 from typing import Dict, Optional, Sequence, Callable, Any
 
-from .gnn_network import _interpolate_mesh
+from .gnn_network import _interpolate_mesh, _build_bc_arrays
 from .networks import get_activation, FNN
 
 
@@ -264,7 +264,6 @@ class AlphaPINN:
         Hard-constraint transform applied *after* network evaluation.
         Signature: ``f(x_original, y, params_dict) → y``.
         Obtain from ``ProblemWeak(..., hard_constraints=[...]).output_transform``.
-        For ``use_state=True``, prefer ``hard_constraints=True`` instead.
     input_transform : callable, optional
         Applied to raw query coordinates *before* the feature encoding
         (continuous mode only).
@@ -272,10 +271,6 @@ class AlphaPINN:
         ``None`` (default): auto-detect — ``True`` when *domain* is a
         :class:`~pinns.DomainMeshDiscrete`, ``False`` otherwise.
         Pass explicitly to override.
-    hard_constraints : bool
-        When ``True`` (default) and in state-integrator mode, Dirichlet BCs
-        registered on *domain* are enforced after spectral decode via static
-        condensation.
     residual : bool
         When ``True`` (default) and in state-integrator mode, use a residual
         (skip) connection: ``α^{n+1} = α^n + MLP(α^n)``.
@@ -298,7 +293,6 @@ class AlphaPINN:
         output_transform: Optional[Callable] = None,
         input_transform: Optional[Callable] = None,
         use_state: Optional[bool] = None,
-        hard_constraints: bool = True,
         residual: bool = True,
         normalize_input: bool = True,
     ):
@@ -318,7 +312,7 @@ class AlphaPINN:
         self.n_outputs        = n_outputs
         self.activation       = activation
         self.use_state        = use_state
-        self.hard_constraints = hard_constraints
+
         self.residual         = residual
         self.normalize_input  = normalize_input
         self.spatial_dims     = domain._spatial_dims
@@ -352,32 +346,10 @@ class AlphaPINN:
             self._fnn               = None
             self.laplacian_features = None
 
-            # Build BC masks (same logic as GNNMeshNetwork)
-            bc_mask_np   = np.zeros((self.n_nodes, n_outputs), dtype=np.float32)
-            bc_values_np = np.zeros((self.n_nodes, n_outputs), dtype=np.float32)
-            if hard_constraints:
-                from pinns.boundary import MeshNodeBC
-                for bc in getattr(domain, 'boundary_conditions', []):
-                    if not (isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet'):
-                        continue
-                    t_mode = getattr(bc, 't_mode', None)
-                    if t_mode not in (None, 'all'):
-                        continue
-                    comp = bc.component
-                    if comp >= n_outputs:
-                        continue
-                    if bc.node_indices is not None:
-                        node_idx = np.asarray(bc.node_indices).astype(np.int64)
-                    elif bc.edges is not None:
-                        node_idx = np.unique(bc.edges).astype(np.int64)
-                    else:
-                        continue
-                    node_pos = verts[node_idx]
-                    vals = bc.get_value(node_pos)
-                    bc_mask_np[node_idx, comp]   = 1.0
-                    bc_values_np[node_idx, comp] = vals
-            self._bc_mask_jnp   = jnp.array(bc_mask_np,   dtype=jnp.float32)
-            self._bc_values_jnp = jnp.array(bc_values_np, dtype=jnp.float32)
+            # Build BC masks — always enforced in state mode
+            self._bc_mask_jnp, self._bc_values_jnp = _build_bc_arrays(
+                domain, self.n_nodes, n_outputs, verts
+            )
 
         else:
             # ── Continuous space-time mode ────────────────────────────────
@@ -467,9 +439,8 @@ class AlphaPINN:
         node_coeffs = self._Phi @ alpha_next                    # (n_nodes, n_out)
 
         # ── 5. Hard Dirichlet BCs (static condensation) ─────────────────────
-        if self.hard_constraints:
-            node_coeffs = (node_coeffs * (1.0 - self._bc_mask_jnp)
-                           + self._bc_values_jnp * self._bc_mask_jnp)
+        node_coeffs = (node_coeffs * (1.0 - self._bc_mask_jnp)
+                       + self._bc_values_jnp * self._bc_mask_jnp)
 
         # ── 6. Barycentric interpolation at query points ──────────────────
         nodes_jnp = jnp.array(self._nodes_np)

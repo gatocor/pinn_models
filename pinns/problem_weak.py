@@ -1421,16 +1421,18 @@ class ProblemWeak:
         _gph = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)  # (F, Q, L, 2)
         _wts = jnp.asarray(cd['weights'],  dtype=jnp.float32)  # (F, Q)
         _nid = jnp.asarray(cd['node_ids'], dtype=jnp.int32)    # (F, L)
+        _pts = jnp.asarray(cd['pts'],      dtype=jnp.float32)  # (F, Q, 2)
 
         F, Q, L = _phi.shape
         n_dofs  = self.n_dofs
 
-        _free   = jnp.asarray(self.free_nodes, dtype=jnp.int32)
-        _dt     = jnp.float32(self.domain.dt)  # injected into params["internal"]["dt"] each step
-        _kappa  = jnp.float32(self.params.get("kappa", 1.0))
-        _n_time = n_steps if n_steps is not None else self.n_time_steps
-        _net    = network
-        _mesh   = jnp.asarray(self.domain._vertices, dtype=jnp.float32)
+        _free      = jnp.asarray(self.free_nodes, dtype=jnp.int32)
+        _dt        = jnp.float32(self.domain.dt)
+        _n_time    = n_steps if n_steps is not None else self.n_time_steps
+        _net       = network
+        _mesh      = jnp.asarray(self.domain._vertices, dtype=jnp.float32)
+        _fixed_par = self.params          # user-supplied fixed params (kappa, …)
+        _volume_fn = self.volume_fn       # the user's weak-form integrand
 
         # Per-step weights: normalised so they sum to n_time (same scale as uniform mean)
         if step_weights is not None:
@@ -1441,85 +1443,65 @@ class ProblemWeak:
         else:
             _step_weights_jax = None
 
-        # ── Helper: assemble residual from (possibly subsetted) face arrays ──
-        def _step_body(u_nodes, phi_b, gph_b, wts_b, nid_b):
-            """One implicit-Euler scan step.  *_b arrays cover a subset of faces."""
-            B = phi_b.shape[0]           # faces in this batch
-            Nc = B * Q
-            phi_f = phi_b.reshape(Nc, L)
-            gph_f = gph_b.reshape(Nc, L, 2)
-            wts_f = wts_b.reshape(Nc)
-            nid_f = jnp.tile(nid_b[:, None, :], (1, Q, 1)).reshape(Nc, L)
-
-            u_prev_cub = jnp.sum(phi_f * u_nodes[nid_f], axis=-1)   # (Nc,)
-
-            pdict = {"fixed": {
-                "u_prev_nodes": u_nodes,
-                "u_prev":       u_prev_cub,
-                "dt":           _dt,
-                "kappa":        _kappa,
-                "t_cur":        jnp.float32(0.0),
-            }}
-
-            # GNN forward on ALL mesh nodes (BCs hard-constrained in GNN)
-            u_next_nodes = _net.apply(u_nodes_params := None or {}, _mesh, pdict)
-            # ↑ _net.apply takes (params, x, params_dict); params passed via closure below
-
-        # _step_body above uses a closure trick; define proper versions below.
-        # ── Full-batch version ───────────────────────────────────────────────
+        # ── Full-batch flattened arrays ──────────────────────────────────────
         _phi_f_full = _phi.reshape(F * Q, L)
         _gph_f_full = _gph.reshape(F * Q, L, 2)
         _wts_f_full = _wts.reshape(F * Q)
         _nid_f_full = jnp.tile(_nid[:, None, :], (1, Q, 1)).reshape(F * Q, L)
+        _pts_f_full = _pts.reshape(F * Q, _pts.shape[-1])  # (FQ, 2)
 
-        # ── Lumped-mass vector: m[i] = ∫φ_i dΩ  (precomputed once) ─────────
-        # Normalising R[i] by m[i] makes the loss mesh-invariant: the same
-        # pointwise PDE residual yields the same loss regardless of mesh size h.
-        # Without this, loss ~ h^4 so a 2× finer mesh gives ~16× weaker gradients.
+        # ── Lumped-mass normaliser: m[i] = ∫φ_i dΩ ─────────────────────────
         _lumped_mass = jnp.zeros(n_dofs, dtype=jnp.float32)
         _lumped_mass = _lumped_mass.at[_nid_f_full.reshape(-1)].add(
             (_wts_f_full[:, None] * _phi_f_full).reshape(-1)
         )
         _lumped_mass_free = jnp.maximum(_lumped_mass[_free], 1e-12)
 
-        def _make_step_fn(phi_f, gph_f, wts_f, nid_f):
-            def step_fn(u_nodes, _):
-                u_prev_cub = jnp.sum(phi_f * u_nodes[nid_f], axis=-1)
-                pdict = {"fixed": {
-                    "u_prev_nodes": u_nodes,
-                    "u_prev":       u_prev_cub,
-                    "dt":           _dt,
-                    "kappa":        _kappa,
-                    "t_cur":        jnp.float32(0.0),
-                }}
-                u_next_nodes = _net.apply(step_fn._params, _mesh, pdict)
-                # params injected at call time via the carry trick below
-                raise RuntimeError("unreachable")
-            return step_fn
+        def _build_step_fn(phi_f, gph_f, wts_f, nid_f, pts_f, lumped_mass_free=None):
+            """Build a scan step that calls volume_fn for each local test function.
 
-        # Proper implementation without the helper trick:
-        def _build_step_fn(phi_f, gph_f, wts_f, nid_f, lumped_mass_free=None):
+            pdict layout seen by volume_fn:
+              pdict["fixed"]    — user params + u_prev_nodes (read by AlphaPINN)
+              pdict["internal"] — per-step assembler state: u_prev, dt, …
+            """
             _lm_free = _lumped_mass_free if lumped_mass_free is None else lumped_mass_free
+
             def step_fn(carry, w):
                 params, u_nodes = carry
-                u_prev_cub = jnp.sum(phi_f * u_nodes[nid_f], axis=-1)
-                pdict = {"fixed": {
-                    "u_prev_nodes": u_nodes,
-                    "u_prev":       u_prev_cub,
-                    "dt":           _dt,
-                    "kappa":        _kappa,
-                    "t_cur":        jnp.float32(0.0),
-                }}
-                u_next_nodes = _net.apply(params, _mesh, pdict)[:, 0]
-                grad_u    = jnp.einsum('kl,kli->ki', u_next_nodes[nid_f], gph_f)
-                u_vals    = jnp.sum(phi_f * u_next_nodes[nid_f], axis=-1)
-                mass_term = phi_f * ((u_vals - u_prev_cub) / _dt)[:, None]
-                diff_term = _kappa * jnp.einsum('ki,kli->kl', grad_u, gph_f)
-                contrib   = (mass_term + diff_term) * wts_f[:, None]
+                # Interpolate u^n and its FEM gradient at quadrature points
+                u_prev_cub  = jnp.sum(phi_f * u_nodes[nid_f], axis=-1)           # (FQ,)
+                grad_u_prev = jnp.einsum('kl,kli->ki', u_nodes[nid_f], gph_f)    # (FQ, 2)
+
+                # pdict["fixed"] carries u_prev_nodes so AlphaPINN can encode α^n
+                # pdict["internal"] carries per-step state for volume_fn
+                pdict = {
+                    "fixed":    {**_fixed_par, "u_prev_nodes": u_nodes},
+                    "internal": {"u_prev": u_prev_cub, "grad_u_prev": grad_u_prev, "dt": _dt},
+                }
+
+                # Network forward: u^{n+1} at all mesh nodes
+                u_next_nodes = _net.apply(params, _mesh, pdict)[:, 0]  # (n_dofs,)
+
+                # Interpolate u^{n+1} and its FEM gradient at quadrature points
+                u_next_cub = jnp.sum(phi_f * u_next_nodes[nid_f], axis=-1)  # (FQ,)
+                y_flat     = u_next_cub[:, None]                              # (FQ, 1)
+                grad_u     = jnp.einsum('kl,kli->ki', u_next_nodes[nid_f], gph_f)  # (FQ, 2)
+
+                # Assemble residual by calling volume_fn for each local basis fn
+                # L is small (3 for P1) so the Python loop unrolls at trace time.
                 R = jnp.zeros(n_dofs, dtype=jnp.float32)
-                R = R.at[nid_f.reshape(-1)].add(contrib.reshape(-1))
-                # Normalise by lumped mass so loss is mesh-size invariant:
-                # R̃[i] = R[i]/m[i] ≈ mean_x PDE(x) near node i  →  O(1) for any h
+                for la in range(L):
+                    phi_a  = phi_f[:, la]       # (FQ,)  test-fn values
+                    gphi_a = gph_f[:, la, :]    # (FQ, 2) test-fn gradients
+
+                    # derivative wrapper: phi is 1-D, y is 2-D
+                    def _deriv(Y, X, comp, order, _gu=grad_u, _gp=gphi_a):
+                        dim = order[0] if isinstance(order, (tuple, list)) else order
+                        return _gp[:, dim] if Y.ndim == 1 else _gu[:, dim]
+
+                    integrand = _volume_fn(pts_f, y_flat, pdict, phi_a, _deriv)  # (FQ,)
+                    R = R.at[nid_f[:, la]].add(integrand * wts_f)
+
                 step_loss = w * jnp.mean((R[_free] / _lm_free) ** 2)
                 return (params, u_next_nodes), step_loss
             return step_fn
@@ -1532,7 +1514,9 @@ class ProblemWeak:
 
         if face_batch_size is None:
             # ── Full-batch: loss_fn(params) ──────────────────────────────
-            _step = _build_step_fn(_phi_f_full, _gph_f_full, _wts_f_full, _nid_f_full)
+            _step = _build_step_fn(
+                _phi_f_full, _gph_f_full, _wts_f_full, _nid_f_full, _pts_f_full
+            )
 
             def loss_fn(params):
                 u0 = jnp.zeros(n_dofs, dtype=jnp.float32)
@@ -1541,25 +1525,24 @@ class ProblemWeak:
 
         else:
             # ── Mini-batch: loss_fn(params, face_idx) ────────────────────
-            # face_idx: (face_batch_size,) int32 — sampled at Python level each step
-
             def loss_fn(params, face_idx):
-                phi_b = _phi[face_idx]            # (B, Q, L)
-                gph_b = _gph[face_idx]            # (B, Q, L, 2)
-                wts_b = _wts[face_idx]            # (B, Q)
-                nid_b = _nid[face_idx]            # (B, L)
+                phi_b = _phi[face_idx]   # (B, Q, L)
+                gph_b = _gph[face_idx]   # (B, Q, L, 2)
+                wts_b = _wts[face_idx]   # (B, Q)
+                nid_b = _nid[face_idx]   # (B, L)
+                pts_b = _pts[face_idx]   # (B, Q, 2)
                 B = face_batch_size
                 phi_f = phi_b.reshape(B * Q, L)
                 gph_f = gph_b.reshape(B * Q, L, 2)
                 wts_f = wts_b.reshape(B * Q)
                 nid_f = jnp.tile(nid_b[:, None, :], (1, Q, 1)).reshape(B * Q, L)
-                # Batch lumped mass (only faces in this mini-batch)
+                pts_f = pts_b.reshape(B * Q, pts_b.shape[-1])
                 lm_batch = jnp.zeros(n_dofs, dtype=jnp.float32)
                 lm_batch = lm_batch.at[nid_f.reshape(-1)].add(
                     (wts_f[:, None] * phi_f).reshape(-1)
                 )
                 lm_batch_free = jnp.maximum(lm_batch[_free], 1e-12)
-                _step = _build_step_fn(phi_f, gph_f, wts_f, nid_f, lm_batch_free)
+                _step = _build_step_fn(phi_f, gph_f, wts_f, nid_f, pts_f, lm_batch_free)
                 u0 = jnp.zeros(n_dofs, dtype=jnp.float32)
                 (_, _), step_losses = jax.lax.scan(_step, (params, u0), _xs_full)
                 return jnp.mean(step_losses)
@@ -1611,41 +1594,50 @@ class ProblemWeak:
         _free   = jnp.asarray(self.free_nodes, dtype=jnp.int32)
         n_free  = len(self.free_nodes)
 
-        _dt    = jnp.float32(self.domain.dt)
-        _kappa = jnp.float32(self.params.get("kappa", 1.0))
-        _n_time = n_steps if n_steps is not None else self.n_time_steps
-        _net   = network
-        _mesh  = jnp.asarray(self.domain._vertices, dtype=jnp.float32)
-        # node_norm[a] = ∫ φ_a dΩ (+ boundary edge length for boundary nodes).
-        # Dividing R[a] by node_norm[a] gives the average strong-form residual
-        # weighted by φ_a over its support — scale-free w.r.t. mesh size.
+        _dt         = jnp.float32(self.domain.dt)
+        _n_time     = n_steps if n_steps is not None else self.n_time_steps
+        _net        = network
+        _mesh       = jnp.asarray(self.domain._vertices, dtype=jnp.float32)
+        _fixed_par  = self.params
+        _volume_fn  = self.volume_fn
+        # node_norm[a] = ∫ φ_a dΩ — scale-free normaliser
         _node_norm_free = jnp.asarray(self.node_norm[self.free_nodes], dtype=jnp.float32)
 
         phi_f = _phi.reshape(F * Q, L)
         gph_f = _gph.reshape(F * Q, L, 2)
         wts_f = _wts.reshape(F * Q)
         nid_f = jnp.tile(_nid[:, None, :], (1, Q, 1)).reshape(F * Q, L)
+        pts_f = jnp.asarray(cd['pts'], dtype=jnp.float32).reshape(F * Q, -1)  # (FQ, 2)
 
         def step_fn(carry, lam_n):
             params, u_nodes = carry
-            u_prev_cub = jnp.sum(phi_f * u_nodes[nid_f], axis=-1)
-            pdict = {"fixed": {
-                "u_prev_nodes": u_nodes,
-                "u_prev":       u_prev_cub,
-                "dt":           _dt,
-                "kappa":        _kappa,
-                "t_cur":        jnp.float32(0.0),
-            }}
-            u_next_nodes = _net.apply(params, _mesh, pdict)[:, 0]
-            grad_u    = jnp.einsum('kl,kli->ki', u_next_nodes[nid_f], gph_f)
-            u_vals    = jnp.sum(phi_f * u_next_nodes[nid_f], axis=-1)
-            mass_term = phi_f * ((u_vals - u_prev_cub) / _dt)[:, None]
-            diff_term = _kappa * jnp.einsum('ki,kli->kl', grad_u, gph_f)
-            contrib   = (mass_term + diff_term) * wts_f[:, None]
+            u_prev_cub  = jnp.sum(phi_f * u_nodes[nid_f], axis=-1)           # (FQ,)
+            grad_u_prev = jnp.einsum('kl,kli->ki', u_nodes[nid_f], gph_f)    # (FQ, 2)
+
+            pdict = {
+                "fixed":    {**_fixed_par, "u_prev_nodes": u_nodes},
+                "internal": {"u_prev": u_prev_cub, "grad_u_prev": grad_u_prev, "dt": _dt},
+            }
+
+            u_next_nodes = _net.apply(params, _mesh, pdict)[:, 0]   # (n_dofs,)
+
+            u_next_cub = jnp.sum(phi_f * u_next_nodes[nid_f], axis=-1)  # (FQ,)
+            y_flat     = u_next_cub[:, None]                              # (FQ, 1)
+            grad_u     = jnp.einsum('kl,kli->ki', u_next_nodes[nid_f], gph_f)  # (FQ, 2)
+
             R = jnp.zeros(n_dofs, dtype=jnp.float32)
-            R = R.at[nid_f.reshape(-1)].add(contrib.reshape(-1))
+            for la in range(L):
+                phi_a  = phi_f[:, la]
+                gphi_a = gph_f[:, la, :]
+
+                def _deriv(Y, X, comp, order, _gu=grad_u, _gp=gphi_a):
+                    dim = order[0] if isinstance(order, (tuple, list)) else order
+                    return _gp[:, dim] if Y.ndim == 1 else _gu[:, dim]
+
+                integrand = _volume_fn(pts_f, y_flat, pdict, phi_a, _deriv)  # (FQ,)
+                R = R.at[nid_f[:, la]].add(integrand * wts_f)
+
             # Normalise by support volume: R̂[a] = R[a] / ∫ φ_a dΩ
-            # This makes the residual scale-free w.r.t. mesh size.
             R_free = R[_free] / _node_norm_free
             # Augmented Lagrangian: linear term + quadratic penalty
             step_loss = jnp.dot(lam_n, R_free) / n_free + 0.5 * jnp.mean(R_free ** 2)

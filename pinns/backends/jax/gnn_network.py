@@ -122,8 +122,7 @@ class _GNNModule(nn.Module):
     poly_order     : Chebyshev polynomial order K (default 10, as in paper)
     message_steps  : number of stacked ChebConv layers
     n_outputs      : number of output channels per node
-    activation     : activation inside ChebConv (paper uses ReLU)
-    encoder_act    : activation for the input encoder Dense layer
+    activation     : activation inside ChebConv and input encoder (paper uses ReLU)
     """
     spatial_dims: int
     hidden_dim: int
@@ -131,7 +130,6 @@ class _GNNModule(nn.Module):
     message_steps: int
     n_outputs: int
     activation: str = 'relu'
-    encoder_act: str = 'tanh'
 
     @nn.compact
     def __call__(
@@ -143,7 +141,7 @@ class _GNNModule(nn.Module):
         n_nodes: int,
     ) -> jnp.ndarray:                # (n_nodes, n_outputs)
 
-        enc_act = get_activation(self.encoder_act)
+        enc_act = get_activation(self.activation)
 
         # --- Node encoder: position → hidden space --------------------------
         h = nn.Dense(self.hidden_dim, name='encoder')(node_coords)
@@ -161,6 +159,64 @@ class _GNNModule(nn.Module):
         # --- Node decoder ---------------------------------------------------
         coeffs = nn.Dense(self.n_outputs, name='decoder')(h)   # (n_nodes, n_outputs)
         return coeffs
+
+
+class _GNNEncoderModule(nn.Module):
+    """
+    GNN encoder without output projection: encoder Dense → ChebConv layers.
+
+    Returns node embeddings of shape ``(n_nodes, hidden_dim)`` rather than
+    the final ``(n_nodes, n_outputs)`` produced by :class:`_GNNModule`.
+    Used by :class:`GNNFeatures` and the refactored :class:`GNNMeshNetwork`.
+    """
+    encoder_in_dim: int   # actual encoder input dimension (may include t, u^n)
+    hidden_dim: int
+    poly_order: int
+    message_steps: int
+    activation: str = 'relu'
+
+    @nn.compact
+    def __call__(
+        self,
+        node_feats: jnp.ndarray,     # (n_nodes, encoder_in_dim)
+        edge_src: jnp.ndarray,       # (n_edges,)
+        edge_dst: jnp.ndarray,       # (n_edges,)
+        edge_weights: jnp.ndarray,   # (n_edges,)
+        n_nodes: int,
+    ) -> jnp.ndarray:                # (n_nodes, hidden_dim)
+        enc_act = get_activation(self.activation)
+        h = nn.Dense(self.hidden_dim, name='encoder')(node_feats)
+        h = enc_act(h)
+        for step in range(self.message_steps):
+            h = _ChebConvLayer(
+                hidden_dim  = self.hidden_dim,
+                poly_order  = self.poly_order,
+                activation  = self.activation,
+                name        = f'cheb_layer_{step}',
+            )(h, edge_src, edge_dst, edge_weights, n_nodes)
+        return h   # (n_nodes, hidden_dim)
+
+
+class _MLPDecoder(nn.Module):
+    """
+    Per-point MLP decoder: ``(batch, in_dim) → (batch, n_outputs)``.
+
+    When ``hidden_dims`` is empty this is a single linear projection.
+    """
+    hidden_dims: Sequence[int]
+    n_outputs: int
+    activation: str = 'tanh'
+    normalize_input: bool = False
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        act = get_activation(self.activation)
+        if self.normalize_input:
+            x = nn.LayerNorm()(x)
+        for h in self.hidden_dims:
+            x = nn.Dense(h)(x)
+            x = act(x)
+        return nn.Dense(self.n_outputs)(x)
 
 
 # ---------------------------------------------------------------------------
@@ -252,80 +308,293 @@ def _interpolate_mesh(
 
 
 # ---------------------------------------------------------------------------
+# Shared mesh-array builder (used by GNNFeatures and GNNMeshNetwork)
+# ---------------------------------------------------------------------------
+
+def _build_mesh_arrays(verts: np.ndarray, faces: np.ndarray):
+    """Precompute edge lists, L_hat weights, and normalised node coords."""
+    n_nodes = len(verts)
+    edges_set: dict = {}
+    edges_list = []
+    for face in faces:
+        for j in range(3):
+            v0, v1 = int(face[j]), int(face[(j + 1) % 3])
+            key = (min(v0, v1), max(v0, v1))
+            if key not in edges_set:
+                edges_set[key] = len(edges_list)
+                edges_list.append((v0, v1))
+
+    src = np.array([e[0] for e in edges_list], dtype=np.int32)
+    dst = np.array([e[1] for e in edges_list], dtype=np.int32)
+    edge_src = jnp.array(src)
+    edge_dst = jnp.array(dst)
+
+    degree = np.zeros(n_nodes, dtype=np.float32)
+    for s, d in zip(src, dst):
+        degree[s] += 1
+        degree[d] += 1
+    d_inv_sqrt = 1.0 / np.sqrt(np.maximum(degree, 1.0))
+    edge_w = -d_inv_sqrt[src] * d_inv_sqrt[dst]
+    edge_weights = jnp.array(edge_w, dtype=jnp.float32)
+
+    node_min = verts.min(axis=0)
+    node_max = verts.max(axis=0)
+    nodes_norm = (2.0 * (verts - node_min) / (node_max - node_min + 1e-8) - 1.0)
+    nodes_norm_jnp = jnp.array(nodes_norm, dtype=jnp.float32)
+
+    return edge_src, edge_dst, edge_weights, nodes_norm_jnp
+
+
+def _build_bc_arrays(domain, n_nodes: int, n_outputs: int, verts: np.ndarray):
+    """Build hard-BC mask and value arrays from domain Dirichlet BCs."""
+    bc_mask   = np.zeros((n_nodes, n_outputs), dtype=np.float32)
+    bc_values = np.zeros((n_nodes, n_outputs), dtype=np.float32)
+    from pinns.boundary import MeshNodeBC
+    for bc in getattr(domain, 'boundary_conditions', []):
+        if not (isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet'):
+            continue
+        t_mode = getattr(bc, 't_mode', None)
+        if t_mode not in (None, 'all'):
+            continue
+        comp = bc.component
+        if comp >= n_outputs:
+            continue
+        node_idx = (np.unique(bc.node_indices) if bc.node_indices is not None
+                    else np.unique(bc.edges))
+        node_pos = verts[node_idx]
+        vals = bc.get_value(node_pos)
+        bc_mask[node_idx, comp]   = 1.0
+        bc_values[node_idx, comp] = vals
+    return jnp.array(bc_mask, dtype=jnp.float32), jnp.array(bc_values, dtype=jnp.float32)
+
+
+# ---------------------------------------------------------------------------
+# GNNFeatures — trainable GNN-based feature encoder (analogous to LaplacianFeatures)
+# ---------------------------------------------------------------------------
+
+class GNNFeatures:
+    """
+    Trainable GNN-based spatial feature encoder for mesh PINNs.
+
+    Analogous to :class:`~pinns.LaplacianFeatures` but uses a **trainable**
+    ChebConv GNN instead of fixed Laplace eigenvectors.  The GNN runs on the
+    fixed spatial mesh and produces a ``hidden_dim``-dimensional embedding at
+    every mesh node; embeddings are then barycentric-interpolated at the query
+    points.
+
+    **Time handling** — if *domain* carries a ``t_interval``:
+
+    * The GNN receives only spatial node features ``[x_norm, y_norm]``.
+    * After interpolation at query points, the raw time coordinate ``t`` is
+      appended as an extra feature column.
+    * ``output_dim = hidden_dim + 1``  (so FNN input width = ``hidden_dim + 1``).
+
+    Parameters
+    ----------
+    domain : DomainMesh
+        2-D triangular mesh domain.
+    hidden_dim : int
+        Width of GNN hidden layers and output embedding dimension.
+    poly_order : int
+        Chebyshev polynomial order (higher = more spectral range).
+    message_steps : int
+        Number of stacked ChebConv layers.
+    activation : str
+        Activation used in both the input encoder and ChebConv layers.
+
+    Usage
+    -----
+    ::
+
+        enc = GNNFeatures(domain, hidden_dim=64)
+        enc_params = enc.init(jax.random.PRNGKey(0))
+        features = enc(enc_params, x_query)          # (n_query, output_dim)
+
+    To compose with a custom MLP decoder::
+
+        enc_p = enc.init(rng1)
+        mlp   = flax.linen.Dense(1)
+        mlp_p = mlp.init(rng2, jnp.zeros((1, enc.output_dim)))
+        y     = mlp.apply(mlp_p, enc(enc_p, x))
+    """
+
+    def __init__(
+        self,
+        domain,
+        hidden_dim: int = 64,
+        poly_order: int = 10,
+        message_steps: int = 4,
+        activation: str = 'relu',
+    ):
+        t_interval = getattr(domain, 't_interval', None)
+        self.has_time     = t_interval is not None
+        self.spatial_dims = domain._spatial_dims
+        self.hidden_dim   = hidden_dim
+        self.output_dim   = hidden_dim + (1 if self.has_time else 0)
+        if self.has_time:
+            self.t_min = float(t_interval[0])
+            self.t_max = float(t_interval[1])
+
+        verts = domain._vertices[:, :self.spatial_dims].astype(np.float32)
+        faces = domain._faces.astype(np.int32)
+        self._nodes_np = verts
+        self._faces_np = faces
+        self.n_nodes = len(verts)
+
+        (self._edge_src, self._edge_dst,
+         self._edge_weights, self._nodes_norm) = _build_mesh_arrays(verts, faces)
+
+        # Encoder input: [x_norm, y_norm]  (purely spatial — t handled externally)
+        self._module = _GNNEncoderModule(
+            encoder_in_dim = self.spatial_dims,
+            hidden_dim     = hidden_dim,
+            poly_order     = poly_order,
+            message_steps  = message_steps,
+            activation     = activation,
+        )
+
+    def init(self, rng: 'jax.random.PRNGKey') -> Dict:
+        """Initialise GNN encoder parameters."""
+        return self._module.init(
+            rng,
+            self._nodes_norm,          # (n_nodes, spatial_dims)
+            self._edge_src,
+            self._edge_dst,
+            self._edge_weights,
+            self.n_nodes,
+        )
+
+    def __call__(
+        self,
+        enc_params: Dict,
+        x: jnp.ndarray,
+        params_dict: Optional[Dict] = None,
+    ) -> jnp.ndarray:
+        """
+        Encode query points into GNN features.
+
+        Parameters
+        ----------
+        enc_params : dict
+            GNN encoder parameter tree from :meth:`init`.
+        x : jnp.ndarray, shape ``(n_query, spatial_dims[+1])``
+            Query coordinates.  If the domain has a time interval the last
+            column must be ``t``.
+        params_dict : ignored (API compatibility).
+
+        Returns
+        -------
+        jnp.ndarray, shape ``(n_query, output_dim)``
+        """
+        # Run GNN on purely-spatial node features
+        node_embeds = self._module.apply(
+            enc_params,
+            self._nodes_norm,
+            self._edge_src,
+            self._edge_dst,
+            self._edge_weights,
+            self.n_nodes,
+        )   # (n_nodes, hidden_dim)
+
+        # Interpolate embeddings at query spatial coords
+        nodes_jnp = jnp.array(self._nodes_np)
+        faces_jnp = jnp.array(self._faces_np)
+        x_spatial = x[:, :self.spatial_dims]
+        query_embeds = _interpolate_mesh(node_embeds, nodes_jnp, faces_jnp, x_spatial)
+        # (n_query, hidden_dim)
+
+        if self.has_time:
+            t_col = x[:, self.spatial_dims : self.spatial_dims + 1]   # (n_query, 1)
+            return jnp.concatenate([query_embeds, t_col], axis=-1)    # (n_query, hidden_dim+1)
+        return query_embeds
+
+    def __repr__(self) -> str:
+        mode = f"hidden_dim={self.hidden_dim}" + (" + t" if self.has_time else "")
+        return f"GNNFeatures(output_dim={self.output_dim}, {mode})"
+
+
+# ---------------------------------------------------------------------------
 # Public GNNMeshNetwork class
 # ---------------------------------------------------------------------------
 
 class GNNMeshNetwork:
     """
-    Graph Neural Network on a triangular mesh, compatible with the
-    ``FNN`` API used by the ``pinns`` trainer.
+    Graph Neural Network on a triangular mesh with two operating modes,
+    mirroring the :class:`~pinns.AlphaPINN` API split.
 
-    The network performs message passing on the **fixed** spatial mesh
-    to produce nodal coefficient vectors, then evaluates at arbitrary
-    query points by barycentric (Lagrange-P1) interpolation.
+    **Continuous-time mode** (``use_state=False``, default for :class:`~pinns.DomainMeshContinuous`)
+        Use with :class:`~pinns.DomainMeshContinuous`.
+
+        Pipeline::
+
+            node_feats [x_norm, y_norm]          (n_nodes, 2)
+              → GNN encoder (ChebConv × message_steps)  (n_nodes, hidden_dim)
+              → barycentric interp at query pts          (n_query, hidden_dim)
+              → [embeds, t]                              (n_query, hidden_dim+1)
+              → MLP decoder (decoder_dims)               (n_query, n_outputs)
+
+        Time derivative ``∂u/∂t`` is obtained by autodiff through the MLP
+        w.r.t. the appended ``t`` feature — no broadcast tricks needed.
+
+    **State-integrator / rollout mode** (``use_state=True``, auto for :class:`~pinns.DomainMeshDiscrete`)
+        Use with :class:`~pinns.DomainMeshDiscrete`.
+
+        The GNN operates over **all mesh nodes** at each rollout step.
+        ``u^n`` at mesh nodes is read from ``params_dict["fixed"]["u_prev_nodes"]``
+        and appended as an extra node feature::
+
+            node_feats [x_norm, y_norm, u^n]     (n_nodes, 2+n_outputs)
+              → GNN encoder (ChebConv × message_steps)  (n_nodes, hidden_dim)
+              → MLP decoder (decoder_dims) per node      (n_nodes, n_outputs) ← u^{n+1}
+              → hard Dirichlet BC enforcement
+              → barycentric interp at query pts          (n_query, n_outputs)
 
     Parameters
     ----------
     domain : DomainMesh
-        Mesh domain.  Must contain a 2D triangular mesh
-        (``domain._spatial_dims == 2``).
+        2-D triangular mesh domain.
     hidden_dim : int
-        Width of every hidden layer (encoder, ChebConv layers, decoder).
+        GNN hidden / embedding dimension (ChebConv output width).
     poly_order : int
-        Chebyshev polynomial order K (default 10, as recommended in the
-        paper).  Higher K captures longer-range spectral information.
+        Chebyshev polynomial order K.
     message_steps : int
-        Number of stacked ChebConv layers (depth of the GCN).
+        Number of stacked ChebConv layers.
     n_outputs : int
-        Number of PDE unknowns / output channels (default 1).
+        Number of PDE unknowns per node.
+    decoder_dims : sequence of int
+        Hidden-layer widths for the MLP decoder that maps GNN embeddings
+        to outputs.  ``()`` (default) = single linear projection — identical
+        behaviour to the original ``GNNMeshNetwork``.
     activation : str
-        Activation used inside ChebConv layers (paper uses ``'relu'``).
-    encoder_act : str
-        Activation for the input encoder (default ``'tanh'``).
-    normalize_input : bool
-        Normalise query coordinates to ``[-1, 1]`` before interpolation
-        (the node coordinates fed to the GNN are always normalised).
+        Activation used in both the input encoder and ChebConv layers (default ``'relu'``).
+    decoder_act : str
+        Activation inside the MLP decoder (default ``'tanh'``).
+    use_state : bool or None
+        ``None`` (default): auto-detect — ``True`` when domain is a
+        :class:`~pinns.DomainMeshDiscrete`, ``False`` otherwise.
     input_transform : callable, optional
-        Applied to query coordinates before normalisation.
+        Applied to query coords before evaluation.
     output_transform : callable, optional
-        Hard-constraint transform applied after interpolation.
-        Signature: ``output_transform(x_original, y, params_dict) -> y``
-    hard_constraints : bool
-        If ``True`` (default), Dirichlet boundary nodes are **hardwired** to
-        their prescribed values by static condensation: the GNN output at
-        those nodes is replaced by the known BC values *before* barycentric
-        interpolation.  This is the approach of Eq. (13) in the paper —
-        essential BCs are satisfied *exactly* by construction and their loss
-        terms become identically zero.  Set to ``False`` to fall back to the
-        soft (penalty / Lagrange) enforcement.
-
-    Example
-    -------
-    ::
-
-        import trimesh, pinns, jax
-
-        mesh   = trimesh.load("mesh.obj")
-        domain = pinns.DomainMesh(mesh)
-        net    = GNNMeshNetwork(domain, hidden_dim=64, depth=3, message_steps=4)
-        params = net.init(jax.random.PRNGKey(0))
-        y      = net.apply(params, x_query)   # (n_query, 1)
+        Hard-constraint transform applied after the final output.
+    normalize_input : bool
+        Normalise query coordinates to ``[-1, 1]`` (for output un-normalisation
+        path only; node coordinates are always normalised internally).
     """
 
     def __init__(
         self,
-        domain,                            # DomainMesh
+        domain,
         hidden_dim: int = 64,
         poly_order: int = 10,
         message_steps: int = 4,
         n_outputs: int = 1,
+        decoder_dims: Sequence[int] = (),
         activation: str = 'relu',
-        encoder_act: str = 'tanh',
-        normalize_input: bool = True,
+        decoder_act: str = 'tanh',
+        use_state: Optional[bool] = None,
         input_transform: Optional[Callable] = None,
         output_transform: Optional[Callable] = None,
-        hard_constraints: bool = True,
-        use_state: bool = False,
+        normalize_input: bool = True,
     ):
         if domain._spatial_dims != 2:
             raise NotImplementedError(
@@ -333,9 +602,25 @@ class GNNMeshNetwork:
                 f"(got spatial_dims={domain._spatial_dims})."
             )
 
-        # ---- Time interval (optional) --------------------------------------
+        # Auto-detect mode from domain type
+        if use_state is None:
+            from pinns.domain import DomainMeshDiscrete
+            use_state = isinstance(domain, DomainMeshDiscrete)
+
+        # Time interval — only relevant in continuous mode
         t_interval = getattr(domain, 't_interval', None)
-        self.has_time = t_interval is not None
+        self.has_time     = (t_interval is not None) and (not use_state)
+        self.use_state    = use_state
+        self.spatial_dims = domain._spatial_dims
+        self.hidden_dim   = hidden_dim
+        self.n_outputs    = n_outputs
+        self.poly_order   = poly_order
+        self.message_steps = message_steps
+        self.decoder_dims  = list(decoder_dims)
+        self.input_transform    = input_transform
+        self.output_transform   = output_transform
+        self.normalize_input    = normalize_input
+
         if self.has_time:
             self.t_min = float(t_interval[0])
             self.t_max = float(t_interval[1])
@@ -343,129 +628,64 @@ class GNNMeshNetwork:
             self.t_min = None
             self.t_max = None
 
-        self.hidden_dim     = hidden_dim
-        self.poly_order     = poly_order
-        self.message_steps  = message_steps
-        self.n_outputs      = n_outputs
-        self.activation     = activation
-        self.encoder_act    = encoder_act
-        self.use_state      = use_state
-        self.normalize_input = normalize_input
-        self.input_transform = input_transform
-        self.output_transform = output_transform
-        self.hard_constraints = hard_constraints
-
-        # ---- Fixed mesh arrays (JAX) ---------------------------------------
-        verts = domain._vertices[:, :domain._spatial_dims]   # (n_nodes, 2)
-        faces = domain._faces                                  # (n_faces, 3)
-
-        self._nodes_np = verts.astype(np.float32)
-        self._faces_np = faces.astype(np.int32)
-
-        self.n_nodes = verts.shape[0]
+        # ── Fixed mesh arrays ────────────────────────────────────────────────
+        verts = domain._vertices[:, :self.spatial_dims].astype(np.float32)
+        faces = domain._faces.astype(np.int32)
+        self._nodes_np = verts
+        self._faces_np = faces
+        self.n_nodes = len(verts)
         self.n_faces = faces.shape[0]
-        self.spatial_dims = domain._spatial_dims
 
-        # Normalise node coords to [-1, 1] for encoder input
-        node_min = verts.min(axis=0)
-        node_max = verts.max(axis=0)
-        self._node_min = jnp.array(node_min, dtype=jnp.float32)
-        self._node_max = jnp.array(node_max, dtype=jnp.float32)
-        nodes_norm = (2.0 * (verts - node_min) / (node_max - node_min + 1e-8) - 1.0)
-        self._nodes_norm = jnp.array(nodes_norm, dtype=jnp.float32)
+        (self._edge_src, self._edge_dst,
+         self._edge_weights, self._nodes_norm) = _build_mesh_arrays(verts, faces)
 
-        # ---- Build undirected edge list from faces --------------------------
-        edges_set: dict = {}
-        edges_list = []
-        for face in faces:
-            for j in range(3):
-                v0, v1 = int(face[j]), int(face[(j + 1) % 3])
-                key = (min(v0, v1), max(v0, v1))
-                if key not in edges_set:
-                    edges_set[key] = len(edges_list)
-                    edges_list.append((v0, v1))
-
-        src = np.array([e[0] for e in edges_list], dtype=np.int32)
-        dst = np.array([e[1] for e in edges_list], dtype=np.int32)
-        self._edge_src = jnp.array(src)
-        self._edge_dst = jnp.array(dst)
-
-        # ---- Precompute L_hat edge weights ---------------------------------
-        # L      = I - D^{-1/2} A D^{-1/2}   (normalised Laplacian)
-        # L_hat  = L - I = -D^{-1/2} A D^{-1/2}
-        # For undirected edge (i,j): L_hat[i,j] = -1 / sqrt(d_i * d_j)
-        degree = np.zeros(self.n_nodes, dtype=np.float32)
-        for s, d in zip(src, dst):
-            degree[s] += 1
-            degree[d] += 1
-        d_inv_sqrt = 1.0 / np.sqrt(np.maximum(degree, 1.0))
-        # weight = -1 / sqrt(deg_src * deg_dst)  (off-diagonal entry of L_hat)
-        edge_w = -d_inv_sqrt[src] * d_inv_sqrt[dst]
-        self._edge_weights = jnp.array(edge_w, dtype=jnp.float32)
-
-        # ---- Flax GNN module ------------------------------------------------
-        # When a time interval is present the encoder receives an extra
-        # normalised time feature broadcast to every node: (x, y, t_norm).
-        # When use_state is True the previous solution u^n is concatenated as
-        # additional node features, making the GNN a learned step-integrator.
-        encoder_input_dims = self.spatial_dims + (1 if self.has_time else 0) + (n_outputs if use_state else 0)
-        self._module = _GNNModule(
-            spatial_dims  = encoder_input_dims,
-            hidden_dim    = hidden_dim,
-            poly_order    = poly_order,
-            message_steps = message_steps,
-            n_outputs     = n_outputs,
-            activation    = activation,
-            encoder_act   = encoder_act,
-        )
-
-        # Input/output normalisation bounds (set by trainer via set_*_range)
-        self.input_min = None
-        self.input_max = None
+        # Input/output normalisation bounds (set by trainer)
+        self.input_min  = None
+        self.input_max  = None
         self.output_min = None
         self.output_max = None
 
-        # ---- Hard Dirichlet BC arrays --------------------------------------
-        # Build a (n_nodes, n_outputs) mask and values array from the domain's
-        # Dirichlet BCs.  At forward time we overwrite constrained node outputs
-        # with their prescribed values before barycentric interpolation.
-        bc_mask   = np.zeros((self.n_nodes, n_outputs), dtype=np.float32)
-        bc_values = np.zeros((self.n_nodes, n_outputs), dtype=np.float32)
-        if hard_constraints:
-            from pinns.boundary import MeshNodeBC
-            for bc in getattr(domain, 'boundary_conditions', []):
-                if not (isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet'):
-                    continue
-                # Only hard-constrain BCs that apply at ALL times (or spatial-only).
-                # BCs with t_mode="t_min"/"t_max" are time-restricted (e.g. initial
-                # conditions) and must be soft-enforced by the trainer instead.
-                t_mode = getattr(bc, 't_mode', None)
-                if t_mode not in (None, 'all'):
-                    continue
-                comp = bc.component
-                if comp >= n_outputs:
-                    continue
-                # Resolve node indices from stored edge pairs
-                node_idx = np.unique(bc.edges)           # (n_bc_nodes,)
-                node_pos = verts[node_idx]               # (n_bc_nodes, 2)
-                # Evaluate prescribed value (scalar or callable)
-                vals = bc.get_value(node_pos)            # (n_bc_nodes,)
-                bc_mask[node_idx, comp]   = 1.0
-                bc_values[node_idx, comp] = vals
-        self._bc_mask_jnp   = jnp.array(bc_mask,   dtype=jnp.float32)
-        self._bc_values_jnp = jnp.array(bc_values, dtype=jnp.float32)
+        # ── GNN encoder Flax module ──────────────────────────────────────────
+        # Continuous: encoder receives [x_norm, y_norm]  → hidden_dim embeddings
+        # State:      encoder receives [x_norm, y_norm, u^n_i]
+        encoder_in_dim = self.spatial_dims + (n_outputs if use_state else 0)
+        self._encoder_module = _GNNEncoderModule(
+            encoder_in_dim = encoder_in_dim,
+            hidden_dim     = hidden_dim,
+            poly_order     = poly_order,
+            message_steps  = message_steps,
+            activation     = activation,
+        )
 
-    # ---------------------------------------------------------------------- #
-    #  Trainer-compatible API                                                 #
-    # ---------------------------------------------------------------------- #
+        # ── MLP decoder Flax module ──────────────────────────────────────────
+        # Continuous: input = (hidden_dim + 1)  [+1 for t appended after interp]
+        # State:      input = hidden_dim          [decoder applied per-node]
+        decoder_in_dim = hidden_dim + (1 if self.has_time else 0)
+        self._decoder_module = _MLPDecoder(
+            hidden_dims     = list(decoder_dims),
+            n_outputs       = n_outputs,
+            activation      = decoder_act,
+            normalize_input = False,
+        )
+        self._decoder_in_dim = decoder_in_dim
+
+        # ── Hard Dirichlet BC arrays ─────────────────────────────────────────
+        # Always built in state mode so BC nodes are clamped before rollout state is stored.
+        if use_state:
+            self._bc_mask_jnp, self._bc_values_jnp = _build_bc_arrays(
+                domain, self.n_nodes, n_outputs, verts
+            )
+        else:
+            self._bc_mask_jnp   = jnp.zeros((self.n_nodes, n_outputs), dtype=jnp.float32)
+            self._bc_values_jnp = jnp.zeros((self.n_nodes, n_outputs), dtype=jnp.float32)
+
+    # ── Trainer-compatible API ───────────────────────────────────────────── #
 
     def set_input_range(self, xmin: np.ndarray, xmax: np.ndarray):
-        """Set input normalisation bounds (called by the trainer)."""
         self.input_min = jnp.array(xmin, dtype=jnp.float32)
         self.input_max = jnp.array(xmax, dtype=jnp.float32)
 
     def set_output_range(self, ymin: np.ndarray, ymax: np.ndarray):
-        """Set output un-normalisation bounds (called by the trainer)."""
         self.output_min = jnp.array(ymin, dtype=jnp.float32)
         self.output_max = jnp.array(ymax, dtype=jnp.float32)
 
@@ -473,35 +693,29 @@ class GNNMeshNetwork:
         """
         Initialise network parameters.
 
-        Parameters
-        ----------
-        rng : PRNGKey
-        dummy_input : ignored (kept for API compatibility with FNN)
-
         Returns
         -------
-        dict : Flax parameter tree
+        dict
+            ``{"encoder": encoder_params, "decoder": decoder_params}``
         """
-        # Use the correct node feature shape for parameter initialisation.
-        # For time-augmented domains pass a dummy t=0 column so the encoder
-        # sees (x_norm, y_norm, t_norm) with the right dimensionality.
-        if self.has_time:
-            dummy_t = jnp.zeros((self.n_nodes, 1), dtype=jnp.float32)
-            init_feats = jnp.concatenate([self._nodes_norm, dummy_t], axis=-1)
-        else:
-            init_feats = self._nodes_norm
+        rng_enc, rng_dec = jax.random.split(rng)
+
+        # Encoder init — use purely-spatial node features (u^n = 0 for state mode)
+        init_feats = self._nodes_norm   # (n_nodes, spatial_dims)
         if self.use_state:
             dummy_state = jnp.zeros((self.n_nodes, self.n_outputs), dtype=jnp.float32)
             init_feats = jnp.concatenate([init_feats, dummy_state], axis=-1)
 
-        return self._module.init(
-            rng,
-            init_feats,
-            self._edge_src,
-            self._edge_dst,
-            self._edge_weights,
-            self.n_nodes,
+        enc_params = self._encoder_module.init(
+            rng_enc, init_feats,
+            self._edge_src, self._edge_dst, self._edge_weights, self.n_nodes,
         )
+
+        # Decoder init — dummy input has the correct decoder input width
+        dummy_dec = jnp.zeros((1, self._decoder_in_dim), dtype=jnp.float32)
+        dec_params = self._decoder_module.init(rng_dec, dummy_dec)
+
+        return {"encoder": enc_params, "decoder": dec_params}
 
     def apply(
         self,
@@ -512,165 +726,126 @@ class GNNMeshNetwork:
         """
         Evaluate the network at query points *x*.
 
-        Steps
-        -----
-        1. Apply optional ``input_transform(x, params_dict)``.
-        2. Optionally normalise *x* to ``[-1, 1]``.
-        3. Run GNN on fixed mesh to obtain nodal coefficients.
-        4. Barycentric interpolation at the *spatial* part of *x*.
-        5. Optionally un-normalise output.
-        6. Apply optional ``output_transform(x_original, y, params_dict)``.
+        **Continuous mode** — forward pass at query points:
+
+        1. Run GNN encoder on spatial node features → ``(n_nodes, hidden_dim)``
+        2. Barycentric interpolation at *x* → ``(n_query, hidden_dim)``
+        3. Append ``t`` column → ``(n_query, hidden_dim+1)``
+        4. MLP decoder → ``(n_query, n_outputs)``
+        5. Optional ``output_transform``
+
+        **State-integrator mode** — one-step forward:
+
+        1. Append ``u^n`` (from ``params_dict["fixed"]["u_prev_nodes"]``) to node feats
+        2. Run GNN encoder → ``(n_nodes, hidden_dim)``
+        3. MLP decoder per node → ``(n_nodes, n_outputs)``  ← ``u^{n+1}``
+        4. Hard Dirichlet BC enforcement
+        5. Barycentric interpolation at *x* → ``(n_query, n_outputs)``
 
         Parameters
         ----------
-        params : dict
-            Flax parameter tree from :meth:`init`.
-        x : jnp.ndarray, shape ``(n_query, n_dims)``
-            Query coordinates.  For space-time problems the spatial
-            dimensions must come first (``x[:, :spatial_dims]``).
+        params : dict  ``{"encoder": ..., "decoder": ...}``
+        x : jnp.ndarray  ``(n_query, spatial_dims[+1])``
         params_dict : dict, optional
-            Passed to ``input_transform`` / ``output_transform``.
 
         Returns
         -------
-        jnp.ndarray, shape ``(n_query, n_outputs)``
+        (n_query, n_outputs)
         """
         x_original = x
 
-        # Optional input transform (e.g. symmetry encoding)
         if self.input_transform is not None:
             x = self.input_transform(x, params_dict)
 
-        # Normalise query coords to [-1, 1].
-        # Slice input_min/max to x.shape[-1] so that purely-spatial BC queries
-        # (shape (n, 2)) and space-time queries (shape (n, 3)) both work when
-        # the domain carries a t_interval (making input_min shape (3,)).
-        if self.normalize_input and self.input_min is not None:
-            n_q_dims = x.shape[-1]
-            imin = self.input_min[:n_q_dims]
-            imax = self.input_max[:n_q_dims]
-            x_norm = (2.0 * (x - imin) / (imax - imin + 1e-8) - 1.0)
-        else:
-            x_norm = x   # use as-is for spatial interpolation below
+        enc_params = params["encoder"]
+        dec_params = params["decoder"]
 
-        # --- GNN forward pass on fixed mesh ---------------------------------
-        # Node features are the normalised mesh node coordinates.
-        # When the domain has a time interval, the mean t of the query batch
-        # is normalised to [-1, 1] and broadcast as an extra feature to every
-        # node: node_feats shape (n_nodes, spatial_dims + 1).
-        if self.has_time:
-            t_raw = jnp.mean(x_original[:, self.spatial_dims])
-            t_norm_val = (2.0 * (t_raw - self.t_min)
-                          / (self.t_max - self.t_min + 1e-8) - 1.0)
-            t_broadcast = jnp.full((self.n_nodes, 1), t_norm_val, dtype=jnp.float32)
-            node_feats = jnp.concatenate([self._nodes_norm, t_broadcast], axis=-1)
+        nodes_jnp = jnp.array(self._nodes_np)
+        faces_jnp = jnp.array(self._faces_np)
+        x_spatial = x_original[:, :self.spatial_dims]
+
+        if not self.use_state:
+            # ── Continuous mode ──────────────────────────────────────────────
+            # GNN encoder on purely-spatial node features [x_norm, y_norm]
+            node_embeds = self._encoder_module.apply(
+                enc_params,
+                self._nodes_norm,
+                self._edge_src, self._edge_dst, self._edge_weights, self.n_nodes,
+            )   # (n_nodes, hidden_dim)
+
+            # Interpolate embeddings at query spatial coords
+            query_embeds = _interpolate_mesh(node_embeds, nodes_jnp, faces_jnp, x_spatial)
+            # (n_query, hidden_dim)
+
+            # Append raw t so the decoder can differentiate w.r.t. time
+            if self.has_time:
+                t_col = x_original[:, self.spatial_dims : self.spatial_dims + 1]  # (n_query, 1)
+                query_embeds = jnp.concatenate([query_embeds, t_col], axis=-1)
+
+            # MLP decoder at query points
+            y = self._decoder_module.apply(dec_params, query_embeds)  # (n_query, n_outputs)
+
+            # Output un-normalisation (if set by trainer)
+            if self.output_min is not None:
+                y = (y + 1.0) / 2.0 * (self.output_max - self.output_min) + self.output_min
+
+            if self.output_transform is not None:
+                y = self.output_transform(x_original, y, params_dict)
+
+            return y
+
         else:
-            node_feats = self._nodes_norm
-        # State-integrator mode: append u^n nodal values as extra node features.
-        # u_prev_nodes is read from params_dict["fixed"]["u_prev_nodes"] and
-        # has shape (n_nodes, n_outputs) or (n_nodes,) for scalar problems.
-        if self.use_state:
-            u_prev_nodes = params_dict["fixed"]["u_prev_nodes"]  # (n_nodes, n_out) or (n_nodes,)
-            u_prev_nodes = jnp.asarray(u_prev_nodes, dtype=jnp.float32)
+            # ── State-integrator mode ────────────────────────────────────────
+            # Read u^n nodal values from params_dict
+            _fixed = (params_dict or {}).get("fixed") or {}
+            u_prev_raw = _fixed.get("u_prev_nodes", None)
+            if u_prev_raw is None:
+                u_prev_nodes = jnp.zeros((self.n_nodes, self.n_outputs), dtype=jnp.float32)
+            else:
+                u_prev_nodes = jnp.asarray(u_prev_raw, dtype=jnp.float32)
             if u_prev_nodes.ndim == 1:
-                u_prev_nodes = u_prev_nodes[:, None]              # (n_nodes, n_out)
-            node_feats = jnp.concatenate([node_feats, u_prev_nodes], axis=-1)
+                u_prev_nodes = u_prev_nodes[:, None]   # (n_nodes, n_outputs)
 
-        node_coeffs = self._module.apply(
-            params,
-            node_feats,
-            self._edge_src,
-            self._edge_dst,
-            self._edge_weights,
-            self.n_nodes,
-        )   # (n_nodes, n_outputs)
+            # GNN encoder on [x_norm, y_norm, u^n]
+            node_feats = jnp.concatenate([self._nodes_norm, u_prev_nodes], axis=-1)
+            node_embeds = self._encoder_module.apply(
+                enc_params,
+                node_feats,
+                self._edge_src, self._edge_dst, self._edge_weights, self.n_nodes,
+            )   # (n_nodes, hidden_dim)
 
-        # --- Hard Dirichlet BC enforcement (static condensation) ------------
-        # Replace constrained node outputs with their prescribed BC values.
-        # bc_mask is 1 at constrained DOFs, 0 elsewhere.
-        if self.hard_constraints:
-            node_coeffs = (node_coeffs * (1.0 - self._bc_mask_jnp)
-                           + self._bc_values_jnp * self._bc_mask_jnp)
+            # Per-node MLP decoder → u^{n+1} at all nodes
+            node_out = self._decoder_module.apply(dec_params, node_embeds)
+            # (n_nodes, n_outputs)
 
-        # --- Spatial interpolation at query points --------------------------
-        # Use the *original* (un-normalised) spatial coords of the mesh nodes
-        # together with *original* spatial coords of the query points,
-        # so that barycentric coordinates remain correct.
-        nodes_orig = jnp.array(self._nodes_np)
-        faces_arr  = jnp.array(self._faces_np)
-        x_spatial  = x_original[:, :self.spatial_dims]
+            # Hard Dirichlet BC enforcement (static condensation) — always applied in state mode
+            node_out = (node_out * (1.0 - self._bc_mask_jnp)
+                        + self._bc_values_jnp * self._bc_mask_jnp)
 
-        y = _interpolate_mesh(node_coeffs, nodes_orig, faces_arr, x_spatial)
-        # y: (n_query, n_outputs)
+            # Barycentric interpolation at query points
+            y = _interpolate_mesh(node_out, nodes_jnp, faces_jnp, x_spatial)
+            # (n_query, n_outputs)
 
-        # Optional output un-normalisation
-        if self.output_min is not None:
-            y = (y + 1.0) / 2.0 * (self.output_max - self.output_min) + self.output_min
+            if self.output_transform is not None:
+                y = self.output_transform(x_original, y, params_dict)
 
-        # Optional hard-constraint transform
-        if self.output_transform is not None:
-            y = self.output_transform(x_original, y, params_dict)
+            return y
 
-        return y
-
-    def forward(
-        self,
-        x: jnp.ndarray,
-        params_dict: Optional[Dict] = None,
-    ) -> jnp.ndarray:
-        """Forward pass using stored ``self.params``."""
+    def forward(self, x: jnp.ndarray, params_dict=None) -> jnp.ndarray:
         return self.apply(self.params, x, params_dict)
 
-    def predict(
-        self,
-        x_np: np.ndarray,
-        params_dict: Optional[Dict] = None,
-    ) -> np.ndarray:
-        """Predict with NumPy I/O."""
-        return np.array(self.forward(jnp.array(x_np), params_dict))
+    def predict(self, x_np: np.ndarray, params_dict=None) -> np.ndarray:
+        return np.array(self.apply(self.params, jnp.array(x_np), params_dict))
 
-    # ---------------------------------------------------------------------- #
-    #  Introspection / utilities                                              #
-    # ---------------------------------------------------------------------- #
+    # ── Introspection ────────────────────────────────────────────────────── #
 
     @property
     def mesh_nodes(self) -> np.ndarray:
-        """Mesh vertex positions, shape ``(n_nodes, spatial_dims)``."""
         return self._nodes_np.copy()
 
     @property
     def mesh_faces(self) -> np.ndarray:
-        """Triangular element connectivity, shape ``(n_faces, 3)``."""
         return self._faces_np.copy()
-
-    def get_node_coefficients(self, params: Dict) -> np.ndarray:
-        """
-        Return the nodal coefficients produced by the GNN.
-
-        Useful for post-processing / visualisation.
-
-        Parameters
-        ----------
-        params : dict  – network parameters
-
-        Returns
-        -------
-        np.ndarray, shape ``(n_nodes, n_outputs)``
-        """
-        if self.has_time:
-            dummy_t = jnp.zeros((self.n_nodes, 1), dtype=jnp.float32)
-            feats = jnp.concatenate([self._nodes_norm, dummy_t], axis=-1)
-        else:
-            feats = self._nodes_norm
-        coeffs = self._module.apply(
-            params,
-            feats,
-            self._edge_src,
-            self._edge_dst,
-            self._edge_weights,
-            self.n_nodes,
-        )
-        return np.array(coeffs)
 
     def to(self, device: str = None, dtype=None, seed: int = 0) -> 'GNNMeshNetwork':
         """PyTorch-compatible device/dtype migration (no-op for JAX)."""
@@ -684,13 +859,32 @@ class GNNMeshNetwork:
             self.params = self.init(jax.random.PRNGKey(seed))
         return self
 
+    def node_embeddings(self, params: Dict, u_prev_nodes=None) -> np.ndarray:
+        """
+        Return GNN node embeddings ``(n_nodes, hidden_dim)``.
+
+        In state mode pass the current nodal state as *u_prev_nodes*.
+        """
+        enc_params = params["encoder"]
+        node_feats = self._nodes_norm
+        if self.use_state and u_prev_nodes is not None:
+            u = jnp.asarray(u_prev_nodes, dtype=jnp.float32)
+            if u.ndim == 1:
+                u = u[:, None]
+            node_feats = jnp.concatenate([node_feats, u], axis=-1)
+        embeds = self._encoder_module.apply(
+            enc_params,
+            node_feats,
+            self._edge_src, self._edge_dst, self._edge_weights, self.n_nodes,
+        )
+        return np.array(embeds)
+
     def __repr__(self) -> str:
-        time_str = (f", t_interval=[{self.t_min}, {self.t_max}]"
-                    if self.has_time else "")
+        mode = "state-integrator" if self.use_state else "continuous"
+        dec = f"+MLP{self.decoder_dims}" if self.decoder_dims else "+Linear"
         return (
-            f"GNNMeshNetwork("
-            f"n_nodes={self.n_nodes}, n_faces={self.n_faces}, "
+            f"GNNMeshNetwork({mode}, n_nodes={self.n_nodes}, "
             f"hidden_dim={self.hidden_dim}, poly_order={self.poly_order}, "
-            f"message_steps={self.message_steps}, n_outputs={self.n_outputs}, "
-            f"hard_constraints={self.hard_constraints}{time_str})"
+            f"message_steps={self.message_steps}{dec}, "
+            f"n_outputs={self.n_outputs})"
         )
