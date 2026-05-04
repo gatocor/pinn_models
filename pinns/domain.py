@@ -2703,18 +2703,24 @@ class DomainMeshContinuous(DomainMesh):
 
 class DomainMeshDiscrete(DomainMesh):
     """
-    Mesh domain with a **discrete** time axis defined by a fixed time-step.
+    Mesh domain with a **discrete** time axis.
 
-    Intended for Method-of-Lines GNN networks that advance the state one step
+    Intended for Method-of-Lines networks that advance the state one step
     at a time via an implicit (or explicit) ODE integrator and BPTT.
     ``ProblemWeak`` automatically reads ``domain.n_steps`` and ``domain.dt``
     and routes to :meth:`~pinns.problem_weak.ProblemWeak.make_rollout_loss_fn`.
 
-    Args:
-        mesh: Mesh object (see :class:`DomainMesh`).
-        dt: Time-step size.
-        n_steps: Total number of time steps to unroll.
-        t_start: Start time (default ``0.0``).
+    Can be constructed in two ways::
+
+        # From a uniform time array (recommended)
+        DomainMeshDiscrete(mesh, time_points=np.linspace(0, 1, 21))
+
+        # From dt + n_steps (legacy)
+        DomainMeshDiscrete(mesh, dt=0.05, n_steps=20)
+
+    ``domain.dt`` and ``domain.n_steps`` are always available after construction.
+    For non-uniform grids ``domain.dt`` holds the array of step sizes
+    ``time_points[1:] - time_points[:-1]``.
 
     **Boundary-condition API** — ``time_window=[t0, t1, ...]``
 
@@ -2724,19 +2730,54 @@ class DomainMeshDiscrete(DomainMesh):
     randomly from the list.
 
     * Pass ``time_window=None`` (default) to enforce the BC at **every** time
-      step (equivalent to the full list ``[t_start, t_start+dt, ..., t_end]``).
+      step.
     * Pass ``time_window=[t_start]`` for an **initial condition**.  The
       convenience method :meth:`add_initial_condition` does this automatically.
     * Pass any subset of time values for a BC active only at those steps.
     """
 
-    def __init__(self, mesh, dt: float, n_steps: int, t_start: float = 0.0):
-        t_interval = [t_start, t_start + dt * n_steps]
-        super().__init__(mesh, t_interval=t_interval, t_sampling_method='midpoint')
-        self.dt = float(dt)
-        self.n_steps = int(n_steps)
-        # Precompute the default full list of time points
-        self._time_points = [t_start + i * self.dt for i in range(n_steps + 1)]
+    def __init__(
+        self,
+        mesh,
+        dt: float = None,
+        n_steps: int = None,
+        t_start: float = 0.0,
+        *,
+        time_points=None,
+    ):
+        if time_points is not None:
+            # Array-based construction
+            import numpy as _np
+            tp = _np.asarray(time_points, dtype=float)
+            if tp.ndim != 1 or len(tp) < 2:
+                raise ValueError(
+                    "DomainMeshDiscrete: time_points must be a 1-D array with "
+                    f"at least 2 elements, got shape {tp.shape}."
+                )
+            dts = tp[1:] - tp[:-1]
+            if _np.allclose(dts, dts[0]):
+                _dt = float(dts[0])
+            else:
+                _dt = dts            # non-uniform: store as array
+            _n_steps = len(tp) - 1
+            _t_start = float(tp[0])
+            _t_end   = float(tp[-1])
+            self._time_points = list(tp)
+        elif dt is not None and n_steps is not None:
+            _dt      = float(dt)
+            _n_steps = int(n_steps)
+            _t_start = float(t_start)
+            _t_end   = _t_start + _dt * _n_steps
+            self._time_points = [_t_start + i * _dt for i in range(_n_steps + 1)]
+        else:
+            raise TypeError(
+                "DomainMeshDiscrete requires either 'time_points' or both "
+                "'dt' and 'n_steps'."
+            )
+
+        super().__init__(mesh, t_interval=[_t_start, _t_end], t_sampling_method='midpoint')
+        self.dt      = _dt
+        self.n_steps = _n_steps
 
     # ── BC builder overrides ─────────────────────────────────────────────
 

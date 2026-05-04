@@ -125,6 +125,7 @@ class Trainer(BaseTrainer):
         lagrange_optimizer: str = "adam",
         train_samples: dict = None,
         test_samples=None,
+        step_weight_exp: float = 0.0,
         **kwargs,
     ):
         """
@@ -159,6 +160,7 @@ class Trainer(BaseTrainer):
                 _rts_n_nodes_test = int(_rts_n_nodes_test)
             test_samples = {k: v for k, v in test_samples.items() if k != 'pde'} or None
         self._rts_n_nodes_test = _rts_n_nodes_test
+        self._step_weight_exp = float(step_weight_exp)
 
         super().compile(*args, test_samples=test_samples, **kwargs)
         # Weak-form test PDE loss: evaluates the weak residual on a DIFFERENT random
@@ -189,8 +191,21 @@ class Trainer(BaseTrainer):
         )
         self._is_lagrangian_mode = bool(auto_lagrangian and has_al_request)
 
+        # ── Rollout (BPTT) mode override ─────────────────────────────────
+        # ProblemWeak with n_time_steps set uses make_rollout_loss_fn, not the
+        # Lagrangian (AL) path.  Force Lagrangian mode OFF here so that
+        # _initialize_lagrange_multipliers_impl is never called — it would
+        # invoke make_residual_vector_fn which is not valid in rollout mode.
+        from pinns.problem_weak import ProblemWeak as _PW_early
+        if (self._is_lagrangian_mode
+                and isinstance(self.problem, _PW_early)
+                and getattr(self.problem, 'n_time_steps', None) is not None):
+            self._is_lagrangian_mode = False
+
         self.lagrange_lr = lagrange_lr
-        self._lagrange_lr_ratio = lagrange_lr / max(self.learning_rate, 1e-12)
+        _lr_scalar = (self.learning_rate(0) if callable(self.learning_rate)
+                      else self.learning_rate)
+        self._lagrange_lr_ratio = lagrange_lr / max(float(_lr_scalar), 1e-12)
         self._lagrange_max = lagrange_max
         self._lagrange_optimizer_name = lagrange_optimizer
 
@@ -615,24 +630,77 @@ class Trainer(BaseTrainer):
                 # BPTT rollout mode: one scan over all time steps; no Lagrange needed.
                 # Override lagrangian mode — BCs are hard-constrained in the network.
                 self._is_lagrangian_mode = False
+                # Warn if the user also requested soft (Lagrange) BCs — these
+                # are silently ignored in rollout mode.  Use hard_constraints=True
+                # on AlphaPINN instead (the default).
+                _soft_bcs = [
+                    n for n in (getattr(self.problem, 'lagrange_multipliers', None) or [])
+                    if n != 'pde'
+                ]
+                if _soft_bcs:
+                    import warnings
+                    warnings.warn(
+                        f"Rollout (BPTT) mode detected: soft Lagrange BCs {_soft_bcs} are "
+                        "not enforced during rollout training.  Set hard_constraints=True "
+                        "on the AlphaPINN network to enforce BCs exactly at every time step.",
+                        UserWarning, stacklevel=3,
+                    )
+                # Check whether per-step AL is requested via lagrange_multipliers=["pde"]
+                _uses_rollout_al = "pde" in (getattr(self.problem, 'lagrange_multipliers', None) or [])
+                self._rollout_al_mode = _uses_rollout_al
                 _face_batch = getattr(self, '_rollout_face_batch', None)
                 _n_faces    = self.problem.cubature_data['phi'].shape[0]  # F
                 self._rollout_n_faces = _n_faces
+                # Compute per-step exponential weights if requested
+                _swe = getattr(self, '_step_weight_exp', 0.0)
+                _n_cur_steps = self.problem.n_time_steps
+                if _swe != 0.0:
+                    import numpy as _np_sw
+                    _sw = _np_sw.exp(_swe * _np_sw.arange(_n_cur_steps) / max(_n_cur_steps - 1, 1))
+                    _step_weights = _sw.astype(_np_sw.float32)
+                else:
+                    _step_weights = None
                 # Full-batch version (used for metrics)
                 _weak_loss_fn = jax.jit(
-                    self.problem.make_rollout_loss_fn(_network)
+                    self.problem.make_rollout_loss_fn(_network, step_weights=_step_weights)
                 )
                 self._weak_loss_fn = _weak_loss_fn
                 # Training version (may be mini-batch)
                 if _face_batch is not None:
                     _weak_loss_fn_train = jax.jit(
-                        self.problem.make_rollout_loss_fn(_network, face_batch_size=_face_batch)
+                        self.problem.make_rollout_loss_fn(_network, face_batch_size=_face_batch, step_weights=_step_weights)
                     )
                     self._weak_loss_fn_train = _weak_loss_fn_train
                 else:
                     self._weak_loss_fn_train = _weak_loss_fn
                     _weak_loss_fn_train = _weak_loss_fn
                 self._weak_residual_fn = None
+                # ── Per-step AL (dual ascent over rollout residuals) ─────
+                if _uses_rollout_al and _face_batch is None:
+                    _n_cur  = self.problem.n_time_steps
+                    _n_free = len(self.problem.free_nodes)
+                    _al_fn  = jax.jit(self.problem.make_rollout_al_loss_fn(_network))
+                    self._rollout_al_fn = _al_fn
+                    # Always reset lambdas at each curriculum stage.
+                    # Carrying λ from the k-step problem into the (k+1)-step problem
+                    # causes the optimizer to focus on keeping R_1..R_k near-zero
+                    # (dominated by large accumulated λ) at the expense of R_{k+1},
+                    # which stalls learning after the first stage.
+                    self._rollout_lambdas = jnp.zeros((_n_cur, _n_free), dtype=jnp.float32)
+                    _optim = self.optimizer
+
+                    @jax.jit
+                    def _rollout_al_train_step(params, opt_state, lambdas):
+                        def _fl(p):
+                            loss, res = _al_fn(p, lambdas)
+                            return loss, res
+                        (loss, res), grads = jax.value_and_grad(_fl, has_aux=True)(params)
+                        updates, new_opt_state = _optim.update(grads, opt_state, params)
+                        new_params = optax.apply_updates(params, updates)
+                        return new_params, new_opt_state, loss, res
+
+                    self._rollout_al_train_step = _rollout_al_train_step
+
             else:
                 # Standard single-step weak-form path
                 _weak_params_dict = self.problem._build_params()
@@ -938,6 +1006,207 @@ class Trainer(BaseTrainer):
             
             return (grad_fn, apply_updates), False, False
     
+    # ==================== Solution error (rollout override) ====================
+
+    def _compute_solution_error(self, n_points: int = 1000):
+        """Override: for BPTT rollout mode unroll the full trajectory and compare."""
+        from pinns.problem_weak import ProblemWeak as _PW
+        from pinns.domain import DomainMeshDiscrete as _DMD
+        _is_rollout = (
+            isinstance(self.problem, _PW)
+            and isinstance(self.problem.domain, _DMD)
+            and getattr(self.problem, 'n_time_steps', None) is not None
+            and self.problem.solution is not None
+            and hasattr(self.network, 'predict_rollout')
+        )
+        if not _is_rollout:
+            return super()._compute_solution_error(n_points)
+
+        import numpy as _np
+        domain = self.problem.domain
+        # Use the current curriculum stage, not the full domain horizon
+        n_steps = self.problem.n_time_steps
+        dt      = float(domain.dt)
+        u_all = self.network.predict_rollout(n_steps=n_steps, dt=dt)
+        # u_all: (n_steps+1, n_nodes)
+        verts = _np.array(domain._vertices)  # (n_nodes, 2)
+        t_vals = _np.array(domain._time_points[:n_steps + 1])  # only trained steps
+        preds, trues = [], []
+        for step_i, tv in enumerate(t_vals):
+            x_ref = _np.hstack([verts, _np.full((len(verts), 1), tv)])
+            y_true = self._call_solution(x_ref)  # (n_nodes, 1)
+            if y_true is None:
+                continue
+            y_true_np = _np.atleast_2d(y_true).reshape(-1, 1) if y_true.ndim == 1 else y_true
+            y_pred_np = u_all[step_i].reshape(-1, 1)
+            valid = _np.isfinite(y_true_np).all(axis=1)
+            if valid.any():
+                preds.append(y_pred_np[valid])
+                trues.append(y_true_np[valid])
+        if not preds:
+            return None
+        y_pred_all = _np.concatenate(preds)
+        y_true_all = _np.concatenate(trues)
+        return float(_np.mean((y_pred_all - y_true_all) ** 2))
+
+    # ==================== Plot snapshot (rollout override) ====================
+
+    def _plot_mesh_snapshot(self, ax, output_idx, t_val, kind='sol'):
+        """Override: for BPTT rollout, fetch the correct time-step from predict_rollout."""
+        from pinns.problem_weak import ProblemWeak as _PW
+        from pinns.domain import DomainMeshDiscrete as _DMD
+        import numpy as _np
+
+        _is_rollout = (
+            isinstance(self.problem, _PW)
+            and isinstance(self.problem.domain, _DMD)
+            and getattr(self.problem, 'n_time_steps', None) is not None
+            and hasattr(self.network, 'predict_rollout')
+        )
+        if not _is_rollout or kind not in ('sol', 'err', 'true', 'res'):
+            return super()._plot_mesh_snapshot(ax, output_idx, t_val, kind)
+
+        domain = self.problem.domain
+        # Always roll out the full domain horizon for plotting
+        n_steps = domain.n_steps
+        dt = float(domain.dt)
+        t_points = _np.array(domain._time_points)  # (n_steps+1,)
+
+        # run rollout over the full domain
+        try:
+            u_all = self.network.predict_rollout(n_steps=n_steps, dt=dt)  # (n_steps+1, n_nodes)
+        except Exception:
+            ax.text(0.5, 0.5, 'Rollout not ready', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=10, color='gray')
+            ax.set_title(f't={t_val:.3g}')
+            return
+
+        # linearly interpolate between the two bracketing time steps
+        t_val_f = float(t_val)
+        idx_hi = int(_np.searchsorted(t_points, t_val_f, side='left'))
+        idx_hi = int(_np.clip(idx_hi, 1, len(t_points) - 1))
+        idx_lo = idx_hi - 1
+        t_lo, t_hi = float(t_points[idx_lo]), float(t_points[idx_hi])
+        alpha = (t_val_f - t_lo) / (t_hi - t_lo) if t_hi > t_lo else 0.0
+        u_snap = (1.0 - alpha) * u_all[idx_lo] + alpha * u_all[idx_hi]
+        t_actual = t_val_f
+
+        import matplotlib.tri as _mtri
+        verts_xy = _np.array(domain._vertices)
+        faces = _np.array(domain._faces)
+        tri_obj = _mtri.Triangulation(verts_xy[:, 0], verts_xy[:, 1], faces)
+
+        if kind == 'sol':
+            vals = u_snap.astype(float)
+            cmap = 'viridis'
+            label = f'u pred (t={t_actual:.3g})'
+            vmin, vmax = 0.0, 1.0
+            im = ax.tricontourf(tri_obj, vals, levels=50, cmap=cmap, vmin=vmin, vmax=vmax)
+            cbar = self._fig.colorbar(im, ax=ax)
+            self._colorbars.append(cbar)
+            ax.set_aspect('equal')
+            ax.set_title(label)
+            ax.set_xlabel('x'); ax.set_ylabel('y')
+
+        elif kind == 'err' and self.problem.solution is not None:
+            x_ref = _np.hstack([verts_xy, _np.full((len(verts_xy), 1), t_actual, dtype=_np.float32)])
+            y_true = self._call_solution(x_ref)
+            if y_true is None:
+                return
+            y_true_np = _np.atleast_2d(y_true).reshape(-1) if y_true.ndim > 1 else y_true
+            err = _np.abs(u_snap - y_true_np)
+            err[~_np.isfinite(err)] = _np.nan
+            vals_plot = _np.where(_np.isnan(err), 0.0, err)
+            cmap = 'viridis'
+            label = f'|error| (t={t_actual:.3g})'
+            im = ax.tricontourf(tri_obj, vals_plot, levels=50, cmap=cmap)
+            cbar = self._fig.colorbar(im, ax=ax)
+            self._colorbars.append(cbar)
+            ax.set_aspect('equal')
+            ax.set_title(label)
+            ax.set_xlabel('x'); ax.set_ylabel('y')
+
+        elif kind == 'true' and self.problem.solution is not None:
+            x_ref = _np.hstack([verts_xy, _np.full((len(verts_xy), 1), t_actual, dtype=_np.float32)])
+            y_true = self._call_solution(x_ref)
+            if y_true is None:
+                return
+            y_true_np = _np.atleast_2d(y_true).reshape(-1) if y_true.ndim > 1 else y_true
+            vals = y_true_np.astype(float)
+            vals_plot = _np.where(_np.isfinite(vals), vals, 0.0)
+            nan_mask = _np.array([
+                not (_np.isfinite(vals[f[0]]) and _np.isfinite(vals[f[1]]) and _np.isfinite(vals[f[2]]))
+                for f in faces
+            ])
+            tri_obj.set_mask(nan_mask)
+            im = ax.tricontourf(tri_obj, vals_plot, levels=50, cmap='viridis', vmin=0.0, vmax=1.0)
+            cbar = self._fig.colorbar(im, ax=ax)
+            self._colorbars.append(cbar)
+            ax.set_aspect('equal')
+            ax.set_title(f'True (t={t_actual:.3g})')
+            ax.set_xlabel('x'); ax.set_ylabel('y')
+
+        elif kind == 'res':
+            # Accumulated |residual| over steps 1..k, where k corresponds to t_val.
+            acc_res = self._compute_rollout_accumulated_residual(u_all)  # (n_steps+1, n_nodes)
+            # Interpolate between bracketing steps (same logic as u_snap above)
+            res_snap = (1.0 - alpha) * acc_res[idx_lo] + alpha * acc_res[idx_hi]
+            vals_plot = res_snap.astype(float)
+            label = f'Accum |R| (t={t_actual:.3g})'
+            im = ax.tricontourf(tri_obj, vals_plot, levels=50, cmap='inferno')
+            cbar = self._fig.colorbar(im, ax=ax)
+            self._colorbars.append(cbar)
+            ax.set_aspect('equal')
+            ax.set_title(label)
+            ax.set_xlabel('x'); ax.set_ylabel('y')
+
+    def _compute_rollout_accumulated_residual(self, u_all):
+        """Compute accumulated absolute per-node weak residual across rollout steps.
+
+        Returns array of shape (n_steps+1, n_nodes) where entry [k] is the
+        sum of |R_1| + |R_2| + ... + |R_k| (entry [0] is all zeros).
+        """
+        import numpy as _np
+        cd   = self.problem.cubature_data
+        phi  = _np.array(cd['phi'],      dtype=float)   # (F, Q, L)
+        gph  = _np.array(cd['grad_phi'], dtype=float)   # (F, Q, L, 2)
+        wts  = _np.array(cd['weights'],  dtype=float)   # (F, Q)
+        nid  = _np.array(cd['node_ids'], dtype=int)     # (F, L)
+        dt   = float(self.problem.domain.dt)
+        kappa = float(self.problem.params.get('kappa', 1.0))
+
+        F, Q, L = phi.shape
+        n_nodes = u_all.shape[1]
+
+        phi_f = phi.reshape(F * Q, L)           # (FQ, L)
+        gph_f = gph.reshape(F * Q, L, 2)        # (FQ, L, 2)
+        wts_f = wts.reshape(F * Q)              # (FQ,)
+        # node id for each (quad-pt, basis-fn) pair
+        nid_f = _np.tile(nid[:, None, :], (1, Q, 1)).reshape(F * Q, L)  # (FQ, L)
+
+        acc = _np.zeros(n_nodes, dtype=float)
+        result = [acc.copy()]  # step 0: zero residual (no step taken)
+
+        for n in range(1, u_all.shape[0]):
+            u_prev = u_all[n - 1].astype(float)  # (n_nodes,)
+            u_next = u_all[n].astype(float)       # (n_nodes,)
+
+            u_prev_cub = _np.sum(phi_f * u_prev[nid_f], axis=-1)   # (FQ,)
+            u_next_cub = _np.sum(phi_f * u_next[nid_f], axis=-1)   # (FQ,)
+            grad_u     = _np.einsum('kl,kli->ki', u_next[nid_f], gph_f)  # (FQ, 2)
+
+            mass  = phi_f * ((u_next_cub - u_prev_cub) / dt)[:, None]  # (FQ, L)
+            diff  = kappa * _np.einsum('ki,kli->kl', grad_u, gph_f)    # (FQ, L)
+            contrib = (mass + diff) * wts_f[:, None]                    # (FQ, L)
+
+            R = _np.zeros(n_nodes, dtype=float)
+            _np.add.at(R, nid_f.reshape(-1), contrib.reshape(-1))
+
+            acc = acc + _np.abs(R)
+            result.append(acc.copy())
+
+        return _np.stack(result, axis=0)  # (n_steps+1, n_nodes)
+
     # ==================== Loss Computation (weak-form override) ====================
 
     def _compute_total_loss(self, data, params_dict, weights_dict):
@@ -1076,15 +1345,45 @@ class Trainer(BaseTrainer):
                     # Expose stage info so print messages can show "Stage X/Y"
                     self._curriculum_stage   = _stage_steps
                     self._curriculum_n_stages = _n_time_max
+                    # Reset optimizer state at each stage: the new rollout length
+                    # changes the loss landscape significantly, so stale SOAP/Adam
+                    # second-order statistics from the previous (shorter) stage
+                    # would cause overshooting on the first few updates.
+                    self.opt_state = self.optimizer.init(self.network.params)
                     self.train()   # recursive call; _curriculum_running guards re-entry
             finally:
                 self._curriculum_running = False
                 self._epochs = saved_epochs
                 self.problem.n_time_steps = saved_n_time
                 # Rebuild loss fn for the full rollout
+                _swe_final = getattr(self, '_step_weight_exp', 0.0)
+                if _swe_final != 0.0:
+                    import numpy as _np_sw2
+                    _sw_f = _np_sw2.exp(_swe_final * _np_sw2.arange(_n_time_max) / max(_n_time_max - 1, 1))
+                    _step_weights_final = _sw_f.astype(_np_sw2.float32)
+                else:
+                    _step_weights_final = None
                 self._weak_loss_fn = jax.jit(
-                    self.problem.make_rollout_loss_fn(self.network, n_steps=_n_time_max)
+                    self.problem.make_rollout_loss_fn(self.network, n_steps=_n_time_max, step_weights=_step_weights_final)
                 )
+                # Rebuild AL fn for the full rollout if AL mode is active
+                if getattr(self, '_rollout_al_mode', False):
+                    _n_free = len(self.problem.free_nodes)
+                    _al_fn  = jax.jit(self.problem.make_rollout_al_loss_fn(self.network, n_steps=_n_time_max))
+                    self._rollout_al_fn = _al_fn
+                    # Reset lambdas for full-rollout phase (same rationale as per-stage reset)
+                    self._rollout_lambdas = jnp.zeros((_n_time_max, _n_free), dtype=jnp.float32)
+                    _optim = self.optimizer
+                    @jax.jit
+                    def _rollout_al_train_step_full(params, opt_state, lambdas):
+                        def _fl(p):
+                            loss, res = _al_fn(p, lambdas)
+                            return loss, res
+                        (loss, res), grads = jax.value_and_grad(_fl, has_aux=True)(params)
+                        updates, new_opt_state = _optim.update(grads, opt_state, params)
+                        new_params = optax.apply_updates(params, updates)
+                        return new_params, new_opt_state, loss, res
+                    self._rollout_al_train_step = _rollout_al_train_step_full
             return
 
         epochs = self._epochs
@@ -1373,9 +1672,20 @@ class Trainer(BaseTrainer):
                 # Full-batch training
                 train_targets = getattr(self, '_train_targets', {})
                 if is_full_jit:
-                    self.network.params, self.opt_state, loss = train_step(
-                            self.network.params, self.opt_state, self._train_data, train_targets
+                    # ── Per-step Lagrangian rollout (AL dual-ascent) ──────────
+                    _al_step_fn = getattr(self, '_rollout_al_train_step', None)
+                    if _al_step_fn is not None:
+                        self.network.params, self.opt_state, loss, _step_res = _al_step_fn(
+                            self.network.params, self.opt_state, self._rollout_lambdas
                         )
+                        # Dual ascent: λ ← λ + lr * R̂  (plain numpy, outside JIT)
+                        # step_res are already normalised by node_norm inside the
+                        # loss fn, so the update is scale-free w.r.t. mesh size.
+                        self._rollout_lambdas = self._rollout_lambdas + self.lagrange_lr * _step_res
+                    else:
+                        self.network.params, self.opt_state, loss = train_step(
+                                self.network.params, self.opt_state, self._train_data, train_targets
+                            )
                 else:
                     loss, grads = grad_fn(self.network.params, self._train_data, train_targets)
                     self.network.params, self.opt_state = apply_updates(self.network.params, grads, self.opt_state)
