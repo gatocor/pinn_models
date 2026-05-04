@@ -146,16 +146,25 @@ class Trainer(BaseTrainer):
             to the base class as usual.
         """
         # For ProblemWeak: strip 'pde' from test_samples before base class sees it.
-        # The weak-form test loss always uses all nodes (no mini-batching in metrics).
+        # The base class would try to create collocation test points, which makes no
+        # sense for ProblemWeak — node batching is handled separately below.
         from pinns.problem_weak import ProblemWeak as _PW
         _is_weak = isinstance(self.problem, _PW)
         _user_wants_test = test_samples is not None
+        # Capture test node count BEFORE stripping (used to build _weak_loss_fn_test).
+        _rts_n_nodes_test = None
         if _is_weak and isinstance(test_samples, dict):
+            _rts_n_nodes_test = test_samples.get('pde', None)
+            if _rts_n_nodes_test is not None:
+                _rts_n_nodes_test = int(_rts_n_nodes_test)
             test_samples = {k: v for k, v in test_samples.items() if k != 'pde'} or None
+        self._rts_n_nodes_test = _rts_n_nodes_test
 
         super().compile(*args, test_samples=test_samples, **kwargs)
-        # Flag: ProblemWeak test loss uses the full weak-form (no test data needed)
-        self._weak_test_loss = bool(_is_weak and _user_wants_test)
+        # Weak-form test PDE loss: evaluates the weak residual on a DIFFERENT random
+        # batch of nodes than the training batch, giving a true held-out PDE metric.
+        # Only active when the user passes test_samples={'pde': N}.
+        self._weak_test_loss = bool(_is_weak and _rts_n_nodes_test is not None)
 
         # For ProblemWeak: remove hard-constrained BC data — output_transform
         # satisfies them exactly so their soft loss is always zero.
@@ -642,6 +651,7 @@ class Trainer(BaseTrainer):
                         return u, jac
                 _weak_loss_fn = jax.jit(self.problem.make_loss_fn(_u_and_grad, bc_weights=weights))
                 self._weak_loss_fn = _weak_loss_fn
+                self._u_and_grad_fn = _u_and_grad
                 _is_random_time = getattr(self.problem, '_random_time_sampling', False)
                 if _is_random_time:
                     _rts_t_min = float(getattr(self.problem, '_t_min', 0.0))
@@ -664,6 +674,18 @@ class Trainer(BaseTrainer):
                             self.problem.make_loss_fn(
                                 _u_and_grad, bc_weights=weights,
                                 node_batch_size=_rts_n_nodes,
+                            )
+                        )
+                    # Test node batch: build a separate loss fn for test_samples={'pde': N}.
+                    # Uses a different random node draw each evaluation → true held-out metric.
+                    _rts_n_nodes_test = getattr(self, '_rts_n_nodes_test', None)
+                    if _rts_n_nodes_test is not None:
+                        _n_free = _n_free if _rts_n_nodes is not None else len(self.problem.free_nodes)
+                        self._rts_n_free_nodes = getattr(self, '_rts_n_free_nodes', _n_free)
+                        self._weak_loss_fn_test = jax.jit(
+                            self.problem.make_loss_fn(
+                                _u_and_grad, bc_weights=weights,
+                                node_batch_size=_rts_n_nodes_test,
                             )
                         )
                 self._weak_residual_fn = jax.jit(
@@ -944,25 +966,74 @@ class Trainer(BaseTrainer):
 
     def _compute_total_loss_batched(self, data, params_dict, weights_dict, batch_size=1000):
         """Override so the weak-form PDE loss is computed once, not per-batch."""
+        import numpy as _np
         from pinns.problem_weak import ProblemWeak as _ProblemWeak
         if isinstance(self.problem, _ProblemWeak) and hasattr(self, '_weak_loss_fn'):
-            # Strip 'pde' and hard-constrained BCs (output_transform satisfies them exactly)
+            # Strip 'pde', hard-constrained BCs, and internal '_'-prefixed keys.
+            # Hard BCs are satisfied exactly by output_transform; internal keys
+            # (_node_idx, _t_vals, etc.) are not BC data and must not be forwarded
+            # to the base class (which would produce float(None) on an empty loop).
             _hard = self.problem.hard_bc_names
-            bc_data = {k: v for k, v in data.items() if k != 'pde' and k not in _hard}
-            total_loss, losses = super()._compute_total_loss_batched(
-                bc_data, params_dict, weights_dict, batch_size)
-            # Add weak residual exactly once
-            pde_weight = weights_dict.get('pde', 1.0)
-            if getattr(self, '_rts_t_min', None) is not None:
-                import numpy as _np
-                _t_vals = jnp.array(
-                    _np.linspace(self._rts_t_min, self._rts_t_max, self._rts_n_t)
-                )
-                weak_pde_loss = float(self._weak_loss_fn(self.network.params, _t_vals))
+            bc_data = {k: v for k, v in data.items()
+                       if k != 'pde' and k not in _hard and not k.startswith('_')}
+            if bc_data:
+                total_loss, losses = super()._compute_total_loss_batched(
+                    bc_data, params_dict, weights_dict, batch_size)
             else:
-                weak_pde_loss = float(self._weak_loss_fn(self.network.params))
-            losses['pde'] = pde_weight * weak_pde_loss
-            total_loss = (total_loss or 0.0) + pde_weight * weak_pde_loss
+                total_loss, losses = 0.0, {}
+            _is_train_data = data is getattr(self, '_train_data', None)
+            pde_weight = weights_dict.get('pde', 1.0)
+            if _is_train_data:
+                # Training: use precomputed _t_vals / _node_idx from train_data
+                if getattr(self, '_rts_t_min', None) is not None:
+                    if getattr(self, '_rts_n_nodes', None) is not None:
+                        # Node-batched: one independent random time per node, shape (B,)
+                        _node_idx = jnp.array(_np.random.choice(
+                            self._rts_n_free_nodes, size=self._rts_n_nodes,
+                            replace=self._rts_n_nodes > self._rts_n_free_nodes
+                        ).astype(_np.int32))
+                        _t_per_node = jnp.array(
+                            (self._rts_t_min + _np.random.uniform(0, 1, self._rts_n_nodes)
+                             * (self._rts_t_max - self._rts_t_min)).astype(_np.float32)
+                        )
+                        weak_pde_loss = float(self._weak_loss_fn_train(self.network.params, _node_idx, _t_per_node))
+                    else:
+                        _t_vals = jnp.array(
+                            _np.linspace(self._rts_t_min, self._rts_t_max, self._rts_n_t)
+                        )
+                        weak_pde_loss = float(self._weak_loss_fn(self.network.params, _t_vals))
+                else:
+                    weak_pde_loss = float(self._weak_loss_fn(self.network.params))
+                losses['pde'] = pde_weight * weak_pde_loss
+                total_loss = (total_loss or 0.0) + pde_weight * weak_pde_loss
+            elif getattr(self, '_weak_test_loss', False):
+                # Test: sample a DIFFERENT random batch of nodes → held-out PDE metric
+                _weak_fn_test = getattr(self, '_weak_loss_fn_test',
+                                        getattr(self, '_weak_loss_fn_train',
+                                                self._weak_loss_fn))
+                if getattr(self, '_rts_t_min', None) is not None:
+                    _n_free = getattr(self, '_rts_n_free_nodes', len(self.problem.free_nodes))
+                    _n_test_nodes = getattr(self, '_rts_n_nodes_test', None) or getattr(self, '_rts_n_nodes', None)
+                    if _n_test_nodes is not None:
+                        # Node-batched test: one random time per test node, shape (B_test,)
+                        _node_idx_test = jnp.array(_np.random.choice(
+                            _n_free, size=_n_test_nodes,
+                            replace=_n_test_nodes > _n_free
+                        ).astype(_np.int32))
+                        _t_per_node_test = jnp.array(
+                            (self._rts_t_min + _np.random.uniform(0, 1, _n_test_nodes)
+                             * (self._rts_t_max - self._rts_t_min)).astype(_np.float32)
+                        )
+                        weak_pde_loss_test = float(_weak_fn_test(self.network.params, _node_idx_test, _t_per_node_test))
+                    else:
+                        _t_vals_test = jnp.array(
+                            _np.linspace(self._rts_t_min, self._rts_t_max, self._rts_n_t)
+                        )
+                        weak_pde_loss_test = float(_weak_fn_test(self.network.params, _t_vals_test))
+                else:
+                    weak_pde_loss_test = float(_weak_fn_test(self.network.params))
+                losses['pde'] = pde_weight * weak_pde_loss_test
+                total_loss = (total_loss or 0.0) + pde_weight * weak_pde_loss_test
             return total_loss, losses
         return super()._compute_total_loss_batched(data, params_dict, weights_dict, batch_size)
 
@@ -1903,6 +1974,7 @@ def _make_al_loss_fn_impl(self, params_dict):
         _weak_res_fn = jax.jit(self.problem.make_residual_vector_fn(_u_and_grad))
         # Store for the residual plot
         self._weak_residual_fn = _weak_res_fn
+        self._u_and_grad_fn = _u_and_grad
         _n_dofs  = self.problem.n_dofs
         _n_comp  = self.problem.n_outputs
         # For multi-component: residual vector is [R1; R2; ...] of length n_dofs*n_comp

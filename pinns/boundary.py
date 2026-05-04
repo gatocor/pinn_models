@@ -489,7 +489,8 @@ class MeshNodeBC:
         domain.add_dirichlet(
             select=np.arange(100),
             value=lambda x: np.sin(np.pi * x[:, 1]),
-            component=0, name="ic", t_mode="t_min"
+            component=0, name="ic",
+            time_window=[0.0, 0.0],  # t_min=0
         )
     """
     node_positions: 'np.ndarray'          # (n_selected, spatial_dims)
@@ -497,12 +498,62 @@ class MeshNodeBC:
     bc_type: str                          # "dirichlet" or "neumann"
     component: int = 0
     name: Optional[str] = None
-    t_mode: Optional[str] = None         # None | "all" | "t_min" | "t_max"
+    # time_window encodes when this BC is active:
+    #   None              – purely spatial domain (no time axis)
+    #   [t_a, t_b]        – continuous interval; sampled uniformly in [t_a, t_b]
+    #   [t0, t1, t2, ...] – discrete list of exact time points (≥3 elements)
+    #   [t_a, t_b]  with t_a==t_b  – fixed single time point
+    time_window: Optional[Union[List, Tuple]] = None
     t_min: float = 0.0
     t_max: float = 1.0
+    node_indices: Optional['np.ndarray'] = None  # (n_nodes,) int indices into the full mesh vertex array
     edges: Optional['np.ndarray'] = None         # (n_edges, 2) vertex index pairs into the full mesh
     edge_lengths: Optional['np.ndarray'] = None  # (n_edges,)
     edge_normals: Optional['np.ndarray'] = None  # (n_edges, 2) outward unit normals per edge
+
+    # ── backward-compat property ──────────────────────────────────────────
+    @property
+    def t_mode(self) -> Optional[str]:
+        """Derived from ``time_window`` for backward compatibility.
+
+        Returns one of ``None``, ``"t_min"``, ``"t_max"``, or ``"all"``.
+        """
+        tw = self.time_window
+        if tw is None:
+            return None
+        pts = [float(v) for v in tw]
+        if len(pts) == 0:
+            return None
+        if len(pts) == 1:
+            a = pts[0]
+            if abs(a - self.t_min) < 1e-10:
+                return "t_min"
+            if abs(a - self.t_max) < 1e-10:
+                return "t_max"
+            return "all"
+        # 2-element interval (continuous) or multi-point discrete list
+        a, b = pts[0], pts[-1]
+        if abs(a - self.t_min) < 1e-10 and abs(b - self.t_min) < 1e-10:
+            return "t_min"
+        if abs(a - self.t_max) < 1e-10 and abs(b - self.t_max) < 1e-10:
+            return "t_max"
+        return "all"
+
+    def is_full_time_coverage(self) -> bool:
+        """True if the BC is active over the entire time domain ``[t_min, t_max]``.
+
+        Used by :class:`~pinns.problem_weak.ProblemWeak` to decide which BCs
+        can be imposed as hard constraints.  Returns ``True`` for purely
+        spatial domains (no time axis) as well as for continuous-interval BCs
+        whose window spans ``[t_min, t_max]`` exactly.
+        """
+        tw = self.time_window
+        if tw is None:
+            return True   # spatial domain, always active
+        if len(tw) != 2:
+            return False  # discrete list of individual time points
+        a, b = float(tw[0]), float(tw[1])
+        return abs(a - self.t_min) < 1e-10 and abs(b - self.t_max) < 1e-10
 
     def get_value(self, x) -> np.ndarray:
         """Return target values as a numpy array (backend-agnostic)."""

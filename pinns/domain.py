@@ -1434,7 +1434,7 @@ class DomainMesh:
         domain.add_dirichlet(
             select=np.arange(500),
             value=lambda x: np.sin(np.pi * x[:, 1]),
-            component=0, name="ic", t_mode="t_min"
+            component=0, name="ic", time_window=[0.0, 0.0]
         )
     """
 
@@ -1521,11 +1521,13 @@ class DomainMesh:
         if t_interval is not None:
             self._t_min = float(t_interval[0])
             self._t_max = float(t_interval[1])
+            self.t_interval = [self._t_min, self._t_max]
             self.xmin = np.append(sp_min, self._t_min)
             self.xmax = np.append(sp_max, self._t_max)
         else:
             self._t_min = None
             self._t_max = None
+            self.t_interval = None
             self.xmin = sp_min
             self.xmax = sp_max
 
@@ -1547,6 +1549,21 @@ class DomainMesh:
                            if _edges_list else np.empty((0, 2), dtype=np.int64))
         # canonical (min_v, max_v) -> edge_index  (used by helper methods)
         self._edge_lookup: dict = _seen_edges
+
+        # Precompute boundary / interior node masks from edge counts.
+        # A mesh edge shared by exactly one face is a boundary edge.
+        _edge_face_count: dict = {}
+        for _face in self._faces:
+            for _j in range(3):
+                _v0, _v1 = int(_face[_j]), int(_face[(_j + 1) % 3])
+                _key = (min(_v0, _v1), max(_v0, _v1))
+                _edge_face_count[_key] = _edge_face_count.get(_key, 0) + 1
+        _bnd_mask = np.zeros(len(self._vertices), dtype=bool)
+        for (_v0, _v1), _cnt in _edge_face_count.items():
+            if _cnt == 1:
+                _bnd_mask[_v0] = True
+                _bnd_mask[_v1] = True
+        self._boundary_node_mask: np.ndarray = _bnd_mask
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #
@@ -1606,37 +1623,51 @@ class DomainMesh:
             (n_points, self._spatial_dims)
         )
 
-    def _resolve_select(self, select) -> np.ndarray:
+    def _resolve_node_select(self, select) -> np.ndarray:
         """
-        Return edge indices (into ``self._all_edges``) matching *select*.
+        Return a 1-D integer array of **node indices** matching *select*.
 
         *select* can be one of:
 
-        - **``(n, 2)`` integer array** — interpreted as ``(v0, v1)`` vertex-pair
-          edge pairs (e.g. directly from ``mesh.cells_dict["line"]`` or a
-          ``boundary_edges()`` helper).  Each pair is looked up in
-          ``_edge_lookup``; unrecognised pairs are silently skipped.
-        - **Callable** — called with the full vertex array ``(n_verts, 2)``;
-          must return a boolean mask of shape ``(n_verts,)``.  An edge is
-          included when **both** of its endpoints satisfy the mask.
+        - **Callable** — called with ``self._vertices`` ``(n_verts, spatial_dims)``;
+          must return a boolean mask of shape ``(n_verts,)``.
+          Example: ``lambda v: v[:, 0] < 1e-6`` (x ≈ 0 plane).
+
+        - **1-D integer array** — explicit node index list.
+          Example: ``np.arange(100)``.
+
+        - **Boolean array** of shape ``(n_verts,)`` — treated as a mask.
+
+        - **2-D ``(n, 2)`` integer array** — interpreted as edge vertex-pair
+          table (e.g. ``mesh.cells_dict["line"]``); the unique node indices
+          contained in those edges are returned (backward-compatible usage
+          for Neumann BCs sourced directly from mesh boundary cells).
         """
         if callable(select):
             mask = np.asarray(select(self._vertices), dtype=bool)
-            v0_ok = mask[self._all_edges[:, 0]]
-            v1_ok = mask[self._all_edges[:, 1]]
-            edge_indices = np.where(v0_ok & v1_ok)[0].astype(np.intp)
-        else:
-            arr = np.asarray(select)
-            if arr.ndim != 2 or arr.shape[1] != 2:
-                raise ValueError(
-                    "select must be a (n, 2) array of vertex-index pairs "
-                    "or a callable returning a boolean vertex mask. "
-                    f"Got array with shape {arr.shape}."
-                )
-            edge_indices = self.edge_pairs_to_indices(arr)
-        if len(edge_indices) == 0:
-            raise ValueError("Edge selector matched zero edges.")
-        return edge_indices
+            return np.where(mask)[0].astype(np.intp)
+        arr = np.asarray(select)
+        if arr.dtype == bool:
+            return np.where(arr)[0].astype(np.intp)
+        if arr.ndim == 1:
+            return arr.astype(np.intp)
+        if arr.ndim == 2 and arr.shape[1] == 2:
+            # Edge-pair table — extract unique node indices
+            return np.unique(arr.ravel()).astype(np.intp)
+        raise ValueError(
+            "select must be a callable, a boolean mask, a 1-D integer array, "
+            f"or a (n, 2) edge-pair array.  Got array with shape {arr.shape}."
+        )
+
+    # keep _resolve_select as an alias for internal / backward-compat callers
+    def _resolve_select(self, select) -> np.ndarray:
+        """Legacy alias — converts node selector to edge indices.
+
+        Calls :meth:`_resolve_node_select` then returns indices of edges whose
+        **both** endpoints are in the selected node set.
+        """
+        node_idx = self._resolve_node_select(select)
+        return self.node_indices_to_edge_indices(node_idx)
 
     def edge_pairs_to_indices(self, edge_pairs: np.ndarray) -> np.ndarray:
         """
@@ -1722,6 +1753,104 @@ class DomainMesh:
         return normals
 
     # ------------------------------------------------------------------ #
+    #  Temporal-overlap validation                                        #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _tw_overlaps(tw_a, tw_b, t_min: float, t_max: float,
+                     tol: float = 1e-10) -> bool:
+        """
+        Return ``True`` if two time windows share any common time.
+
+        Rules
+        -----
+        * ``None`` stands for the full domain ``[t_min, t_max]``.
+        * A 2-element list/tuple ``[a, b]`` is a closed interval.
+        * A list with > 2 elements is a discrete set; each value is compared
+          against the other window's discrete set or interval.
+        """
+        def to_interval(tw):
+            """Reduce any time window to (lo, hi); discrete → (min, max)."""
+            if tw is None:
+                return (t_min, t_max)
+            pts = [float(v) for v in tw]
+            return (min(pts), max(pts))
+
+        # Both discrete: exact-value intersection
+        def is_discrete(tw):
+            return tw is not None and len(tw) > 2
+
+        if is_discrete(tw_a) and is_discrete(tw_b):
+            # Round to tol grid to handle float noise
+            grid = max(tol, 1e-14)
+            ka = {round(float(v) / grid) for v in tw_a}
+            kb = {round(float(v) / grid) for v in tw_b}
+            return bool(ka & kb)
+
+        if is_discrete(tw_a) or is_discrete(tw_b):
+            # One discrete, one interval: check whether any discrete value
+            # falls inside the interval
+            disc, cont = (tw_a, tw_b) if is_discrete(tw_a) else (tw_b, tw_a)
+            lo, hi = to_interval(cont)
+            return any(lo - tol <= float(v) <= hi + tol for v in disc)
+
+        # Both intervals (or None)
+        # Two intervals overlap only if they share more than a single point.
+        # Touching at exactly one endpoint ([0,0.5] and [0.5,1]) is NOT
+        # an overlap — it is zero-measure and is allowed.
+        a_lo, a_hi = to_interval(tw_a)
+        b_lo, b_hi = to_interval(tw_b)
+        return max(a_lo, b_lo) < min(a_hi, b_hi) - tol
+
+    def _check_bc_time_overlap(self, new_bc) -> None:
+        """
+        Raise ``ValueError`` if *new_bc* conflicts in time with any already-
+        registered BC on the same (bc_type, component, nodes) combination.
+
+        A conflict exists when both BCs have at least one shared **node** *and*
+        their **time windows overlap** — meaning the same node would be
+        assigned two different conditions at the same time.
+        """
+        from pinns.boundary import MeshNodeBC
+        if not isinstance(new_bc, MeshNodeBC):
+            return
+
+        t_min = self._t_min if self._t_min is not None else 0.0
+        t_max = self._t_max if self._t_max is not None else 1.0
+
+        for existing in self.boundary_conditions:
+            if not isinstance(existing, MeshNodeBC):
+                continue
+            if existing.bc_type != new_bc.bc_type:
+                continue
+            if existing.component != new_bc.component:
+                continue
+
+            # Check node-set intersection
+            n_ex  = existing.node_indices
+            n_new = new_bc.node_indices
+            if n_ex is None or n_new is None:
+                continue   # can't determine without index arrays
+            common = np.intersect1d(n_ex, n_new)
+            if len(common) == 0:
+                continue
+
+            # Check temporal overlap
+            if self._tw_overlaps(
+                existing.time_window, new_bc.time_window, t_min, t_max
+            ):
+                raise ValueError(
+                    f"BC '{new_bc.name}' "
+                    f"(type='{new_bc.bc_type}', component={new_bc.component}, "
+                    f"time_window={new_bc.time_window}) overlaps in time with "
+                    f"existing BC '{existing.name}' "
+                    f"(time_window={existing.time_window}) on "
+                    f"{len(common)} shared node(s).  "
+                    "Adjust the time_window of one of the two conditions so "
+                    "that they do not cover the same time simultaneously."
+                )
+
+    # ------------------------------------------------------------------ #
     #  Public sampling API (called by the trainer)                        #
     # ------------------------------------------------------------------ #
 
@@ -1784,20 +1913,23 @@ class DomainMesh:
             idx     = rng.integers(0, n_nodes, n_points)
             pts_sp  = bc.node_positions[idx]
 
-        if self._t_min is None or bc.t_mode is None:
+        tw = getattr(bc, 'time_window', None)
+        if self._t_min is None or tw is None:
             return pts_sp, idx
-        elif bc.t_mode == "all":
-            t = rng.uniform(self._t_min, self._t_max, (n_points, 1))
-            return np.hstack([pts_sp, t]), idx
-        elif bc.t_mode == "t_min":
-            t = np.full((n_points, 1), self._t_min)
-            return np.hstack([pts_sp, t]), idx
-        elif bc.t_mode == "t_max":
-            t = np.full((n_points, 1), self._t_max)
-            return np.hstack([pts_sp, t]), idx
+        pts_tw = [float(v) for v in tw]
+        if len(pts_tw) == 0:
+            return pts_sp, idx
+        if len(pts_tw) == 2 and abs(pts_tw[0] - pts_tw[1]) < 1e-12:
+            # degenerate interval — single fixed time (e.g. initial condition)
+            t = np.full((n_points, 1), pts_tw[0])
+        elif len(pts_tw) == 2:
+            # continuous interval [a, b] — uniform sampling within window
+            t = rng.uniform(pts_tw[0], pts_tw[1], (n_points, 1))
         else:
-            raise ValueError(f"Unknown t_mode: {bc.t_mode!r}. "
-                             "Choose 'all', 't_min', or 't_max'.")
+            # discrete list of time values — pick randomly
+            chosen = rng.choice(pts_tw, size=n_points)
+            t = chosen.reshape(-1, 1)
+        return np.hstack([pts_sp, t]), idx
 
     # ------------------------------------------------------------------ #
     #  Boundary-condition builders                                        #
@@ -1809,57 +1941,119 @@ class DomainMesh:
         value,
         component: int = 0,
         name: str = None,
-        t_mode: str = None,
+        time_window=None,
     ) -> 'DomainMesh':
         """
         Add a Dirichlet BC: ``u = value`` on the selected nodes.
 
         Args:
-            select: Node selector — an ``np.ndarray`` of integer indices **or**
-                    a callable ``(vertices: ndarray) -> bool mask``.
+            select: Node selector — one of:
 
-                    Examples::
+                    - **Callable** ``(vertices: ndarray) -> bool mask``
 
                         select=lambda v: v[:, 0] < 1e-6   # x ≈ 0 plane
-                        select=np.array([0, 5, 10, 42])   # explicit indices
-                        select=lambda v: np.linalg.norm(v, axis=1) > 0.99
+
+                    - **Boolean array** of shape ``(n_verts,)``
+
+                    - **1-D integer array** of node indices
+
+                        select=np.array([0, 5, 10, 42])
 
             value: Dirichlet value. Scalar **or** ``(x_np) -> np.ndarray``
                    callable that receives the sampled coordinates (including t
                    if a time interval is set).
             component: Output component index (default 0).
             name: Label used in loss weight dicts and plots.
-            t_mode: How to handle the time dimension (ignored for purely
-                    spatial domains):
-
-                    - ``None``    — no time appended (pure spatial domain)
-                    - ``"all"``   — sample t uniformly in ``[t_min, t_max]``
-                    - ``"t_min"`` — fix t = t_min  (initial condition)
-                    - ``"t_max"`` — fix t = t_max  (final condition)
+            time_window: When this BC is active (see subclass docs).
 
         Returns:
             *self* for method chaining.
         """
         from pinns.boundary import MeshNodeBC
-        edge_indices  = self._resolve_select(select)
-        edges         = self._all_edges[edge_indices]          # (n_sel, 2)
-        node_positions = self._vertices[np.unique(edges)]      # unique vertices
-        edge_lengths  = np.linalg.norm(
-            self._vertices[edges[:, 1]] - self._vertices[edges[:, 0]], axis=1)
+        node_idx       = self._resolve_node_select(select)
+        if len(node_idx) == 0:
+            raise ValueError("Node selector matched zero nodes.")
+        node_positions = self._vertices[node_idx]
         bc = MeshNodeBC(
             node_positions=node_positions,
             value=value,
             bc_type="dirichlet",
             component=component,
             name=name,
-            t_mode=t_mode if self._t_min is not None else None,
+            time_window=time_window if self._t_min is not None else None,
             t_min=self._t_min or 0.0,
             t_max=self._t_max or 1.0,
-            edges=edges,
-            edge_lengths=edge_lengths,
+            node_indices=node_idx,
+            edges=None,
+            edge_lengths=None,
         )
+        self._check_bc_time_overlap(bc)
         self.boundary_conditions.append(bc)
         return self
+
+    @property
+    def boundary_node_mask(self) -> np.ndarray:
+        """Boolean mask ``(n_vertices,)`` — ``True`` for boundary nodes.
+
+        A node is considered a boundary node if it belongs to at least one
+        mesh edge that is shared by exactly one triangle.
+        """
+        return self._boundary_node_mask
+
+    @property
+    def interior_node_mask(self) -> np.ndarray:
+        """Boolean mask ``(n_vertices,)`` — ``True`` for strictly interior nodes.
+
+        Complement of :attr:`boundary_node_mask`.
+        """
+        return ~self._boundary_node_mask
+
+    def add_initial_condition(
+        self,
+        value=0.0,
+        component: int = 0,
+        name: str = "ic",
+    ) -> 'DomainMesh':
+        """
+        Add a Dirichlet initial condition: ``u(x, t_min) = value``.
+
+        Applies to **interior nodes only** (nodes not on the spatial boundary).
+        Spatial boundary nodes at ``t_min`` are typically already governed by
+        a full-time-coverage Dirichlet BC, so including them here would be
+        redundant.  The selector is determined automatically from the mesh
+        topology via :attr:`interior_node_mask`.
+
+        Args:
+            value:     IC value. Scalar **or** ``(x_np) -> np.ndarray`` callable.
+            component: Output component index (default 0).
+            name:      Label used in loss weight dicts and plots (default ``"ic"``).
+
+        Returns:
+            *self* for method chaining.
+
+        Example::
+
+            # u(x, y, 0) = 0 everywhere in the interior
+            domain.add_initial_condition(value=0.0)
+
+            # position-dependent IC
+            domain.add_initial_condition(
+                value=lambda x: np.sin(np.pi * x[:, 0]).reshape(-1, 1),
+            )
+        """
+        if self._t_min is None:
+            raise ValueError(
+                "add_initial_condition requires a time-dependent domain "
+                "(DomainMeshContinuous or DomainMeshDiscrete)."
+            )
+        interior_mask = self.interior_node_mask
+        return self.add_dirichlet(
+            select=lambda v: interior_mask,
+            value=value,
+            component=component,
+            name=name,
+            time_window=[self._t_min, self._t_min],
+        )
 
     def add_neumann(
         self,
@@ -1867,52 +2061,69 @@ class DomainMesh:
         value,
         component: int = 0,
         name: str = None,
-        t_mode: str = None,
+        time_window=None,
     ) -> 'DomainMesh':
         """
-        Add a Neumann BC: ``du/dn = value`` on the selected edges.
+        Add a Neumann BC: ``du/dn = value`` on the selected boundary nodes.
 
-        For **time boundaries** (``t_mode="t_min"`` or ``"t_max"``) the normal
-        direction is along the time axis.
+        The edges whose **both** endpoints are in the selected node set are
+        determined automatically and used for line-integral flux sampling and
+        outward-normal computation.
 
-        For **spatial surface** edges normals are inferred automatically from
-        the local tangent of the boundary curve and oriented away from the
-        mesh centroid.
+        For **time-point** BCs (degenerate ``time_window=[t, t]`` or a
+        single-element list), outward normals act along the time axis.
 
         Args:
-            select: Edge selector — ``(n, 2)`` vertex-pair array or callable
+            select: Node selector — callable, boolean mask, or 1-D int array
                     (see :meth:`add_dirichlet`).
             value: Normal-derivative value. Scalar or callable.
             component: Output component index.
             name: Label.
-            t_mode: Time sampling mode (see :meth:`add_dirichlet`).
+            time_window: When this BC is active (see subclass docs).
 
         Returns:
             *self* for method chaining.
         """
         from pinns.boundary import MeshNodeBC
-        edge_indices   = self._resolve_select(select)
-        edges          = self._all_edges[edge_indices]          # (n_sel, 2)
-        node_positions = self._vertices[np.unique(edges)]       # unique vertices
+        node_idx       = self._resolve_node_select(select)
+        if len(node_idx) == 0:
+            raise ValueError("Node selector matched zero nodes.")
+        node_positions = self._vertices[node_idx]
+        # Derive edges: all mesh edges whose BOTH endpoints are selected nodes
+        edge_indices   = self.node_indices_to_edge_indices(node_idx)
+        if len(edge_indices) == 0:
+            raise ValueError(
+                "Neumann BC node selector yielded no mesh edges "
+                "(no mesh edge has both endpoints among the selected nodes)."
+            )
+        edges          = self._all_edges[edge_indices]
         edge_lengths   = np.linalg.norm(
             self._vertices[edges[:, 1]] - self._vertices[edges[:, 0]], axis=1)
-        if t_mode not in ("t_min", "t_max"):
-            edge_normals = self._infer_edge_outward_normals(edges)
-        else:
-            edge_normals = None
+        _tw = time_window
+        _is_time_point = (
+            _tw is not None
+            and len(_tw) >= 1
+            and (
+                (len(_tw) == 1)
+                or (len(_tw) == 2 and abs(float(_tw[0]) - float(_tw[1])) < 1e-12)
+            )
+        )
+        edge_normals = None if _is_time_point else self._infer_edge_outward_normals(edges)
         bc = MeshNodeBC(
             node_positions=node_positions,
             value=value,
             bc_type="neumann",
             component=component,
             name=name,
-            t_mode=t_mode if self._t_min is not None else None,
+            time_window=_tw if self._t_min is not None else None,
             t_min=self._t_min or 0.0,
             t_max=self._t_max or 1.0,
+            node_indices=node_idx,
             edges=edges,
             edge_lengths=edge_lengths,
             edge_normals=edge_normals,
         )
+        self._check_bc_time_overlap(bc)
         self.boundary_conditions.append(bc)
         return self
 
@@ -2114,6 +2325,234 @@ class DomainMesh:
         self.boundary_conditions.append(bc)
         return self
 
+    # ------------------------------------------------------------------ #
+    #  Visualisation                                                       #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _bc_label(bc, color_idx: int) -> str:
+        """Build a human-readable legend label for one MeshNodeBC."""
+        label = bc.name or f"bc_{color_idx}"
+        if bc.bc_type:
+            label = f"[{bc.bc_type[0].upper()}] {label}"
+        return label
+
+    @staticmethod
+    def _tw_label(tw) -> str:
+        """Short string describing a time_window."""
+        if tw is None:
+            return "spatial"
+        pts = [float(v) for v in tw]
+        if len(pts) == 1 or (len(pts) == 2 and abs(pts[0] - pts[-1]) < 1e-12):
+            return f"t = {pts[0]:.4g}"
+        if len(pts) == 2:
+            return f"t ∈ [{pts[0]:.4g}, {pts[1]:.4g}]"
+        return f"{len(pts)} time steps"
+
+    def _draw_bc_on_ax(self, ax, bc, color, label,
+                       node_size: float, show_normals: bool = False) -> None:
+        """Draw a single MeshNodeBC onto *ax*."""
+        v = self._vertices
+        if bc.node_indices is not None:
+            pts = v[bc.node_indices]
+        else:
+            pts = bc.node_positions
+        ax.scatter(pts[:, 0], pts[:, 1],
+                   s=node_size, c=color, zorder=3, label=label)
+        if bc.bc_type == "neumann" and bc.edges is not None:
+            for e in bc.edges:
+                p0, p1 = v[e[0]], v[e[1]]
+                ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
+                        color=color, linewidth=2.5, zorder=4)
+
+    def _draw_background(self, ax, show_mesh: bool, show_boundary: bool,
+                         show_interior: bool, node_size: float) -> None:
+        """Draw mesh and optional background node layers."""
+        import matplotlib.tri as mtri
+        v, f = self._vertices, self._faces
+        if show_mesh:
+            tri = mtri.Triangulation(v[:, 0], v[:, 1], f)
+            ax.triplot(tri, color="#cccccc", linewidth=0.5, zorder=1)
+        if show_boundary:
+            idx = np.where(self._boundary_node_mask)[0]
+            ax.scatter(v[idx, 0], v[idx, 1],
+                       s=node_size * 0.6, c="#aaaaaa", zorder=2,
+                       label="_bnd")
+        if show_interior:
+            idx = np.where(~self._boundary_node_mask)[0]
+            ax.scatter(v[idx, 0], v[idx, 1],
+                       s=node_size * 0.3, c="#dddddd", zorder=2,
+                       label="_int")
+
+    def plot(
+        self,
+        show_mesh: bool = True,
+        show_boundary: bool = True,
+        show_interior: bool = False,
+        node_size: float = 30.0,
+        figsize=None,
+    ):
+        """
+        Visualise the mesh together with the registered boundary conditions.
+
+        Works for **2-D spatial meshes** only (raises ``NotImplementedError``
+        for 3-D meshes).
+
+        **Panel layout:** the union of all BC time-window endpoints defines a
+        set of *time breakpoints*.  Consecutive breakpoints form
+        **phase intervals** (e.g. ``[0, 0.5]`` and ``[0.5, 1.0]``).  One
+        subplot is produced per phase.  A BC is drawn in a panel whenever its
+        ``time_window`` overlaps with (or covers) that phase.  This means BCs
+        active for the entire simulation appear in every panel, while BCs
+        restricted to a sub-interval appear only in the relevant panel(s).
+
+        When the domain has no time axis a single panel is produced.
+
+        Each subplot shows:
+
+        * the full triangulation in light grey (``show_mesh=True``),
+        * boundary nodes in dark grey (``show_boundary=True``),
+        * every active BC in a distinct colour; Neumann edges drawn as thick
+          lines.
+
+        Args:
+            show_mesh (bool): Draw triangulation edges (default ``True``).
+            show_boundary (bool): Highlight boundary nodes (default ``True``).
+            show_interior (bool): Show interior nodes (default ``False``).
+            node_size (float): Scatter-point size for BC nodes (default 30).
+            figsize (tuple | None): Figure size; auto-computed when ``None``.
+
+        Returns:
+            ``numpy.ndarray`` of ``matplotlib.axes.Axes`` (one per panel),
+            or a single ``Axes`` if there is only one panel.
+
+        Example::
+
+            axes = domain.plot()
+
+        """
+        if self._spatial_dims != 2:
+            raise NotImplementedError(
+                "DomainMesh.plot() is only implemented for 2-D spatial meshes."
+            )
+
+        import matplotlib.pyplot as plt
+        from pinns.boundary import MeshNodeBC
+
+        mesh_bcs = [bc for bc in self.boundary_conditions
+                    if isinstance(bc, MeshNodeBC)]
+
+        # ── Build time phases from BC breakpoints ──────────────────────
+        #
+        # Collect every finite time-value mentioned in any BC time_window.
+        # ``None`` time-window means "no time axis" — treat as a single panel.
+        has_time = self._t_min is not None
+        breakpoints: list = []
+
+        if has_time:
+            breakpoints.append(self._t_min)
+            breakpoints.append(self._t_max)
+            for bc in mesh_bcs:
+                tw = bc.time_window
+                if tw is not None:
+                    for v in tw:
+                        breakpoints.append(float(v))
+
+        # Deduplicate and sort
+        tol = 1e-10
+        unique_bps: list = []
+        for v in sorted(set(round(b, 12) for b in breakpoints)):
+            if not unique_bps or abs(v - unique_bps[-1]) > tol:
+                unique_bps.append(v)
+
+        # Phases: consecutive pairs of breakpoints
+        if len(unique_bps) >= 2:
+            phases = [(unique_bps[i], unique_bps[i + 1])
+                      for i in range(len(unique_bps) - 1)]
+        else:
+            phases = [(self._t_min, self._t_max)] if has_time else [None]
+
+        # ── Assign a fixed colour to each BC (consistent across panels) ─
+        _colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        bc_color: dict = {id(bc): _colors[i % len(_colors)]
+                          for i, bc in enumerate(mesh_bcs)}
+
+        # ── Helper: does a BC's time_window cover a phase? ──────────────
+        def _bc_in_phase(bc, phase) -> bool:
+            if phase is None:
+                return True   # spatial-only domain
+            tw = bc.time_window
+            p_lo, p_hi = phase
+            p_mid = 0.5 * (p_lo + p_hi)
+
+            if tw is None:
+                return True   # BC has no time restriction — always active
+
+            pts = [float(v) for v in tw]
+            if len(pts) > 2:
+                # Discrete list: any value inside the phase?
+                return any(p_lo - tol <= v <= p_hi + tol for v in pts)
+            # Interval [a, b]: check if phase midpoint is inside [a, b]
+            a, b = min(pts), max(pts)
+            if abs(a - b) < tol:
+                # Point BC: active if the point is inside the phase
+                return p_lo - tol <= a <= p_hi + tol
+            return a - tol <= p_mid <= b + tol
+
+        n_panels = len(phases)
+        panel_w, panel_h = 6.0, 5.5
+        if figsize is None:
+            figsize = (panel_w * n_panels, panel_h)
+
+        fig, axes = plt.subplots(1, n_panels, figsize=figsize, squeeze=False)
+        axes = axes[0]   # (n_panels,)
+
+        for ax, phase in zip(axes, phases):
+            self._draw_background(ax, show_mesh, show_boundary,
+                                   show_interior, node_size)
+
+            for bc in mesh_bcs:
+                if not _bc_in_phase(bc, phase):
+                    continue
+                color = bc_color[id(bc)]
+                label = self._bc_label(bc, list(bc_color.keys()).index(id(bc)))
+                self._draw_bc_on_ax(ax, bc, color, label, node_size)
+
+            ax.set_aspect("equal")
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+
+            # Panel title: phase interval
+            if phase is None:
+                ax.set_title("spatial", fontsize=10)
+            else:
+                p_lo, p_hi = phase
+                if abs(p_lo - p_hi) < tol:
+                    ax.set_title(f"t = {p_lo:.4g}", fontsize=10)
+                else:
+                    ax.set_title(f"t ∈ [{p_lo:.4g}, {p_hi:.4g}]", fontsize=10)
+
+            # Legend (skip private background entries)
+            handles, labels = ax.get_legend_handles_labels()
+            visible = [(h, l) for h, l in zip(handles, labels)
+                       if not l.startswith("_")]
+            if visible:
+                ax.legend(*zip(*visible), loc="upper right",
+                          fontsize=8, framealpha=0.85)
+
+        # Super-title: mesh summary
+        v, f_ = self._vertices, self._faces
+        t_info = (f" × t∈[{self._t_min:.3g}, {self._t_max:.3g}]"
+                  if self._t_min is not None else "")
+        fig.suptitle(
+            f"{type(self).__name__}  |  {len(v)} nodes, {len(f_)} triangles"
+            f"  [{self._spatial_dims}D{t_info}]",
+            fontsize=11, y=1.01,
+        )
+        fig.tight_layout()
+
+        return axes[0] if n_panels == 1 else axes
+
     def __repr__(self):
         n_bcs = len(self.boundary_conditions)
         sp = f"{self._spatial_dims}D"
@@ -2147,6 +2586,21 @@ class DomainMeshContinuous(DomainMesh):
         n_time_points: Default number of time levels passed to
             :class:`~pinns.problem_weak.ProblemWeak` (can be overridden
             there via ``n_time_points`` argument).  Defaults to 10.
+
+    **Boundary-condition API** — ``time_window=[t_start, t_end]``
+
+    Both :meth:`add_dirichlet` and :meth:`add_neumann` require a
+    ``time_window`` argument that is a **2-element list** ``[t_start, t_end]``
+    (with ``t_min ≤ t_start ≤ t_end ≤ t_max``).
+
+    * Use ``time_window=[t_min, t_max]`` (the default) for a BC that is active
+      at **all times** — e.g. hot or cold walls that are held constant.
+    * Use ``time_window=[t_min, t_min]`` for an **initial condition** pinned at
+      ``t = t_min``.  The convenience method :meth:`add_initial_condition` does
+      this automatically.
+    * Use any sub-interval ``[t_a, t_b]`` to activate the BC only during that
+      part of the simulation.  Time samples are drawn uniformly from
+      ``[t_a, t_b]`` during training.
     """
 
     def __init__(self, mesh, t_interval, t_sampling_method="uniform",
@@ -2154,6 +2608,89 @@ class DomainMeshContinuous(DomainMesh):
         super().__init__(mesh, t_interval=t_interval,
                          t_sampling_method=t_sampling_method)
         self.n_time_points = n_time_points
+
+    # ── BC builder overrides ─────────────────────────────────────────────
+
+    def add_dirichlet(
+        self,
+        select,
+        value,
+        component: int = 0,
+        name: str = None,
+        time_window=None,
+    ) -> 'DomainMeshContinuous':
+        """Add a Dirichlet BC with a **continuous time window** ``[t_start, t_end]``.
+
+        Args:
+            select: Node selector (callable or vertex-pair array).
+            value:  Target value — scalar or ``(x_np) -> np.ndarray``.
+            component: Output component index (default 0).
+            name:   Label for loss dicts and plots.
+            time_window: ``[t_start, t_end]`` sub-interval of ``[t_min, t_max]``
+                during which this BC is enforced.  Defaults to
+                ``[t_min, t_max]`` (active at all times).  Pass
+                ``[t_min, t_min]`` to enforce only at the initial time, or use
+                the :meth:`add_initial_condition` convenience method.
+
+        Returns:
+            *self* for method chaining.
+        """
+        if time_window is None:
+            time_window = [self._t_min, self._t_max]
+        tw = list(time_window)
+        if len(tw) != 2:
+            raise ValueError(
+                f"DomainMeshContinuous.add_dirichlet: time_window must be a "
+                f"2-element list [t_start, t_end], got {tw!r}."
+            )
+        t_a, t_b = float(tw[0]), float(tw[1])
+        if t_a > t_b + 1e-12:
+            raise ValueError(
+                f"time_window[0]={t_a} must be ≤ time_window[1]={t_b}."
+            )
+        return super().add_dirichlet(
+            select=select, value=value, component=component,
+            name=name, time_window=tw,
+        )
+
+    def add_neumann(
+        self,
+        select,
+        value,
+        component: int = 0,
+        name: str = None,
+        time_window=None,
+    ) -> 'DomainMeshContinuous':
+        """Add a Neumann BC with a **continuous time window** ``[t_start, t_end]``.
+
+        Args:
+            select: Edge selector (callable or vertex-pair array).
+            value:  Normal-derivative value — scalar or callable.
+            component: Output component index (default 0).
+            name:   Label.
+            time_window: ``[t_start, t_end]`` — same semantics as
+                :meth:`add_dirichlet`.  Defaults to ``[t_min, t_max]``.
+
+        Returns:
+            *self* for method chaining.
+        """
+        if time_window is None:
+            time_window = [self._t_min, self._t_max]
+        tw = list(time_window)
+        if len(tw) != 2:
+            raise ValueError(
+                f"DomainMeshContinuous.add_neumann: time_window must be a "
+                f"2-element list [t_start, t_end], got {tw!r}."
+            )
+        t_a, t_b = float(tw[0]), float(tw[1])
+        if t_a > t_b + 1e-12:
+            raise ValueError(
+                f"time_window[0]={t_a} must be ≤ time_window[1]={t_b}."
+            )
+        return super().add_neumann(
+            select=select, value=value, component=component,
+            name=name, time_window=tw,
+        )
 
     def __repr__(self):
         n_bcs = len(self.boundary_conditions)
@@ -2178,6 +2715,19 @@ class DomainMeshDiscrete(DomainMesh):
         dt: Time-step size.
         n_steps: Total number of time steps to unroll.
         t_start: Start time (default ``0.0``).
+
+    **Boundary-condition API** — ``time_window=[t0, t1, ...]``
+
+    Both :meth:`add_dirichlet` and :meth:`add_neumann` require a
+    ``time_window`` argument that is a **list of time-point values** at which
+    the BC should be enforced.  During training, one time value is drawn
+    randomly from the list.
+
+    * Pass ``time_window=None`` (default) to enforce the BC at **every** time
+      step (equivalent to the full list ``[t_start, t_start+dt, ..., t_end]``).
+    * Pass ``time_window=[t_start]`` for an **initial condition**.  The
+      convenience method :meth:`add_initial_condition` does this automatically.
+    * Pass any subset of time values for a BC active only at those steps.
     """
 
     def __init__(self, mesh, dt: float, n_steps: int, t_start: float = 0.0):
@@ -2185,6 +2735,80 @@ class DomainMeshDiscrete(DomainMesh):
         super().__init__(mesh, t_interval=t_interval, t_sampling_method='midpoint')
         self.dt = float(dt)
         self.n_steps = int(n_steps)
+        # Precompute the default full list of time points
+        self._time_points = [t_start + i * self.dt for i in range(n_steps + 1)]
+
+    # ── BC builder overrides ─────────────────────────────────────────────
+
+    def add_dirichlet(
+        self,
+        select,
+        value,
+        component: int = 0,
+        name: str = None,
+        time_window=None,
+    ) -> 'DomainMeshDiscrete':
+        """Add a Dirichlet BC at specific **discrete time steps**.
+
+        Args:
+            select: Node selector (callable or vertex-pair array).
+            value:  Target value — scalar or ``(x_np) -> np.ndarray``.
+            component: Output component index (default 0).
+            name:   Label.
+            time_window: List of time values ``[t0, t1, ...]`` at which the BC
+                is enforced.  Defaults to ``None``, meaning **all** time steps.
+                Pass ``[t_start]`` for an initial condition, or any subset for
+                a BC active at specific steps only.
+
+        Returns:
+            *self* for method chaining.
+        """
+        if time_window is None:
+            time_window = self._time_points
+        tw = list(time_window)
+        if any(not isinstance(v, (int, float)) for v in tw):
+            raise ValueError(
+                "DomainMeshDiscrete.add_dirichlet: time_window must be a list "
+                f"of numeric time values, got {tw!r}."
+            )
+        return super().add_dirichlet(
+            select=select, value=value, component=component,
+            name=name, time_window=tw,
+        )
+
+    def add_neumann(
+        self,
+        select,
+        value,
+        component: int = 0,
+        name: str = None,
+        time_window=None,
+    ) -> 'DomainMeshDiscrete':
+        """Add a Neumann BC at specific **discrete time steps**.
+
+        Args:
+            select: Edge selector (callable or vertex-pair array).
+            value:  Normal-derivative value — scalar or callable.
+            component: Output component index (default 0).
+            name:   Label.
+            time_window: List of time values — same semantics as
+                :meth:`add_dirichlet`.  Defaults to all time steps.
+
+        Returns:
+            *self* for method chaining.
+        """
+        if time_window is None:
+            time_window = self._time_points
+        tw = list(time_window)
+        if any(not isinstance(v, (int, float)) for v in tw):
+            raise ValueError(
+                "DomainMeshDiscrete.add_neumann: time_window must be a list "
+                f"of numeric time values, got {tw!r}."
+            )
+        return super().add_neumann(
+            select=select, value=value, component=component,
+            name=name, time_window=tw,
+        )
 
     def __repr__(self):
         n_bcs = len(self.boundary_conditions)

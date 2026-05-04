@@ -649,6 +649,10 @@ class BaseTrainer(ABC):
         # Train epochs_by_time_step epochs with 1 step, then 2 steps, …, up to n_time_steps.
         # Each stage runs epochs_by_time_step epochs.  Set to None to disable.
         epochs_by_time_step: Optional[int] = None,
+        # Snapshot time points for transient mesh solutions.
+        # When set, plot_progress shows one row of panels (predicted, true?, residual, error?)
+        # per time value.  E.g. plot_time_points=[0.0, 0.25, 0.5, 1.0].
+        plot_time_points: Optional[List[float]] = None,
         # Gradient clipping: clip global gradient norm to this value. Useful for BPTT.
         # Set to None (default) to disable.
         grad_clip: Optional[float] = None,
@@ -843,6 +847,7 @@ class BaseTrainer(ABC):
             self._show_sampling_points.update(show_sampling_points)
         
         self._plot_regions = plot_regions if plot_regions is not None else []
+        self._plot_time_points = list(plot_time_points) if plot_time_points is not None else None
         self._plot_n_points = plot_n_points
         self._batch_size = batch_size
         self._resample_each = resample_each
@@ -1079,7 +1084,7 @@ class BaseTrainer(ABC):
                 else:
                     raise ValueError(
                         "MeshNodeBC Neumann on a spatial surface requires edge_normals. "
-                        "Use t_mode='t_min'/'t_max' for time boundaries."
+                        "Use time_window=[t_min, t_min] or [t_max, t_max] for time-face boundaries."
                     )
             else:
                 raise ValueError(f"Unknown bc_type: {bc.bc_type!r}")
@@ -1919,6 +1924,37 @@ class BaseTrainer(ABC):
                 axes['obs__deformed_ref'] = fig.add_subplot(gs[row_s, 0])
                 axes['obs__deformed_def'] = fig.add_subplot(gs[row_s, 1])
         
+        elif self._is_mesh_domain() and getattr(self, '_plot_time_points', None):
+            # Transient mesh domain with time snapshots.
+            # Columns: predicted | true (opt) | residual | error (opt)
+            # Rows: 2 loss rows + one row per (time × output)
+            ts = self._plot_time_points
+            n_snap = len(ts) * n_outputs
+            if has_solution:
+                n_cols = 4  # predicted, true, residual, error
+            else:
+                n_cols = 2  # predicted, residual
+
+            n_rows = 2 + n_snap
+            fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
+            gs = fig.add_gridspec(n_rows, n_cols)
+
+            axes = {}
+            axes['losses'] = fig.add_subplot(gs[0, :])
+            axes['mse_losses'] = fig.add_subplot(gs[1, :])
+
+            row = 2
+            for t_val in ts:
+                for i in range(n_outputs):
+                    key = f'snap_sol_{i}_t{t_val}'
+                    axes[key] = fig.add_subplot(gs[row, 0])
+                    if has_solution:
+                        axes[f'snap_true_{i}_t{t_val}'] = fig.add_subplot(gs[row, 1])
+                        axes[f'snap_res_{i}_t{t_val}'] = fig.add_subplot(gs[row, 2])
+                        axes[f'snap_err_{i}_t{t_val}'] = fig.add_subplot(gs[row, 3])
+                    else:
+                        axes[f'snap_res_{i}_t{t_val}'] = fig.add_subplot(gs[row, 1])
+                    row += 1
         else:
             # For 3D+: loss plot + region slices for all outputs with residuals
             n_cols = 2 * n_outputs  # Two columns per output (solution + residual)
@@ -2073,6 +2109,125 @@ class BaseTrainer(ABC):
             return isinstance(self.problem.domain, _DomainMesh)
         except ImportError:
             return False
+
+    def _plot_mesh_snapshot(self, ax, output_idx, t_val, kind='sol'):
+        """Plot a spatial snapshot of a transient mesh solution at time t_val.
+
+        kind : 'sol'  – predicted u(x,y,t)
+               'true' – reference solution u(x,y,t)
+               'res'  – absolute weak residual |R_j| (t ignored, uses stored residual)
+               'err'  – absolute pointwise error |pred - true|
+        """
+        import matplotlib.tri as _mtri
+
+        dom      = self.problem.domain
+        verts_xy = dom._vertices          # (N, 2)
+        faces    = dom._faces             # (F, 3)
+        n_verts  = len(verts_xy)
+        t_dim    = getattr(dom, '_t_dim', self.problem.n_dims - 1)
+
+        # Build space-time input: (N, n_inputs) with t injected at t_dim
+        n_inputs = self.problem.n_dims
+        x_st = np.zeros((n_verts, n_inputs), dtype=np.float32)
+        spatial_dims = [d for d in range(n_inputs) if d != t_dim]
+        for k, sd in enumerate(spatial_dims):
+            x_st[:, sd] = verts_xy[:, k]
+        x_st[:, t_dim] = float(t_val)
+
+        tri_obj = _mtri.Triangulation(verts_xy[:, 0], verts_xy[:, 1], faces)
+
+        if kind == 'res':
+            # Use the true weak-form per-node residual R_j = Σ_k ∫_T_k φ_j·volume_fn dΩ
+            # evaluated at the requested time t_val.  Falls back to a placeholder if
+            # the machinery is not available (e.g. non-weak problem).
+            try:
+                from pinns.problem_weak import ProblemWeak as _PW
+                _u_and_grad = getattr(self, '_u_and_grad_fn', None)
+                if not isinstance(self.problem, _PW) or _u_and_grad is None:
+                    raise ValueError('weak residual not available')
+                import jax as _jax
+                _res_fn = _jax.jit(
+                    self.problem.make_residual_vector_fn_at_t(_u_and_grad, float(t_val))
+                )
+                R_full = np.array(_res_fn(self.network.params))   # (n_dofs * n_comp,)
+                _n_dofs = self.problem.n_dofs
+                # Take the component for output_idx (row block)
+                R_comp = R_full[output_idx * _n_dofs:(output_idx + 1) * _n_dofs]
+                # Place values on nodes; non-free nodes get NaN (Dirichlet BCs)
+                vals = np.full(n_verts, np.nan, dtype=float)
+                for _nj in self.problem.free_nodes:
+                    if int(_nj) < n_verts:
+                        vals[int(_nj)] = float(np.abs(R_comp[int(_nj)]))
+                # Normalise by node support area so the colour scale is O(residual)
+                _node_norm = getattr(self.problem, 'node_norm', None)
+                if _node_norm is not None:
+                    for _nj in self.problem.free_nodes:
+                        if int(_nj) < n_verts and _node_norm[int(_nj)] > 0:
+                            vals[int(_nj)] /= float(_node_norm[int(_nj)])
+                # Mask triangles where ALL three vertices are non-free (Dirichlet)
+                tri_mask = np.array([
+                    np.isnan(vals[f[0]]) and np.isnan(vals[f[1]]) and np.isnan(vals[f[2]])
+                    for f in faces
+                ])
+                tri_obj.set_mask(tri_mask)
+                # Fill NaN boundary nodes with 0 for contour plotting
+                vals_plot = np.where(np.isnan(vals), 0.0, vals)
+            except Exception:
+                ax.text(0.5, 0.5, 'Residual\nnot available',
+                        ha='center', va='center', transform=ax.transAxes, fontsize=9, color='gray')
+                ax.set_title(f'|R_j| (t={t_val:.3g})')
+                return
+            cmap = 'inferno'
+            label = f'|R_j| (t={t_val:.3g})'
+            im = ax.tricontourf(tri_obj, vals_plot, levels=50, cmap=cmap)
+        else:
+            y_pred = self.predict(x_st)[:, output_idx]
+            if kind == 'true':
+                if self.problem.solution is None:
+                    return
+                y_true_raw = self._call_solution(x_st)
+                if isinstance(y_true_raw, (list, tuple)):
+                    y_true_raw = np.concatenate(
+                        [np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true_raw], axis=1)
+                elif y_true_raw.ndim == 1:
+                    y_true_raw = y_true_raw.reshape(-1, 1)
+                vals = y_true_raw[:, output_idx].astype(float)
+                label = f'True (t={t_val:.3g})'
+                cmap = self._get_colormap(output_idx)
+            elif kind == 'err':
+                if self.problem.solution is None:
+                    return
+                y_true_raw = self._call_solution(x_st)
+                if isinstance(y_true_raw, (list, tuple)):
+                    y_true_raw = np.concatenate(
+                        [np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true_raw], axis=1)
+                elif y_true_raw.ndim == 1:
+                    y_true_raw = y_true_raw.reshape(-1, 1)
+                vals = np.abs(y_pred - y_true_raw[:, output_idx]).astype(float)
+                label = f'|Error| (t={t_val:.3g})'
+                cmap = 'Reds'
+            else:  # 'sol'
+                vals = y_pred.astype(float)
+                label = f'Predicted (t={t_val:.3g})'
+                cmap = self._get_colormap(output_idx)
+            # Mask triangles where any vertex has a non-finite value (e.g. NaN
+            # returned by the reference interpolator near irregular boundaries).
+            nan_mask = np.array([
+                not (np.isfinite(vals[f[0]]) and np.isfinite(vals[f[1]]) and np.isfinite(vals[f[2]]))
+                for f in faces
+            ])
+            tri_obj.set_mask(nan_mask)
+            vals_plot = np.where(np.isfinite(vals), vals, 0.0)
+            im = ax.tricontourf(tri_obj, vals_plot, levels=50, cmap=cmap)
+
+        ax.triplot(tri_obj, color='gray', lw=0.3, alpha=0.3)
+        cbar = self._fig.colorbar(im, ax=ax)
+        self._colorbars.append(cbar)
+        out_name = self._get_output_name(output_idx)
+        ax.set_title(f'{label} ({out_name})')
+        ax.set_xlabel(self._get_input_name(spatial_dims[0]))
+        ax.set_ylabel(self._get_input_name(spatial_dims[1]) if len(spatial_dims) > 1 else '')
+        ax.set_aspect('equal')
 
     def _plot_solution_2d(self, ax, output_idx, n_points=50, plot_key='solution'):
         """Plot 2D solution as heatmap on given axes."""
@@ -2429,6 +2584,24 @@ class BaseTrainer(ABC):
                 if f'err_{i}' in axes and has_solution:
                     self._plot_error_2d(axes[f'err_{i}'], i, n_points, plot_key='error')
                     self._apply_plot_kwargs(axes[f'err_{i}'], 'error')
+
+        # ── Transient mesh snapshots (works regardless of n_dims) ──────────────
+        _pts = getattr(self, '_plot_time_points', None)
+        if _pts and self._is_mesh_domain():
+            for _t_val in _pts:
+                for _i in range(n_outputs):
+                    _sol_key  = f'snap_sol_{_i}_t{_t_val}'
+                    _true_key = f'snap_true_{_i}_t{_t_val}'
+                    _res_key  = f'snap_res_{_i}_t{_t_val}'
+                    _err_key  = f'snap_err_{_i}_t{_t_val}'
+                    if _sol_key in axes:
+                        self._plot_mesh_snapshot(axes[_sol_key], _i, _t_val, 'sol')
+                    if _true_key in axes and has_solution:
+                        self._plot_mesh_snapshot(axes[_true_key], _i, _t_val, 'true')
+                    if _res_key in axes:
+                        self._plot_mesh_snapshot(axes[_res_key], _i, _t_val, 'res')
+                    if _err_key in axes and has_solution:
+                        self._plot_mesh_snapshot(axes[_err_key], _i, _t_val, 'err')
 
         # Plot observables (1D or 2D)
         obs_spatial = list(getattr(self.problem, 'obs_spatial', None) or [])
@@ -2928,15 +3101,25 @@ class BaseTrainer(ABC):
         """
         if self.problem.solution is None:
             return None
-        
-        # For mesh domains: evaluate directly at the mesh nodes (same as the
-        # absolute-error plot) — avoids barycentric interpolation noise and is
-        # cheaper than random sampling.
+
+        # For transient mesh domains, evaluate only at the plot_time_points
+        # snapshots (cheap — no large random interpolation over the full
+        # space-time cloud).  Fall back to a single random time level if no
+        # plot_time_points are configured.
         if self._is_mesh_domain():
-            x = self.problem.domain._vertices
+            verts = self.problem.domain._vertices
+            t_min = getattr(self.problem.domain, '_t_min', None)
+            t_max = getattr(self.problem.domain, '_t_max', None)
+            if t_min is not None and t_max is not None:
+                t_vals = getattr(self, '_plot_time_points', None) or \
+                         [float(np.random.uniform(t_min, t_max))]
+                xs = [np.hstack([verts, np.full((len(verts), 1), tv)]) for tv in t_vals]
+                x = np.vstack(xs)
+            else:
+                x = verts
         else:
             x = self.problem.domain.sample_interior(n_points)
-        
+
         y_pred = self.predict(x)
         y_true = self._call_solution(x)
         

@@ -679,7 +679,8 @@ class ProblemWeak:
     obs_spatial: Optional[List[str]] = field(default=None)
     n_time_points: Optional[int] = None
     n_time_steps: Optional[int] = None
-    hard_constraints: bool = True
+    hard_constraints: Union[bool, List[str]] = True
+    ic_transition: Union[str, 'Callable'] = "tanh"
 
     # ── filled by __post_init__ ──────────────────────────────────────────
     cubature_data:    Dict       = field(init=False, default_factory=dict)
@@ -761,15 +762,17 @@ class ProblemWeak:
         dirichlet_vertex_set: set = set()
 
         # Pass 1 — vertex DOFs
-        # NOTE: BCs with t_mode='t_min' or 't_max' are time-face conditions
-        # (e.g. initial conditions).  They must remain as *soft* penalty
-        # terms and must NOT be added to the hard Dirichlet set, otherwise
-        # they constrain all nodes globally and leave free_nodes empty.
+        # Use hard_spatial_bc_names: groups collectively covering [t_min, t_max].
+        # IC BCs (hard via t-factorization, not FEM DOF removal) are excluded.
+        _hard_names_d = self.hard_spatial_bc_names
         for bc in self.domain.boundary_conditions:
             if isinstance(bc, MeshNodeBC) and bc.bc_type == "dirichlet":
-                if getattr(bc, 't_mode', None) in ('t_min', 't_max'):
-                    continue   # time-face BC — keep as soft constraint only
-                if bc.edges is not None:
+                if getattr(bc, 'name', None) not in _hard_names_d:
+                    continue   # not a hard-constrained spatial BC — keep as soft
+                if bc.node_indices is not None:
+                    for ni in bc.node_indices:
+                        dirichlet_vertex_set.add(int(ni))
+                elif bc.edges is not None:
                     for i0, i1 in bc.edges:
                         dirichlet_vertex_set.add(int(i0))
                         dirichlet_vertex_set.add(int(i1))
@@ -784,9 +787,16 @@ class ProblemWeak:
         if self.lagrange_order >= 2:
             for bc in self.domain.boundary_conditions:
                 if isinstance(bc, MeshNodeBC) and bc.bc_type == "dirichlet":
-                    if getattr(bc, 't_mode', None) in ('t_min', 't_max'):
-                        continue   # time-face BC — soft only
-                    if bc.edges is not None:
+                    if getattr(bc, 'name', None) not in _hard_names_d:
+                        continue   # not a hard-constrained spatial BC — soft only
+                    if bc.node_indices is not None:
+                        for ni in bc.node_indices:
+                            # find edge DOFs adjacent to this vertex
+                            for key, dofs in edge_to_dofs.items():
+                                if int(ni) in key:
+                                    for idx in dofs:
+                                        dirichlet_set.add(idx)
+                    elif bc.edges is not None:
                         for i0, i1 in bc.edges:
                             key = (min(int(i0), int(i1)), max(int(i0), int(i1)))
                             if key in edge_to_dofs:
@@ -833,22 +843,36 @@ class ProblemWeak:
         n_out = len(self.output_names)
         _bc_mask   = np.zeros((len(verts), n_out), dtype=np.float32)
         _bc_values = np.zeros((len(verts), n_out), dtype=np.float32)
-        if self.hard_constraints:
+        _hard_spatial = self.hard_spatial_bc_names
+        _hard_ic      = self.hard_ic_names
+        _ic_mask   = np.zeros((len(verts), n_out), dtype=np.float32)
+        _ic_values = np.zeros((len(verts), n_out), dtype=np.float32)
+        if _hard_spatial or _hard_ic:
             for bc in self.domain.boundary_conditions:
                 if not (isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet'):
                     continue
-                if getattr(bc, 't_mode', None) not in (None, 'all'):
-                    continue   # skip IC / final-time BCs
+                bc_name = getattr(bc, 'name', None)
                 comp = getattr(bc, 'component', 0)
                 if comp >= n_out:
                     continue
-                node_idx = np.unique(bc.edges)
+                if bc.node_indices is not None:
+                    node_idx = bc.node_indices
+                elif bc.edges is not None:
+                    node_idx = np.unique(bc.edges)
+                else:
+                    continue
                 node_pos = verts[node_idx]
                 vals = bc.get_value(node_pos)
-                _bc_mask[node_idx, comp]   = 1.0
-                _bc_values[node_idx, comp] = vals
+                if bc_name in _hard_spatial:
+                    _bc_mask[node_idx, comp]   = 1.0
+                    _bc_values[node_idx, comp] = vals
+                elif bc_name in _hard_ic:
+                    _ic_mask[node_idx, comp]   = 1.0
+                    _ic_values[node_idx, comp] = vals
         self._bc_mask_np   = _bc_mask
         self._bc_values_np = _bc_values
+        self._ic_mask_np   = _ic_mask
+        self._ic_values_np = _ic_values
 
         # ── Nodal support volumes + boundary edge lengths ─────────────────────
         # For each node j we build a normaliser that makes R̂_j = R_j / norm_j
@@ -1025,6 +1049,84 @@ class ProblemWeak:
                     and not isinstance(self.output_range[0], (list, tuple))):
                 self.output_range = [self.output_range] * self.n_outputs
 
+        # ── BC coverage check ────────────────────────────────────────────
+        self._check_bc_coverage()
+
+    def _check_bc_coverage(self):
+        """Warn if boundary nodes or interior nodes appear uncovered.
+
+        For each output component this verifies:
+
+        1. **Spatial boundary nodes** are in at least one BC
+           (Dirichlet or Neumann) that has full or partial time coverage.
+        2. **Interior nodes** are covered at ``t = t_min`` by at least one BC
+           (typically the initial condition).
+
+        Issues a ``UserWarning`` for each uncovered component rather than
+        raising an exception, because partial coverage can be intentional.
+        """
+        import warnings
+        from .boundary import MeshNodeBC
+
+        has_time = self.domain._t_min is not None
+        n_outputs = len(self.output_names)
+        bnd_mask = self.domain.boundary_node_mask      # (n_verts,)
+        int_mask = self.domain.interior_node_mask      # (n_verts,)
+        bnd_node_ids = set(np.where(bnd_mask)[0].tolist())
+        int_node_ids = set(np.where(int_mask)[0].tolist())
+
+        for comp in range(n_outputs):
+            comp_name = self.output_names[comp]
+
+            bnd_covered: set = set()
+            ic_covered:  set = set()
+
+            for bc in self.domain.boundary_conditions:
+                if not isinstance(bc, MeshNodeBC):
+                    continue
+                if bc.component != comp:
+                    continue
+                if bc.edges is None:
+                    node_ids = set()
+                else:
+                    node_ids = set(bc.edges.ravel().tolist())
+                if bc.node_indices is not None:
+                    node_ids = node_ids | set(bc.node_indices.tolist())
+
+                if node_ids & bnd_node_ids:
+                    bnd_covered |= (node_ids & bnd_node_ids)
+
+                if has_time:
+                    tw = getattr(bc, 'time_window', None)
+                    t_min_dom = self.domain._t_min
+                    if tw is not None:
+                        pts_tw = [float(v) for v in tw]
+                        if abs(min(pts_tw) - t_min_dom) < 1e-10:
+                            ic_covered |= node_ids
+                    else:
+                        ic_covered |= node_ids
+
+            uncovered_bnd = bnd_node_ids - bnd_covered
+            if uncovered_bnd:
+                warnings.warn(
+                    f"ProblemWeak: component '{comp_name}' has "
+                    f"{len(uncovered_bnd)} uncovered spatial boundary node(s). "
+                    "Add a Dirichlet or Neumann BC that selects these nodes.",
+                    UserWarning, stacklevel=3,
+                )
+
+            if has_time:
+                uncovered_ic = (bnd_node_ids | int_node_ids) - ic_covered
+                if uncovered_ic:
+                    warnings.warn(
+                        f"ProblemWeak: component '{comp_name}' has "
+                        f"{len(uncovered_ic)} node(s) not covered at "
+                        f"t = {self.domain._t_min} (no initial condition). "
+                        "Call add_initial_condition() or add a Dirichlet BC "
+                        "whose time_window includes t_min.",
+                        UserWarning, stacklevel=3,
+                    )
+
     # ── Convenience properties ───────────────────────────────────────────
 
     @property
@@ -1032,23 +1134,164 @@ class ProblemWeak:
         """Number of free (non-Dirichlet) DOFs = number of test functions."""
         return len(self.free_nodes)
 
+    @staticmethod
+    def _make_ic_transition_fn(ic_transition):
+        """
+        Return a JAX-compatible callable ``f(t_shifted) -> factor`` where
+        ``t_shifted = t - t_min >= 0``.
+
+        Built-in options
+        ----------------
+        ``"tanh"`` *(default)*
+            ``jnp.tanh(t_shifted)`` — smooth ramp from 0 at ``t_min``,
+            quickly saturates.  Gradient is non-zero everywhere; preferred
+            for training stability.
+        ``"linear"``
+            ``t_shifted`` — plain linear envelope.  Equivalent to the
+            classic  ``u = u_IC + (t-t_min) * NN`` factorization.
+        Callable
+            Any differentiable function ``f(t_shifted: jnp.ndarray) -> jnp.ndarray``
+            of the same shape.  Must satisfy ``f(0) == 0`` for the IC to be
+            exactly satisfied at ``t = t_min``.
+
+        Example::
+
+            # Quadratic ramp
+            problem = ProblemWeak(
+                ...,
+                ic_transition=lambda t: t**2,
+            )
+        """
+        if callable(ic_transition):
+            return ic_transition
+        if ic_transition == "tanh":
+            import jax.numpy as _jnp
+            return lambda t: _jnp.tanh(t)
+        if ic_transition == "linear":
+            return lambda t: t
+        raise ValueError(
+            f"ic_transition must be 'tanh', 'linear', or a callable; "
+            f"got {ic_transition!r}."
+        )
+
+    @staticmethod
+    def _bc_intervals_cover(windows, t0, t1, tol=1e-10) -> bool:
+        """True when the union of *windows* (list of time_window lists) covers [t0, t1]."""
+        if not windows:
+            return False
+        ivs = []
+        for tw in windows:
+            pts = sorted(float(v) for v in tw)
+            lo, hi = pts[0], pts[-1]
+            ivs.append((lo, hi))
+        ivs.sort()
+        cover = t0
+        for lo, hi in ivs:
+            if lo > cover + tol:
+                return False
+            cover = max(cover, hi)
+        return cover >= t1 - tol
+
+    @property
+    def hard_spatial_bc_names(self) -> set:
+        """Names of **spatial** Dirichlet BCs that are hard-constrained.
+
+        These are full-time-coverage BCs (individually or collectively
+        covering ``[t_min, t_max]``) that are enforced via the network's
+        output mask-and-clamp transform.  They do NOT include IC BCs
+        (see :attr:`hard_ic_names`).
+        """
+        hc = self.hard_constraints
+        if hc is False or hc == []:
+            return set()
+
+        from .boundary import MeshNodeBC
+        from collections import defaultdict
+
+        t_min = getattr(self.domain, '_t_min', None)
+        t_max = getattr(self.domain, '_t_max', None)
+
+        # Group by (node-fingerprint, component), but only non-IC BCs
+        groups: dict = defaultdict(list)
+        for bc in self.domain.boundary_conditions:
+            if not isinstance(bc, MeshNodeBC) or bc.bc_type != 'dirichlet':
+                continue
+            if getattr(bc, 'name', None) is None:
+                continue
+            # Skip point-time BCs (IC candidates)
+            tw = bc.time_window
+            if tw is not None:
+                pts = [float(v) for v in tw]
+                if len(pts) <= 2 and abs(pts[0] - pts[-1]) < 1e-10:
+                    continue   # point BC — belongs to IC category
+            ni = bc.node_indices
+            if ni is None:
+                continue
+            key = (tuple(sorted(ni.tolist())), bc.component)
+            groups[key].append(bc)
+
+        eligible: set = set()
+        for key, bcs in groups.items():
+            for bc in bcs:
+                if bc.is_full_time_coverage():
+                    eligible.add(bc.name)
+                    continue
+                if t_min is None or t_max is None:
+                    continue
+                windows = [b.time_window for b in bcs if b.time_window is not None]
+                if self._bc_intervals_cover(windows, t_min, t_max):
+                    eligible.add(bc.name)
+
+        if hc is True:
+            return eligible
+        return eligible & set(hc)
+
+    @property
+    def hard_ic_names(self) -> set:
+        """Names of **initial-condition** Dirichlet BCs that are hard-constrained.
+
+        These are point-time BCs at ``t = t_min`` enforced via the
+        ``u = u_IC(x) + (t - t_min) \\cdot \\text{NN}(x, t)`` factorization
+        in the network's output transform.  They are automatically detected
+        when ``hard_constraints=True`` or when their name is listed in
+        ``hard_constraints``.
+        """
+        hc = self.hard_constraints
+        if hc is False or hc == []:
+            return set()
+
+        t_min = getattr(self.domain, '_t_min', None)
+        if t_min is None:
+            return set()   # no time axis — ICs don't apply
+
+        from .boundary import MeshNodeBC
+        eligible: set = set()
+        for bc in self.domain.boundary_conditions:
+            if not isinstance(bc, MeshNodeBC) or bc.bc_type != 'dirichlet':
+                continue
+            name = getattr(bc, 'name', None)
+            if name is None:
+                continue
+            tw = bc.time_window
+            if tw is None:
+                continue
+            pts = [float(v) for v in tw]
+            # IC = point BC at t_min
+            if len(pts) <= 2 and abs(pts[0] - t_min) < 1e-10 and abs(pts[-1] - t_min) < 1e-10:
+                eligible.add(name)
+
+        if hc is True:
+            return eligible
+        return eligible & set(hc)
+
     @property
     def hard_bc_names(self) -> set:
-        """Names of BCs that are hard-constrained (t_mode='all' Dirichlet).
+        """Union of :attr:`hard_spatial_bc_names` and :attr:`hard_ic_names`.
 
-        These BCs are satisfied exactly by the network's output_transform and
-        contribute zero residual, so they should be excluded from soft-loss
-        computation.
+        Used by the trainer and ``show_problem()`` to exclude all
+        hard-constrained BCs from soft losses and display.
         """
-        from .boundary import MeshNodeBC
-        names = set()
-        for bc in self.domain.boundary_conditions:
-            if (isinstance(bc, MeshNodeBC)
-                    and bc.bc_type == 'dirichlet'
-                    and getattr(bc, 't_mode', None) not in ('t_min', 't_max')
-                    and getattr(bc, 'name', None) is not None):
-                names.add(bc.name)
-        return names
+        return self.hard_spatial_bc_names | self.hard_ic_names
 
     @property
     def n_dofs(self) -> int:
@@ -1092,27 +1335,48 @@ class ProblemWeak:
         Returns ``None`` when ``hard_constraints=False`` or when there are no
         eligible Dirichlet BCs on the domain.
         """
-        if not self.hard_constraints or not np.any(self._bc_mask_np):
+        has_spatial = bool(self.hard_spatial_bc_names) and np.any(self._bc_mask_np)
+        has_ic      = bool(self.hard_ic_names)          and np.any(self._ic_mask_np)
+        if not has_spatial and not has_ic:
             return None
 
-        import jax.numpy as _jnp
         _verts = self.domain._vertices[:, :self.domain._spatial_dims].astype(np.float32)
         _faces = self.domain._faces.astype(np.int32)
         _bc_mask   = np.array(self._bc_mask_np,   dtype=np.float32)
         _bc_values = np.array(self._bc_values_np, dtype=np.float32)
+        _ic_mask   = np.array(self._ic_mask_np,   dtype=np.float32)
+        _ic_values = np.array(self._ic_values_np, dtype=np.float32)
+        _t_min     = float(self.domain._t_min) if self.domain._t_min is not None else 0.0
+        _t_dim     = self.domain._spatial_dims   # index of the time column in x
+        _has_spatial = has_spatial
+        _has_ic      = has_ic
+        _transition_fn = self._make_ic_transition_fn(self.ic_transition)
 
         def _transform(x_original, y, params_dict=None):
             from .backends.jax.gnn_network import _interpolate_mesh
             import jax.numpy as jnp
             nodes = jnp.array(_verts)
             faces = jnp.array(_faces)
-            bc_mask_jnp   = jnp.array(_bc_mask)
-            bc_values_jnp = jnp.array(_bc_values)
             spatial_dims = _verts.shape[1]
             x_spatial = x_original[:, :spatial_dims]
-            mask_x = _interpolate_mesh(bc_mask_jnp,   nodes, faces, x_spatial)
-            val_x  = _interpolate_mesh(bc_values_jnp, nodes, faces, x_spatial)
-            return (1.0 - mask_x) * y + mask_x * val_x
+
+            # ── Step 1: IC hard constraint — u = u_IC(x) + f(t−t_min)·NN ───
+            if _has_ic:
+                ic_m = _interpolate_mesh(jnp.array(_ic_mask),   nodes, faces, x_spatial)
+                ic_v = _interpolate_mesh(jnp.array(_ic_values), nodes, faces, x_spatial)
+                t_shifted = x_original[:, _t_dim:_t_dim+1] - _t_min   # (n, 1)
+                factor = _transition_fn(t_shifted)                      # (n, 1)
+                # At IC nodes: y = ic_v + factor * y
+                # At other nodes: y unchanged
+                y = ic_v * ic_m + y * (1.0 - ic_m + ic_m * factor)
+
+            # ── Step 2: Spatial Dirichlet mask-and-clamp ────────────────────
+            if _has_spatial:
+                bc_m = _interpolate_mesh(jnp.array(_bc_mask),   nodes, faces, x_spatial)
+                bc_v = _interpolate_mesh(jnp.array(_bc_values), nodes, faces, x_spatial)
+                y = (1.0 - bc_m) * y + bc_m * bc_v
+
+            return y
 
         return _transform
 
@@ -1612,11 +1876,43 @@ class ProblemWeak:
         import jax.numpy as jnp
 
         cd             = self.cubature_data
-        pts_jax        = jnp.asarray(cd['pts'],      dtype=jnp.float32)
-        weights_jax    = jnp.asarray(cd['weights'],  dtype=jnp.float32)
-        phi_jax        = jnp.asarray(cd['phi'],      dtype=jnp.float32)
-        grad_phi_jax   = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)
-        node_ids_jax   = jnp.asarray(cd['node_ids'], dtype=jnp.int32)
+        _pts_sp        = cd['pts']   # (F, Q, 2) spatial — may need time tiling
+
+        # ── If random-time-sampling, tile spatial cubature with midpoint times ─
+        # cd['pts'] is spatial-only (F,Q,2) in random-time mode.  Append the
+        # midpoints of n_t equal sub-intervals as representative time levels so
+        # the residual vector covers the full time domain rather than crashing
+        # with a 2-D input when LaplacianFeatures expects a 3-D (x,y,t) point.
+        _random_time = getattr(self, '_random_time_sampling', False)
+        if _random_time:
+            import numpy as _np_rvf
+            _t0  = float(getattr(self, '_t_min', 0.0) or 0.0)
+            _t1  = float(getattr(self, '_t_max', 1.0) or 1.0)
+            _n_t = int(getattr(self, '_n_t', 10) or 10)
+            _dt  = (_t1 - _t0) / _n_t
+            _t_vals = _t0 + (_np_rvf.arange(_n_t) + 0.5) * _dt   # midpoints
+            _F_sp, _Q_sp = _pts_sp.shape[:2]
+            _pts_xy4d = _np_rvf.broadcast_to(
+                _pts_sp[None], (_n_t, _F_sp, _Q_sp, 2)).copy()
+            _t_col = _np_rvf.broadcast_to(
+                _t_vals[:, None, None, None], (_n_t, _F_sp, _Q_sp, 1)).copy()
+            _pts_st = _np_rvf.concatenate([_pts_xy4d, _t_col], axis=-1)  # (n_t,F,Q,3)
+            _pts_st = _pts_st.reshape(_n_t * _F_sp, _Q_sp, 3).astype(_np_rvf.float32)
+            _weights_np = _np_rvf.tile(cd['weights'], (_n_t, 1)) * _dt
+            _phi_np     = _np_rvf.tile(cd['phi'],     (_n_t, 1, 1))
+            _gphi_np    = _np_rvf.tile(cd['grad_phi'],(_n_t, 1, 1, 1))
+            _node_ids_np= _np_rvf.tile(cd['node_ids'],(_n_t, 1))
+            pts_jax      = jnp.asarray(_pts_st,       dtype=jnp.float32)
+            weights_jax  = jnp.asarray(_weights_np,   dtype=jnp.float32)
+            phi_jax      = jnp.asarray(_phi_np,       dtype=jnp.float32)
+            grad_phi_jax = jnp.asarray(_gphi_np,      dtype=jnp.float32)
+            node_ids_jax = jnp.asarray(_node_ids_np,  dtype=jnp.int32)
+        else:
+            pts_jax      = jnp.asarray(_pts_sp,          dtype=jnp.float32)
+            weights_jax  = jnp.asarray(cd['weights'],    dtype=jnp.float32)
+            phi_jax      = jnp.asarray(cd['phi'],        dtype=jnp.float32)
+            grad_phi_jax = jnp.asarray(cd['grad_phi'],   dtype=jnp.float32)
+            node_ids_jax = jnp.asarray(cd['node_ids'],   dtype=jnp.int32)
 
         n_dofs  = self.n_dofs
         n_faces = pts_jax.shape[0]
@@ -1742,6 +2038,100 @@ class ProblemWeak:
 
         return residual_fn
 
+    def make_residual_vector_fn_at_t(self, u_and_grad_fn, t_val: float):
+        """Like :meth:`make_residual_vector_fn` but for a fixed time ``t_val``.
+
+        For continuous-time (transient) problems the spatial cubature points
+        ``cd['pts']`` have shape ``(F, Q, 2)``.  This method broadcasts them
+        to ``(F, Q, 3)`` by appending the requested time level before calling
+        the same assembly loop as :meth:`make_residual_vector_fn`.
+
+        For static (non-random-time) problems the ``t_val`` argument is simply
+        ignored and the function reduces to :meth:`make_residual_vector_fn`.
+
+        Returns
+        -------
+        residual_fn : callable
+            ``residual_fn(params) -> jnp.ndarray``  shape ``(n_dofs,)``
+        """
+        import jax
+        import jax.numpy as jnp
+
+        cd           = self.cubature_data
+        pts_sp       = cd['pts']                       # (F, Q, 2)  spatial
+        weights_jax  = jnp.asarray(cd['weights'],  dtype=jnp.float32)
+        phi_jax      = jnp.asarray(cd['phi'],      dtype=jnp.float32)
+        grad_phi_jax = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)
+        node_ids_jax = jnp.asarray(cd['node_ids'], dtype=jnp.int32)
+
+        # Append time dimension for continuous-time domains
+        _is_transient = getattr(self, '_random_time_sampling', False)
+        if _is_transient:
+            import numpy as _np
+            t_col  = _np.full(pts_sp.shape[:2] + (1,), float(t_val), dtype=_np.float32)
+            pts_jax = jnp.asarray(_np.concatenate([pts_sp, t_col], axis=-1), dtype=jnp.float32)
+        else:
+            pts_jax = jnp.asarray(pts_sp, dtype=jnp.float32)
+
+        n_dofs  = self.n_dofs
+        n_faces = pts_jax.shape[0]
+        n_qpts  = pts_jax.shape[1]
+        n_local = phi_jax.shape[2]
+        volume_fn   = self.volume_fn
+        params_dict = self._build_params()
+        _n_pts_dims = pts_jax.shape[-1]
+
+        def residual_fn(params):
+            pts_flat = pts_jax.reshape(-1, _n_pts_dims)
+            u_flat, grad_u_flat = jax.vmap(
+                lambda xy: u_and_grad_fn(params, xy))(pts_flat)
+
+            if u_flat.ndim == 1:
+                y_flat = u_flat.reshape(-1, 1)
+                def make_deriv(gu):
+                    def deriv_fn(Y, X, component, order):
+                        dim = order[0] if isinstance(order, (list, tuple)) else order
+                        return gu[:, dim]
+                    return deriv_fn
+                deriv = make_deriv(grad_u_flat)
+            else:
+                y_flat = u_flat
+                def make_deriv(jac):
+                    def deriv_fn(Y, X, component, order):
+                        dim = order[0] if isinstance(order, (list, tuple)) else order
+                        return jac[:, component, dim]
+                    return deriv_fn
+                deriv = make_deriv(grad_u_flat)
+
+            R_sample = volume_fn(
+                pts_flat, y_flat, params_dict,
+                phi_jax[:, :, 0].reshape(-1),
+                grad_phi_jax[:, :, 0, :].reshape(-1, 2),
+                deriv,
+            )
+            _multi = isinstance(R_sample, (tuple, list))
+            _n_comp = len(R_sample) if _multi else 1
+
+            Rs = [jnp.zeros(n_dofs, dtype=jnp.float32) for _ in range(_n_comp)]
+            for a in range(n_local):
+                phi_a  = phi_jax[:, :, a]
+                gphi_a = grad_phi_jax[:, :, a, :]
+                integrand = volume_fn(
+                    pts_flat, y_flat, params_dict,
+                    phi_a.reshape(-1), gphi_a.reshape(-1, 2), deriv,
+                )
+                if _multi:
+                    for k, ig in enumerate(integrand):
+                        elem_int = jnp.einsum('fq,fq->f', weights_jax, ig.reshape(n_faces, n_qpts))
+                        Rs[k] = Rs[k].at[node_ids_jax[:, a]].add(elem_int)
+                else:
+                    elem_int = jnp.einsum('fq,fq->f', weights_jax, integrand.reshape(n_faces, n_qpts))
+                    Rs[0] = Rs[0].at[node_ids_jax[:, a]].add(elem_int)
+
+            return jnp.concatenate([R for R in Rs])
+
+        return residual_fn
+
     # ---------------------------------------------------------------------- #
     #  LaTeX / display helpers                                               #
     # ---------------------------------------------------------------------- #
@@ -1821,7 +2211,12 @@ class ProblemWeak:
         # The quadratic ||B||^2 always appears (it is always in the loss).
         # The Lagrange inner product <λ, B> is added only when the BC name
         # is in lagrange_multipliers.
+        # Hard-constrained BCs are satisfied by the network exactly and are
+        # not part of the soft optimisation problem, so we skip them here.
+        _hard_names = self.hard_bc_names
         for bc in self.domain.boundary_conditions:
+            if getattr(bc, 'name', None) in _hard_names:
+                continue
             raw_name = getattr(bc, 'name', None) or "bc"
             sym = self._latex_name(raw_name)
             is_al_bc = self._is_lagrange(raw_name)

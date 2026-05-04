@@ -37,6 +37,7 @@ _backend_classes = {}
 from .domain import DomainCubic, DomainCubicPartition, DomainMesh, DomainMeshContinuous, DomainMeshDiscrete, SubdomainInfo, bump
 from .problem import Problem
 from .problem_weak import ProblemWeak
+from . import meshes
 
 # JAX-only mesh networks (always available if JAX is installed)
 try:
@@ -150,6 +151,8 @@ __all__ = [
     "BACKEND",
     "use_backend",
     "get_backend",
+    # Meshes
+    "meshes",
     # Domain (backend-agnostic)
     "DomainCubic",
     "DomainCubicPartition",
