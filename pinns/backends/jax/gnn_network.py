@@ -595,6 +595,7 @@ class GNNMeshNetwork:
         input_transform: Optional[Callable] = None,
         output_transform: Optional[Callable] = None,
         normalize_input: bool = True,
+        residual: bool = False,
     ):
         if domain._spatial_dims != 2:
             raise NotImplementedError(
@@ -620,6 +621,7 @@ class GNNMeshNetwork:
         self.input_transform    = input_transform
         self.output_transform   = output_transform
         self.normalize_input    = normalize_input
+        self.residual           = residual
 
         if self.has_time:
             self.t_min = float(t_interval[0])
@@ -814,9 +816,13 @@ class GNNMeshNetwork:
                 self._edge_src, self._edge_dst, self._edge_weights, self.n_nodes,
             )   # (n_nodes, hidden_dim)
 
-            # Per-node MLP decoder → u^{n+1} at all nodes
-            node_out = self._decoder_module.apply(dec_params, node_embeds)
+            # Per-node MLP decoder → Δu^n (residual mode) or u^{n+1} directly
+            node_raw = self._decoder_module.apply(dec_params, node_embeds)
             # (n_nodes, n_outputs)
+            if self.residual:
+                node_out = u_prev_nodes + node_raw   # u^{n+1} = u^n + Δu^n
+            else:
+                node_out = node_raw
 
             # Hard Dirichlet BC enforcement (static condensation) — always applied in state mode
             node_out = (node_out * (1.0 - self._bc_mask_jnp)
@@ -879,12 +885,63 @@ class GNNMeshNetwork:
         )
         return np.array(embeds)
 
+    def predict_rollout(
+        self,
+        n_steps: int = None,
+        u0: np.ndarray = None,
+        dt: float = None,
+    ) -> np.ndarray:
+        """Run the state-integrator forward from *u0* for *n_steps* steps.
+
+        Returns
+        -------
+        u_all : (n_steps+1, n_nodes) float32 numpy array
+            Row 0 is the initial condition; rows 1‒n_steps are the predicted
+            states after each time step.
+        """
+        if not self.use_state:
+            raise RuntimeError(
+                "predict_rollout is only available in state-integrator mode."
+            )
+        if u0 is None:
+            # Seed from BC values (hot=1, cold=0) and IC=0 elsewhere
+            bc_mask_1d   = np.array(self._bc_mask_jnp[:, 0])
+            bc_values_1d = np.array(self._bc_values_jnp[:, 0])
+            u0 = bc_values_1d * bc_mask_1d  # IC=0, BCs at their prescribed values
+        if n_steps is None:
+            n_steps = 1
+        _dt    = jnp.float32(dt if dt is not None else 0.0)
+        _mesh  = jnp.array(self._nodes_np)
+        _params = self.params
+
+        def _step(u_nodes):
+            pdict = {"fixed": {
+                "u_prev_nodes": u_nodes,
+                "u_prev":       u_nodes,
+                "dt":           _dt,
+                "kappa":        jnp.float32(0.0),
+            }}
+            return self.apply(_params, _mesh, pdict)[:, 0]
+
+        # Apply BC mask to ensure initial state honours hard constraints
+        _mask_1d   = self._bc_mask_jnp[:, 0]
+        _values_1d = self._bc_values_jnp[:, 0]
+        u_cur = jnp.array(u0, dtype=jnp.float32)
+        u_cur = u_cur * (1.0 - _mask_1d) + _values_1d * _mask_1d
+
+        u_all = [np.array(u_cur)]
+        for _ in range(n_steps):
+            u_cur = _step(u_cur)
+            u_all.append(np.array(u_cur))
+        return np.stack(u_all, axis=0)  # (n_steps+1, n_nodes)
+
     def __repr__(self) -> str:
         mode = "state-integrator" if self.use_state else "continuous"
         dec = f"+MLP{self.decoder_dims}" if self.decoder_dims else "+Linear"
+        res = ", residual=True" if self.residual else ""
         return (
             f"GNNMeshNetwork({mode}, n_nodes={self.n_nodes}, "
             f"hidden_dim={self.hidden_dim}, poly_order={self.poly_order}, "
             f"message_steps={self.message_steps}{dec}, "
-            f"n_outputs={self.n_outputs})"
+            f"n_outputs={self.n_outputs}{res})"
         )

@@ -1294,6 +1294,36 @@ class ProblemWeak:
         return self.hard_spatial_bc_names | self.hard_ic_names
 
     @property
+    def _rollout_ic_bc_names(self) -> set:
+        """All IC-type BCs (point-time at t_min) when in rollout mode.
+
+        In rollout / BPTT mode these BCs are consumed as the initial state
+        ``u0`` and must NOT appear as soft loss terms — regardless of what is
+        listed in ``hard_constraints``.  Returns an empty set when the problem
+        is not in rollout mode (``n_time_steps is None``).
+        """
+        if self.n_time_steps is None:
+            return set()
+        t_min = getattr(self.domain, '_t_min', None)
+        if t_min is None:
+            return set()
+        from .boundary import MeshNodeBC
+        eligible: set = set()
+        for bc in self.domain.boundary_conditions:
+            if not isinstance(bc, MeshNodeBC) or bc.bc_type != 'dirichlet':
+                continue
+            name = getattr(bc, 'name', None)
+            if name is None:
+                continue
+            tw = bc.time_window
+            if tw is None:
+                continue
+            pts = [float(v) for v in tw]
+            if len(pts) <= 2 and abs(pts[0] - t_min) < 1e-10 and abs(pts[-1] - t_min) < 1e-10:
+                eligible.add(name)
+        return eligible
+
+    @property
     def n_dofs(self) -> int:
         """Total number of global DOFs."""
         return len(self.cubature_data['dof_coords'])
@@ -1512,6 +1542,17 @@ class ProblemWeak:
         else:
             _xs_full = jnp.ones(_n_time, dtype=jnp.float32)
 
+        # ── Initial nodal state u0 ──────────────────────────────────────────
+        # Seed BC nodes with their Dirichlet value (e.g. hot_top=1.0); all
+        # other nodes take the IC value (typically 0.0).  Using zeros here
+        # means the first rollout step sees hot boundary nodes as u_prev=0,
+        # which pollutes the weak-form residual and prevents convergence.
+        _u0 = jnp.where(
+            jnp.asarray(self._bc_mask_np[:, 0], dtype=bool),
+            jnp.asarray(self._bc_values_np[:, 0], dtype=jnp.float32),
+            jnp.asarray(self._ic_values_np[:, 0], dtype=jnp.float32),
+        )
+
         if face_batch_size is None:
             # ── Full-batch: loss_fn(params) ──────────────────────────────
             _step = _build_step_fn(
@@ -1519,8 +1560,7 @@ class ProblemWeak:
             )
 
             def loss_fn(params):
-                u0 = jnp.zeros(n_dofs, dtype=jnp.float32)
-                (_, _), step_losses = jax.lax.scan(_step, (params, u0), _xs_full)
+                (_, _), step_losses = jax.lax.scan(_step, (params, _u0), _xs_full)
                 return jnp.mean(step_losses)
 
         else:
@@ -1543,8 +1583,7 @@ class ProblemWeak:
                 )
                 lm_batch_free = jnp.maximum(lm_batch[_free], 1e-12)
                 _step = _build_step_fn(phi_f, gph_f, wts_f, nid_f, pts_f, lm_batch_free)
-                u0 = jnp.zeros(n_dofs, dtype=jnp.float32)
-                (_, _), step_losses = jax.lax.scan(_step, (params, u0), _xs_full)
+                (_, _), step_losses = jax.lax.scan(_step, (params, _u0), _xs_full)
                 return jnp.mean(step_losses)
 
         return loss_fn
@@ -1645,9 +1684,13 @@ class ProblemWeak:
 
         def loss_fn(params, lambdas):
             # lambdas: (n_time, n_free) — xs fed one row per scan step
-            u0 = jnp.zeros(n_dofs, dtype=jnp.float32)
+            _u0_al = jnp.where(
+                jnp.asarray(self._bc_mask_np[:, 0], dtype=bool),
+                jnp.asarray(self._bc_values_np[:, 0], dtype=jnp.float32),
+                jnp.asarray(self._ic_values_np[:, 0], dtype=jnp.float32),
+            )
             (_, _), (step_losses, step_residuals) = jax.lax.scan(
-                step_fn, (params, u0), lambdas
+                step_fn, (params, _u0_al), lambdas
             )
             return jnp.mean(step_losses), step_residuals
 
@@ -2345,7 +2388,7 @@ class ProblemWeak:
         # is in lagrange_multipliers.
         # Hard-constrained BCs are satisfied by the network exactly and are
         # not part of the soft optimisation problem, so we skip them here.
-        _hard_names = self.hard_bc_names
+        _hard_names = self.hard_bc_names | self._rollout_ic_bc_names
         for bc in self.domain.boundary_conditions:
             if getattr(bc, 'name', None) in _hard_names:
                 continue

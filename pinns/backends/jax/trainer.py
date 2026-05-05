@@ -107,7 +107,7 @@ class Trainer(BaseTrainer):
         names = super()._get_bc_names()
         from pinns.problem_weak import ProblemWeak as _PW
         if isinstance(self.problem, _PW):
-            _hard = self.problem.hard_bc_names
+            _hard = self.problem.hard_bc_names | self.problem._rollout_ic_bc_names
             names = [n for n in names if n not in _hard]
         return names
 
@@ -648,6 +648,15 @@ class Trainer(BaseTrainer):
                 # Check whether per-step AL is requested via lagrange_multipliers=["pde"]
                 _uses_rollout_al = "pde" in (getattr(self.problem, 'lagrange_multipliers', None) or [])
                 self._rollout_al_mode = _uses_rollout_al
+                # In rollout mode IC BCs are the initial state u0, not loss terms.
+                # Remove them from train/test data so no soft loss is computed.
+                _rollout_ic = self.problem._rollout_ic_bc_names
+                for _ic_name in _rollout_ic:
+                    self._train_data.pop(_ic_name, None)
+                    self._train_targets.pop(_ic_name, None)
+                    if self._test_data:
+                        self._test_data.pop(_ic_name, None)
+                        self._test_targets.pop(_ic_name, None)
                 _face_batch = getattr(self, '_rollout_face_batch', None)
                 _n_faces    = self.problem.cubature_data['phi'].shape[0]  # F
                 self._rollout_n_faces = _n_faces
