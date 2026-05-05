@@ -30,6 +30,7 @@ from .networks import (
     FNN,
     WFFNN,
     PirateNet,
+    ResNet,
     FBPINN,
     FBPINNModule,
     FourierFeatures,

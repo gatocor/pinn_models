@@ -59,7 +59,7 @@ def _load_backend(name):
     if name == 'jax':
         try:
             from .backends.jax import (
-                FNN, WFFNN, PirateNet, FBPINN, FourierFeatures, DenseRWF,
+                FNN, WFFNN, PirateNet, ResNet, FBPINN, FourierFeatures, DenseRWF,
                 derivative, gradient, laplacian, divergence,
                 Trainer
             )
@@ -74,6 +74,7 @@ def _load_backend(name):
             derivative, gradient, laplacian, divergence,
             Trainer
         )
+        ResNet = None
     
     # Use backend-specific RWF layer
     RWFLayer = DenseRWF if name == 'jax' else LinearRWF
@@ -82,6 +83,7 @@ def _load_backend(name):
         'FNN': FNN,
         'WFFNN': WFFNN,
         'PirateNet': PirateNet,
+        'ResNet': ResNet,
         'FBPINN': FBPINN,
         'FourierFeatures': FourierFeatures,
         'RWFLayer': RWFLayer,
@@ -135,6 +137,7 @@ BACKEND = _BACKEND
 FNN = _backend_classes['FNN']
 WFFNN = _backend_classes['WFFNN']
 PirateNet = _backend_classes['PirateNet']
+ResNet = _backend_classes['ResNet']
 FBPINN = _backend_classes['FBPINN']
 FourierFeatures = _backend_classes['FourierFeatures']
 RWFLayer = _backend_classes['RWFLayer']
@@ -163,6 +166,7 @@ __all__ = [
     "FNN",
     "WFFNN",
     "PirateNet",
+    "ResNet",
     "FBPINN",
     "FourierFeatures",
     "RWFLayer",
