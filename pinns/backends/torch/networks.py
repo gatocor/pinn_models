@@ -2,7 +2,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, List, Tuple, Callable
-from pinns.domain import DomainCubicPartition
+from pinns.domain import DomainCubic
+
+
+def _bump_vectorized(x, x_min, x_max, sigma_lower, sigma_upper=None):
+    """Vectorized smooth-bump window function for all subdomains (torch)."""
+    if sigma_upper is None:
+        sigma_upper = sigma_lower
+    x_e = x.unsqueeze(1)
+    lower_arg = torch.clamp((x_e - x_min.unsqueeze(0)) / sigma_lower.unsqueeze(0), -10, 10)
+    upper_arg = torch.clamp((x_e - x_max.unsqueeze(0)) / sigma_upper.unsqueeze(0), -10, 10)
+    return torch.prod(
+        (1.0 / (1 + torch.exp(-lower_arg))) * (1.0 / (1 + torch.exp(upper_arg))),
+        dim=-1,
+    )
 
 
 class FourierFeatures:
@@ -774,12 +787,12 @@ class FBPINN(nn.Module):
     
     Example:
         import numpy as np
-        from pinns.domain import DomainCubicPartition
+        from pinns.domain import DomainCubic
         from pinns.networks import FNN, FBPINN
-        
-        # Create domain partition (bounds derived from grid_positions)
-        partition = DomainCubicPartition(
-            grid_positions=[np.linspace(-1, 1, 5), np.linspace(0, 1, 5)],
+
+        # Create partitioned domain (bounds derived from partition breakpoints)
+        partition = DomainCubic(
+            space=[np.linspace(-1, 1, 5), np.linspace(0, 1, 5)],
             overlap=0.5  # 50% overlap between subdomains
         )
         
@@ -833,24 +846,19 @@ class FBPINN(nn.Module):
         active_mask[self._active_indices] = True
         self.register_buffer('active_mask', active_mask)
         
-        # Get subdomain centers and widths as tensors (for window functions)
-        centers, widths_lower, widths_upper = domain.to_torch(device=device, dtype=dtype)
-        self.register_buffer('centers', centers)  # (n_subdomains, n_dims)
-        self.register_buffer('widths_lower', widths_lower)  # (n_subdomains, n_dims) - at xmin boundary
-        self.register_buffer('widths_upper', widths_upper)  # (n_subdomains, n_dims) - at xmax boundary
-        
-        # For backward compatibility, keep average widths
-        widths_avg = (widths_lower + widths_upper) / 2
-        self.register_buffer('widths', widths_avg)
-        
+        # Get subdomain centers as tensors
+        c_np    = domain.to_numpy()
+        centers = torch.tensor(c_np, device=device, dtype=dtype)
+        self.register_buffer('centers', centers)  # (n_subdomains, spatial_dims)
+
         # Get actual subdomain bounds from partition positions (for input scaling)
         lower_bounds_np, upper_bounds_np = domain.get_subdomain_bounds()
         self.register_buffer('lower_bounds', torch.tensor(lower_bounds_np, device=device, dtype=dtype))
         self.register_buffer('upper_bounds', torch.tensor(upper_bounds_np, device=device, dtype=dtype))
-        
-        # Pre-compute extended bounds for point mask computation (overlap_factor=1.0 for safety margin)
-        self.register_buffer('extended_lower', self.lower_bounds - 10*widths_lower)
-        self.register_buffer('extended_upper', self.upper_bounds + 10*widths_upper)
+
+        # extended_lower/upper kept as aliases to bounds for backward compat
+        self.register_buffer('extended_lower', self.lower_bounds.clone())
+        self.register_buffer('extended_upper', self.upper_bounds.clone())
         
         # Input scaling target range (subdomain inputs scaled to this range)
         self.register_buffer('input_range_min', torch.tensor(-1.0, device=device, dtype=dtype))
@@ -976,16 +984,24 @@ class FBPINN(nn.Module):
     def compute_windows(self, x):
         """
         Compute window function values for all subdomains at given points.
-        
-        Delegates to the domain partition's compute_windows method.
-        
+        Windows are hard box indicators on subdomain bounds (no overlap).
+        Overlap/window shaping is a solver-level concern and can be overridden
+        by a Problem/Trainer that computes custom widths.
+
         Args:
             x: Input tensor of shape (batch_size, n_dims)
-            
+
         Returns:
             Tensor of shape (batch_size, n_subdomains) with window values
         """
-        return self.domain.compute_windows(x, normalize=self.normalize_input)
+        lower_bounds_np, upper_bounds_np = self.domain.get_subdomain_bounds()
+        lb = torch.tensor(lower_bounds_np, device=x.device, dtype=x.dtype)
+        ub = torch.tensor(upper_bounds_np, device=x.device, dtype=x.dtype)
+        zero = torch.zeros_like(lb)
+        windows = _bump_vectorized(x, lb, ub, zero, zero)
+        if self.normalize_input:
+            windows = windows / windows.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        return windows
     
     def scale_input(self, x, subdomain_idx):
         """

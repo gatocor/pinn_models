@@ -838,7 +838,8 @@ class _LagrangianTrainerInternal(Trainer):
             Residual tensor of shape (n_points,)
         """
         y = self.network.forward(x, params_dict)
-        component = bc.component if bc.component is not None else 0
+        component = getattr(bc, 'component', None)
+        component = component if component is not None else 0
         u = y[:, component:component + 1]
         
         if isinstance(bc, DirichletBC):
@@ -879,9 +880,12 @@ class _LagrangianTrainerInternal(Trainer):
             return (alpha * u + beta * du_dn - gamma).flatten()
         
         elif isinstance(bc, PointsetBC):
-            target = bc.values[:, bc.component:bc.component + 1]
-            target = torch.as_tensor(target, device=x.device, dtype=x.dtype)
-            return (u - target).flatten()
+            targets = bc.get_outputs(device=x.device, dtype=x.dtype)  # (N, K)
+            residuals = []
+            for k, comp in enumerate(bc.components):
+                u_k = y[:, comp]
+                residuals.append((u_k - targets[:, k]).flatten())
+            return torch.cat(residuals, dim=0)
         
         else:
             raise ValueError(f"Unknown BC type: {type(bc)}")

@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Union, Callable, Tuple, Optional, List
 
 def _call_value_function(value_fn, x: torch.Tensor) -> torch.Tensor:
@@ -87,7 +87,8 @@ class DirichletBC:
     boundary: Tuple
     value: Union[float, torch.Tensor, Callable]
     component: int = 0
-    subdomain: Optional[Tuple] = None
+    subspace: Optional[List] = None
+    time_subspace: Optional[Tuple] = None
     name: Optional[str] = None
     sampling_method: Union[str, Callable] = "uniform"
     sampling_transform: Optional[Callable] = None
@@ -156,14 +157,15 @@ class NeumannBC:
         # Spatially varying flux (using numpy)
         bc3 = NeumannBC(boundary=(1, None), value=lambda x: x[:, 1]**2, component=0)
         
-        # BC with subdomain constraint: y ∈ (0.4, 0.6) on the x_max boundary
+        # Restrict to y ∈ (0.4, 0.6) on the x_max boundary (2-D domain)
         bc4 = NeumannBC(boundary=(1, None), value=0.0, component=0,
-                        subdomain=(0.4, 0.6))
+                        subspace=[(0.4, 0.6)])
     """
     boundary: Tuple
     value: Union[float, torch.Tensor, Callable]
     component: int = 0
-    subdomain: Optional[Tuple] = None
+    subspace: Optional[List] = None
+    time_subspace: Optional[Tuple] = None
     name: Optional[str] = None
     sampling_method: Union[str, Callable] = "uniform"
     sampling_transform: Optional[Callable] = None
@@ -205,6 +207,12 @@ class NeumannBC:
                 return (i, sign)
         raise ValueError("No boundary dimension specified")
 
+    @property
+    def normal_dim(self) -> int:
+        """Index of the dimension perpendicular to this boundary."""
+        dim, _ = self.get_normal_direction()
+        return dim
+
 
 @dataclass  
 class RobinBC:
@@ -242,7 +250,8 @@ class RobinBC:
     beta: float
     value: Union[float, torch.Tensor, Callable]
     component: int = 0
-    subdomain: Optional[Tuple] = None
+    subspace: Optional[List] = None
+    time_subspace: Optional[Tuple] = None
     name: Optional[str] = None
     sampling_method: Union[str, Callable] = "uniform"
     sampling_transform: Optional[Callable] = None
@@ -284,89 +293,112 @@ class RobinBC:
                 return (i, sign)
         raise ValueError("No boundary dimension specified")
 
+    @property
+    def normal_dim(self) -> int:
+        """Index of the dimension perpendicular to this boundary."""
+        dim, _ = self.get_normal_direction()
+        return dim
+
 @dataclass
 class PointsetBC:
     """
     Pointset boundary/data condition: u(x_i) = y_i for given data points.
-    
-    This condition enforces that the network output matches given values
-    at specific input points. Useful for:
-    - Data-driven constraints
-    - Initial conditions
-    - Experimental data fitting
-    - Interior data constraints
-    
+
+    Instead of a single target scalar per point you now provide an
+    ``(N, K)`` target array together with a ``components`` list that maps
+    each column of the target to a network output index.  The trainer
+    minimises one MSE sub-loss per column:
+
+    .. math::
+
+        \\mathcal{L}_k = \\dfrac{1}{N}\\sum_{i=1}^{N}
+            \\bigl(u_{\\mathtt{components}[k]}(x_i) - y_{ik}\\bigr)^2
+
+    Each sub-loss is registered under its own name for independent weight
+    control.  If only a single column is supplied the sub-loss keeps the
+    base ``name``; otherwise the names are ``name_0``, ``name_1``, … (or the
+    list supplied via ``output_names``).
+
     Args:
-        inputs (torch.Tensor or np.ndarray): Input points of shape (n_points, n_dims).
-        outputs (torch.Tensor or np.ndarray): Target values of shape (n_points,) or 
-                                              (n_points, n_outputs).
-        component (int or None): Output component index this condition applies to.
-                                If None and outputs is 2D, applies to all components.
-                                Default: 0 (first output)
-        
-    Example:
+        inputs: Input coordinates of shape ``(N, n_dims)``.
+        outputs: Target values of shape ``(N, K)``.  A 1-D array of length
+                 ``N`` is treated as ``(N, 1)`` (single column).
+        components: Network output index for each column of *outputs*.
+                    A single integer is equivalent to ``[int]``.
+        name: Base label used in weight dicts and plots.
+        output_names: Optional per-column labels.  If omitted, names are
+                      ``name_0``, ``name_1``, … (or just ``name`` when
+                      there is only one column).
+
+    Example::
+
         import numpy as np
-        
-        # Single output component
-        x_data = np.array([[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]])
-        y_data = np.array([0.0, 0.5, 1.0])
-        bc = PointsetBC(inputs=x_data, outputs=y_data, component=0)
-        
-        # Multiple output components
-        y_data_multi = np.array([[0.0, 1.0], [0.5, 0.5], [1.0, 0.0]])  # shape (3, 2)
-        bc = PointsetBC(inputs=x_data, outputs=y_data_multi, component=None)
-        
-        # Initial condition at t=0
-        x_initial = np.column_stack([np.linspace(0, 1, 100), np.zeros(100)])  # (x, t=0)
-        u_initial = np.sin(np.pi * x_initial[:, 0])
-        ic = PointsetBC(inputs=x_initial, outputs=u_initial, component=0)
+
+        x_data = np.random.rand(200, 2)   # (N, 2) coordinates
+        y_data = np.random.rand(200, 3)   # (N, 3) targets for u0, u1, u3
+
+        bc = PointsetBC(
+            inputs=x_data,
+            outputs=y_data,
+            components=[0, 1, 3],
+            name='obs',
+        )
+        # Sub-losses: 'obs_0', 'obs_1', 'obs_2'
     """
-    inputs: Union[torch.Tensor, 'np.ndarray']
-    outputs: Union[torch.Tensor, 'np.ndarray']
-    component: Optional[int] = 0
-    name: Optional[str] = None
-    
+    inputs:       Union[torch.Tensor, 'np.ndarray']
+    outputs:      Union[torch.Tensor, 'np.ndarray']
+    components:   Union[int, List[int]] = 0
+    name:         Optional[str] = None
+    output_names: Optional[List[str]] = None
+
     def __post_init__(self):
-        """Convert inputs to tensors if needed."""
         import numpy as np
-        
+
+        # ── convert to float32 tensors ────────────────────────────────────
         if isinstance(self.inputs, np.ndarray):
             self.inputs = torch.from_numpy(self.inputs).float()
+        elif not isinstance(self.inputs, torch.Tensor):
+            self.inputs = torch.tensor(self.inputs, dtype=torch.float32)
         if isinstance(self.outputs, np.ndarray):
             self.outputs = torch.from_numpy(self.outputs).float()
-        
-        # Ensure inputs is 2D
+        elif not isinstance(self.outputs, torch.Tensor):
+            self.outputs = torch.tensor(self.outputs, dtype=torch.float32)
+
+        # ── ensure 2-D shapes ─────────────────────────────────────────────
         if self.inputs.dim() == 1:
             self.inputs = self.inputs.unsqueeze(-1)
-        
-        # Ensure outputs is at least 1D
-        if self.outputs.dim() == 0:
-            self.outputs = self.outputs.unsqueeze(0)
-    
+        if self.outputs.dim() == 1:
+            self.outputs = self.outputs.unsqueeze(-1)  # (N,) → (N, 1)
+
+        # ── normalise components to list ──────────────────────────────────
+        if isinstance(self.components, int):
+            self.components = [self.components]
+
+        # ── validate shape consistency ────────────────────────────────────
+        n_cols = self.outputs.shape[1]
+        if n_cols != len(self.components):
+            raise ValueError(
+                f"PointsetBC '{self.name}': outputs has {n_cols} column(s) but "
+                f"components has {len(self.components)} element(s).  They must match."
+            )
+
+    # ── convenience accessors ─────────────────────────────────────────────
+
+    def get_input_names(self) -> List[str]:
+        """Per-column sub-loss names (resolved against ``name``)."""
+        base = self.name or 'pointset'
+        if self.output_names is not None:
+            return list(self.output_names)
+        if len(self.components) == 1:
+            return [base]
+        return [f'{base}_{k}' for k in range(len(self.components))]
+
     def get_inputs(self, device='cpu', dtype=torch.float32) -> torch.Tensor:
-        """
-        Get input points as tensor.
-        
-        Args:
-            device: PyTorch device
-            dtype: PyTorch dtype
-            
-        Returns:
-            Tensor of shape (n_points, n_dims)
-        """
+        """Input coordinates as a ``(N, n_dims)`` tensor."""
         return self.inputs.to(device=device, dtype=dtype)
-    
+
     def get_outputs(self, device='cpu', dtype=torch.float32) -> torch.Tensor:
-        """
-        Get output values as tensor.
-        
-        Args:
-            device: PyTorch device
-            dtype: PyTorch dtype
-            
-        Returns:
-            Tensor of shape (n_points,) or (n_points, n_outputs)
-        """
+        """Target values as a ``(N, K)`` tensor."""
         return self.outputs.to(device=device, dtype=dtype)
     
     def __len__(self):
@@ -455,9 +487,10 @@ class MeshNodeBC:
     """
     Boundary condition applied at a selected subset of mesh nodes.
 
-    Created by :meth:`DomainMesh.add_dirichlet` and
-    :meth:`DomainMesh.add_neumann`.  Node positions are pre-resolved at
-    construction time so sampling is just a random draw from the stored nodes.
+    Instantiated directly and appended to ``domain.boundary_conditions``,
+    or created by a :class:`~pinns.problem.Problem` / trainer helper.  Node
+    positions are pre-resolved at construction time so sampling is just a
+    random draw from the stored nodes.
 
     Args:
         node_positions: ``(n_selected, spatial_dims)`` array of node coordinates.
@@ -657,6 +690,97 @@ class CubicPeriodicBC:
     name:               Optional[str] = None
     match_x_derivative: bool = True
     bc_type:            str = 'cubic_periodic'
+
+
+@dataclass
+class InitialConditionBC:
+    """
+    Initial condition: u(x, t_min) = value over the full spatial domain.
+
+    This is a dedicated BC type (not a special-cased :class:`DirichletBC`)
+    so it can be recognised, plotted, and filtered independently.
+
+    Created by :meth:`~pinns.domain.DomainCubic.add_initial`.
+
+    Args:
+        boundary: Tuple ``(None, …, None, 0)`` — all spatial dims free,
+                  time dimension pinned to lower face.  Computed automatically
+                  by :meth:`add_initial`.
+        value: IC value.  Scalar or callable ``(x: np.ndarray) -> np.ndarray``
+               taking points ``(n, n_dims)`` and returning ``(n,)`` or
+               ``(n, n_comp)``.
+        component: Output component index (default 0).
+        name: Label used in weights dicts and plots.
+        sampling_method: Sampling method (``'uniform'``, ``'lhs'``, …).
+        sampling_transform: Optional inverse-CDF transform for sampling.
+    """
+    boundary:           tuple
+    value:              Union[float, Callable]
+    component:          int = 0
+    name:               Optional[str] = None
+    sampling_method:    Union[str, Callable] = 'uniform'
+    sampling_transform: Optional[Callable] = None
+    bc_type:            str = 'initial_condition'
+
+    def get_value(self, x) -> 'torch.Tensor':
+        """Evaluate the IC value at points *x* (numpy array or Tensor)."""
+        if callable(self.value):
+            return _call_value_function(self.value, x)
+        import torch as _torch
+        device = x.device if isinstance(x, _torch.Tensor) else 'cpu'
+        dtype  = x.dtype  if isinstance(x, _torch.Tensor) else _torch.float32
+        return _torch.full((x.shape[0],), float(self.value),
+                           device=device, dtype=dtype)
+
+
+@dataclass
+class CubicCustomBC:
+    """
+    Custom boundary condition for :class:`~pinns.domain.DomainCubic` domains
+    with a user-defined residual callable.
+
+    Instead of a fixed ``value`` + ``component`` target, you supply a
+    **residual function** ``f`` with the same signature as the PDE residual::
+
+        f(x, y, params_dict, derivative) -> residual  # (n,) or tuple of (n,)
+        f(x, y, params_dict)             -> residual
+        f(x, y)                          -> residual
+
+    The trainer minimises ``mean(residual²)``.  When ``f`` returns a tuple the
+    loss is split into one sub-loss per element, named
+    ``<name>_0``, ``<name>_1``, … (unless ``output_names`` is provided).
+
+    Created by :meth:`~pinns.domain.DomainCubic.add_custom`.
+
+    Args:
+        boundary: Face specification — a tuple where each element is
+                  ``0`` (lower face), ``1`` (upper face), or ``None``
+                  (free in that dimension).  Use
+                  :meth:`~pinns.domain.DomainCubic._parse_boundary_str` to
+                  convert string labels such as ``'xmin'``.
+        f: Residual callable.  Signature may be 2-, 3-, or 4-argument
+           (see above).
+        name: Base label used in weight dicts and plots.
+        output_names: Optional per-output labels (when ``f`` returns a tuple).
+                      If omitted, names are auto-generated as ``name_0``,
+                      ``name_1``, …
+        subspace: List of ``(lo, hi)`` tuples — one per **free** spatial
+                  dimension of the boundary face — restricting sampling to
+                  that sub-range on each free spatial axis.
+        time_subspace: ``(t_lo, t_hi)`` restricting sampling to a time
+                       sub-interval.  Only valid for time-dependent domains.
+        sampling_method: Sampling strategy (``'uniform'``, ``'lhs'``, …).
+        sampling_transform: Optional inverse-CDF transform for sampling.
+    """
+    boundary:           tuple
+    f:                  Callable
+    name:               Optional[str] = None
+    output_names:       Optional[List[str]] = None
+    subspace:           Optional[List] = None
+    time_subspace:      Optional[tuple] = None
+    sampling_method:    Union[str, Callable] = 'uniform'
+    sampling_transform: Optional[Callable] = None
+    bc_type:            str = 'cubic_custom'
 
 
 @dataclass

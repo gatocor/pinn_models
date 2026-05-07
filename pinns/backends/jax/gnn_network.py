@@ -605,8 +605,7 @@ class GNNMeshNetwork:
 
         # Auto-detect mode from domain type
         if use_state is None:
-            from pinns.domain import DomainMeshDiscrete
-            use_state = isinstance(domain, DomainMeshDiscrete)
+            use_state = getattr(domain, '_time_mode', None) == 'discrete'
 
         # Time interval — only relevant in continuous mode
         t_interval = getattr(domain, 't_interval', None)

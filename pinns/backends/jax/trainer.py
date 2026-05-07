@@ -1020,10 +1020,9 @@ class Trainer(BaseTrainer):
     def _compute_solution_error(self, n_points: int = 1000):
         """Override: for BPTT rollout mode unroll the full trajectory and compare."""
         from pinns.problem_weak import ProblemWeak as _PW
-        from pinns.domain import DomainMeshDiscrete as _DMD
         _is_rollout = (
             isinstance(self.problem, _PW)
-            and isinstance(self.problem.domain, _DMD)
+            and getattr(self.problem.domain, '_time_mode', None) == 'discrete'
             and getattr(self.problem, 'n_time_steps', None) is not None
             and self.problem.solution is not None
             and hasattr(self.network, 'predict_rollout')
@@ -1063,12 +1062,11 @@ class Trainer(BaseTrainer):
     def _plot_mesh_snapshot(self, ax, output_idx, t_val, kind='sol'):
         """Override: for BPTT rollout, fetch the correct time-step from predict_rollout."""
         from pinns.problem_weak import ProblemWeak as _PW
-        from pinns.domain import DomainMeshDiscrete as _DMD
         import numpy as _np
 
         _is_rollout = (
             isinstance(self.problem, _PW)
-            and isinstance(self.problem.domain, _DMD)
+            and getattr(self.problem.domain, '_time_mode', None) == 'discrete'
             and getattr(self.problem, 'n_time_steps', None) is not None
             and hasattr(self.network, 'predict_rollout')
         )

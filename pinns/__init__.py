@@ -34,7 +34,7 @@ _BACKEND = os.environ.get('PINNS_BACKEND', 'torch').lower()
 _backend_classes = {}
 
 # Domain and Problem are backend-agnostic
-from .domain import DomainCubic, DomainCubicPartition, DomainMesh, DomainMeshContinuous, DomainMeshDiscrete, SubdomainInfo, bump
+from .domain import DomainCubic, DomainMesh, SubdomainInfo, bump
 from .problem import Problem
 from .problem_weak import ProblemWeak
 from . import meshes
@@ -158,7 +158,6 @@ __all__ = [
     "meshes",
     # Domain (backend-agnostic)
     "DomainCubic",
-    "DomainCubicPartition",
     "DomainMesh",
     "SubdomainInfo",
     "bump",

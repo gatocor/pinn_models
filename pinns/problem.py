@@ -3,8 +3,8 @@ from typing import Callable, List, Dict, Any, Optional, Union
 from dataclasses import dataclass, field
 import re
 
-from .boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC
-from .domain import DomainCubic, DomainCubicPartition
+from .boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC, CubicPeriodicBC, InitialConditionBC, CubicCustomBC
+from .domain import DomainCubic
 
 
 @dataclass
@@ -18,7 +18,7 @@ class Problem:
     domain.add_dirichlet(), domain.add_neumann(), etc.
     
     Args:
-        domain (DomainCubic or DomainCubicPartition): The computational domain with boundary 
+        domain (DomainCubic): The computational domain with boundary 
                           conditions already added.
         pde_fn (Callable): The PDE residual function with signature:
                           pde_fn(x, y, params) -> residual
@@ -48,7 +48,7 @@ class Problem:
         
     Example:
         # Define domain with boundary conditions
-        domain = DomainCubic([0, 0], [1, 1])
+        domain = DomainCubic(space=[(0, 1), (0, 1)])
         domain.add_dirichlet((0, None), value=0.0, component=0, name="left")   # u=0 at x_min
         domain.add_dirichlet((1, None), value=1.0, component=0, name="right")  # u=1 at x_max
         
@@ -73,7 +73,7 @@ class Problem:
             output_names=['u']
         )
     """
-    domain: Union[DomainCubic, DomainCubicPartition]
+    domain: DomainCubic
     pde_fn: Callable[[torch.Tensor, torch.Tensor, Dict], torch.Tensor]
     params: Dict[str, Any] = field(default_factory=dict)
     input_names: List[str] = field(default_factory=list)
@@ -87,6 +87,9 @@ class Problem:
     obs_spatial: Optional[List[str]] = field(default=None)
     
     def __post_init__(self):
+        # Boundary conditions owned by the problem (not the domain)
+        self.boundary_conditions: List = []
+
         # Get n_dims from domain
         self.n_dims = self.domain.n_dims
         
@@ -128,10 +131,6 @@ class Problem:
         """Get domain upper bounds."""
         return self.domain.xmax
     
-    @property
-    def boundary_conditions(self):
-        """Get boundary conditions from the domain."""
-        return self.domain.boundary_conditions
     
     def compute_pde_residual(self, x: torch.Tensor, y: torch.Tensor, 
                              internal: Dict[str, Any] = None) -> torch.Tensor:
@@ -225,6 +224,171 @@ class Problem:
         """Get all Pointset boundary conditions."""
         return [bc for bc in self.boundary_conditions if isinstance(bc, PointsetBC)]
     
+    # ------------------------------------------------------------------ #
+    #  Boundary-condition builders                                        #
+    # ------------------------------------------------------------------ #
+
+    def add_dirichlet(
+        self,
+        boundary,
+        value,
+        component: int,
+        name: str,
+        subspace=None,
+        time_subspace=None,
+        sampling_method='uniform',
+        sampling_transform=None,
+    ) -> 'Problem':
+        """Add a Dirichlet BC: u = value on *boundary*. See :meth:`~pinns.domain.DomainCubic.add_dirichlet` for full docs."""
+        boundary = self.domain._parse_boundary_str(boundary)
+        self.domain._validate_subspace(boundary, subspace, name)
+        self.domain._validate_time_subspace(time_subspace, name)
+        bc = DirichletBC(
+            boundary=boundary, value=value, component=component,
+            subspace=subspace, time_subspace=time_subspace, name=name,
+            sampling_method=sampling_method, sampling_transform=sampling_transform,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
+    def add_neumann(
+        self,
+        boundary,
+        value,
+        component: int,
+        name: str,
+        subspace=None,
+        time_subspace=None,
+        sampling_method='uniform',
+        sampling_transform=None,
+    ) -> 'Problem':
+        """Add a Neumann BC: du/dn = value on *boundary*."""
+        boundary = self.domain._parse_boundary_str(boundary)
+        self.domain._validate_subspace(boundary, subspace, name)
+        self.domain._validate_time_subspace(time_subspace, name)
+        bc = NeumannBC(
+            boundary=boundary, value=value, component=component,
+            subspace=subspace, time_subspace=time_subspace, name=name,
+            sampling_method=sampling_method, sampling_transform=sampling_transform,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
+    def add_robin(
+        self,
+        boundary,
+        alpha: float,
+        beta: float,
+        value,
+        component: int,
+        name: str,
+        subspace=None,
+        time_subspace=None,
+        sampling_method='uniform',
+        sampling_transform=None,
+    ) -> 'Problem':
+        """Add a Robin BC: alpha*u + beta*du/dn = value on *boundary*."""
+        boundary = self.domain._parse_boundary_str(boundary)
+        self.domain._validate_subspace(boundary, subspace, name)
+        self.domain._validate_time_subspace(time_subspace, name)
+        bc = RobinBC(
+            boundary=boundary, alpha=alpha, beta=beta, value=value,
+            component=component, subspace=subspace, time_subspace=time_subspace,
+            name=name, sampling_method=sampling_method,
+            sampling_transform=sampling_transform,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
+    def add_pointset(
+        self,
+        inputs,
+        outputs,
+        components,
+        name: str,
+        output_names=None,
+    ) -> 'Problem':
+        """Add a pointset (data) condition at given measurement points."""
+        bc = PointsetBC(
+            inputs=inputs, outputs=outputs, components=components,
+            name=name, output_names=output_names,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
+    def add_periodic(
+        self,
+        dim: str,
+        name: str = 'periodic',
+        component=None,
+        n_pairs: int = 200,
+        match_x_derivative: bool = True,
+    ) -> 'Problem':
+        """Add a soft periodic BC along spatial dimension *dim* ('x', 'y', or 'z')."""
+        _DIM_STR_MAP = {'x': 0, 'y': 1, 'z': 2}
+        if not isinstance(dim, str):
+            raise TypeError(f"'dim' must be a string label ('x', 'y', or 'z'), got {type(dim).__name__!r}.")
+        key = dim.strip().lower()
+        if key not in _DIM_STR_MAP:
+            raise ValueError(f"Unknown dimension label {dim!r}. Valid options: 'x', 'y', 'z'.")
+        dim_int = _DIM_STR_MAP[key]
+        if dim_int >= self.domain._spatial_dims:
+            raise ValueError(
+                f"Dimension {dim!r} refers to spatial dimension {dim_int}, "
+                f"but this domain only has {self.domain._spatial_dims} spatial dimension(s)."
+            )
+        bc = CubicPeriodicBC(
+            dim=dim_int, n_pairs=n_pairs, component=component,
+            name=name, match_x_derivative=match_x_derivative,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
+    def add_initial(
+        self,
+        value,
+        component: int,
+        name: str = 'ic',
+        sampling_method='uniform',
+        sampling_transform=None,
+    ) -> 'Problem':
+        """Add an initial condition: u(x, t_min) = value. Domain must have a time axis."""
+        if not self.domain.has_time:
+            raise ValueError(
+                "add_initial requires a time-dependent domain. "
+                "Pass time=(t_min, t_max) to DomainCubic."
+            )
+        boundary = (None,) * self.domain._spatial_dims + (0,)
+        bc = InitialConditionBC(
+            boundary=boundary, value=value, component=component, name=name,
+            sampling_method=sampling_method, sampling_transform=sampling_transform,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
+    def add_custom(
+        self,
+        boundary,
+        f,
+        name: str,
+        output_names=None,
+        subspace=None,
+        time_subspace=None,
+        sampling_method='uniform',
+        sampling_transform=None,
+    ) -> 'Problem':
+        """Add a custom BC with a user-defined residual callable *f*."""
+        boundary = self.domain._parse_boundary_str(boundary)
+        self.domain._validate_subspace(boundary, subspace, name)
+        self.domain._validate_time_subspace(time_subspace, name)
+        bc = CubicCustomBC(
+            boundary=boundary, f=f, name=name, output_names=output_names,
+            subspace=subspace, time_subspace=time_subspace,
+            sampling_method=sampling_method, sampling_transform=sampling_transform,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
     def update_params(self, **kwargs):
         """Update problem parameters."""
         self.params.update(kwargs)

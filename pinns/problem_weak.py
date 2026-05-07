@@ -67,6 +67,7 @@ Neumann boundary data for each Neumann BC (stored in
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Any, List, Optional, Union
 
@@ -690,7 +691,7 @@ class ProblemWeak:
     dirichlet_nodes:  np.ndarray = field(init=False, default=None)
 
     def __post_init__(self):
-        from .domain import DomainMesh, DomainMeshContinuous, DomainMeshDiscrete
+        from .domain import DomainMesh
         from .boundary import MeshNodeBC
 
         if not isinstance(self.domain, DomainMesh):
@@ -699,12 +700,12 @@ class ProblemWeak:
                 f"got {type(self.domain).__name__}."
             )
 
-        # ── Auto-populate from typed subclasses ──────────────────────────────
-        # DomainMeshDiscrete: read n_steps → n_time_steps
-        if isinstance(self.domain, DomainMeshDiscrete) and self.n_time_steps is None:
+        # ── Auto-populate from domain time mode ──────────────────────────────
+        # Discrete time: read n_steps → n_time_steps
+        if self.domain._time_mode == 'discrete' and self.n_time_steps is None:
             self.n_time_steps = self.domain.n_steps
-        # DomainMeshContinuous: read n_time_points from domain if not set
-        if isinstance(self.domain, DomainMeshContinuous) and self.n_time_points is None:
+        # Continuous time: read n_time_points from domain if not set
+        if self.domain._time_mode == 'continuous' and self.n_time_points is None:
             self.n_time_points = self.domain.n_time_points
         if self.basis != "lagrange":
             raise ValueError(
@@ -733,6 +734,9 @@ class ProblemWeak:
             )
         if not self.output_names:
             raise ValueError("output_names is required.")
+
+        # Boundary conditions owned by the problem (not the domain)
+        self.boundary_conditions: List = []
 
         verts = self.domain._vertices   # (n_verts, 2)  — corner vertices only
         faces = self.domain._faces      # (n_faces, 3)
@@ -765,7 +769,7 @@ class ProblemWeak:
         # Use hard_spatial_bc_names: groups collectively covering [t_min, t_max].
         # IC BCs (hard via t-factorization, not FEM DOF removal) are excluded.
         _hard_names_d = self.hard_spatial_bc_names
-        for bc in self.domain.boundary_conditions:
+        for bc in self.boundary_conditions:
             if isinstance(bc, MeshNodeBC) and bc.bc_type == "dirichlet":
                 if getattr(bc, 'name', None) not in _hard_names_d:
                     continue   # not a hard-constrained spatial BC — keep as soft
@@ -785,7 +789,7 @@ class ProblemWeak:
 
         # Pass 2 — edge interior DOFs for strong Dirichlet (N ≥ 2)
         if self.lagrange_order >= 2:
-            for bc in self.domain.boundary_conditions:
+            for bc in self.boundary_conditions:
                 if isinstance(bc, MeshNodeBC) and bc.bc_type == "dirichlet":
                     if getattr(bc, 'name', None) not in _hard_names_d:
                         continue   # not a hard-constrained spatial BC — soft only
@@ -820,7 +824,7 @@ class ProblemWeak:
         # Boundary free nodes: any free node appearing on a non-Dirichlet BC edge
         # (custom add_bc edges for top/bottom/right).  Inner nodes are the rest.
         _boundary_node_set = set()
-        for bc in self.domain.boundary_conditions:
+        for bc in self.boundary_conditions:
             if getattr(bc, 'bc_type', 'custom') != 'dirichlet':
                 _edges = getattr(bc, 'edges', None)
                 if _edges is not None:
@@ -848,7 +852,7 @@ class ProblemWeak:
         _ic_mask   = np.zeros((len(verts), n_out), dtype=np.float32)
         _ic_values = np.zeros((len(verts), n_out), dtype=np.float32)
         if _hard_spatial or _hard_ic:
-            for bc in self.domain.boundary_conditions:
+            for bc in self.boundary_conditions:
                 if not (isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet'):
                     continue
                 bc_name = getattr(bc, 'name', None)
@@ -892,7 +896,7 @@ class ProblemWeak:
         # L_j will be filled in after boundary_fn_data is built (below)
         self._support_vol_tmp = _support_vol   # hold temporarily
         self.neumann_data = []
-        for bc in self.domain.boundary_conditions:
+        for bc in self.boundary_conditions:
             if isinstance(bc, MeshNodeBC) and bc.bc_type == "neumann" and bc.edges is not None:
                 data = _precompute_boundary_edges(
                     verts, bc.edges, bc.edge_normals, self.cubature_order
@@ -923,7 +927,7 @@ class ProblemWeak:
             )
             # Build name → edges lookup from domain BCs (any type with .edges)
             name_to_edges: dict = {}
-            for bc in self.domain.boundary_conditions:
+            for bc in self.boundary_conditions:
                 if getattr(bc, 'edges', None) is not None and bc.name is not None:
                     name_to_edges[bc.name] = bc.edges
             for bc_name, fn in bfn_dict.items():
@@ -947,7 +951,7 @@ class ProblemWeak:
         # weak_fn object) are stored as a single entry with all names as a list.
         _fn_id_to_names: dict = {}
         _fn_id_to_bc:    dict = {}
-        for bc in self.domain.boundary_conditions:
+        for bc in self.boundary_conditions:
             if not getattr(bc, 'is_weak', False):
                 continue
             fn = bc.weak_fn
@@ -1081,7 +1085,7 @@ class ProblemWeak:
             bnd_covered: set = set()
             ic_covered:  set = set()
 
-            for bc in self.domain.boundary_conditions:
+            for bc in self.boundary_conditions:
                 if not isinstance(bc, MeshNodeBC):
                     continue
                 if bc.component != comp:
@@ -1213,7 +1217,7 @@ class ProblemWeak:
 
         # Group by (node-fingerprint, component), but only non-IC BCs
         groups: dict = defaultdict(list)
-        for bc in self.domain.boundary_conditions:
+        for bc in self.boundary_conditions:
             if not isinstance(bc, MeshNodeBC) or bc.bc_type != 'dirichlet':
                 continue
             if getattr(bc, 'name', None) is None:
@@ -1266,7 +1270,7 @@ class ProblemWeak:
 
         from .boundary import MeshNodeBC
         eligible: set = set()
-        for bc in self.domain.boundary_conditions:
+        for bc in self.boundary_conditions:
             if not isinstance(bc, MeshNodeBC) or bc.bc_type != 'dirichlet':
                 continue
             name = getattr(bc, 'name', None)
@@ -1309,7 +1313,7 @@ class ProblemWeak:
             return set()
         from .boundary import MeshNodeBC
         eligible: set = set()
-        for bc in self.domain.boundary_conditions:
+        for bc in self.boundary_conditions:
             if not isinstance(bc, MeshNodeBC) or bc.bc_type != 'dirichlet':
                 continue
             name = getattr(bc, 'name', None)
@@ -1328,10 +1332,235 @@ class ProblemWeak:
         """Total number of global DOFs."""
         return len(self.cubature_data['dof_coords'])
 
-    @property
-    def boundary_conditions(self):
-        """Pass-through to domain boundary conditions."""
-        return self.domain.boundary_conditions
+    # ------------------------------------------------------------------ #
+    #  Boundary-condition builders                                       #
+    # ------------------------------------------------------------------ #
+
+    def add_dirichlet(self, select, value, component: int = 0,
+                      name: str = None, time_window=None) -> 'ProblemWeak':
+        """Add a Dirichlet BC: ``u = value`` on the selected nodes."""
+        from pinns.boundary import MeshNodeBC
+        domain = self.domain
+        node_idx = domain._resolve_node_select(select)
+        if len(node_idx) == 0:
+            raise ValueError("Node selector matched zero nodes.")
+        node_positions = domain._vertices[node_idx]
+        if time_window is None:
+            time_window = domain._default_time_window()
+        if domain._time_mode == 'continuous' and time_window is not None:
+            tw = list(time_window)
+            if len(tw) != 2:
+                raise ValueError(
+                    f"add_dirichlet: continuous domain requires time_window=[t_start, t_end], "
+                    f"got {tw!r}."
+                )
+            t_a, t_b = float(tw[0]), float(tw[1])
+            if t_a > t_b + 1e-12:
+                raise ValueError(f"time_window[0]={t_a} must be ≤ time_window[1]={t_b}.")
+            time_window = tw
+        bc = MeshNodeBC(
+            node_positions=node_positions,
+            value=value,
+            bc_type="dirichlet",
+            component=component,
+            name=name,
+            time_window=time_window,
+            t_min=domain._t_min or 0.0,
+            t_max=domain._t_max or 1.0,
+            node_indices=node_idx,
+            edges=None,
+            edge_lengths=None,
+        )
+        domain._check_bc_time_overlap(bc)
+        self.boundary_conditions.append(bc)
+        return self
+
+    def add_neumann(self, select, value, component: int = 0,
+                    name: str = None, time_window=None) -> 'ProblemWeak':
+        """Add a Neumann BC: ``du/dn = value`` on the selected boundary nodes."""
+        from pinns.boundary import MeshNodeBC
+        import numpy as np
+        domain = self.domain
+        node_idx = domain._resolve_node_select(select)
+        if len(node_idx) == 0:
+            raise ValueError("Node selector matched zero nodes.")
+        node_positions = domain._vertices[node_idx]
+        edge_indices = domain.node_indices_to_edge_indices(node_idx)
+        if len(edge_indices) == 0:
+            raise ValueError(
+                "Neumann BC node selector yielded no mesh edges "
+                "(no mesh edge has both endpoints among the selected nodes)."
+            )
+        edges = domain._all_edges[edge_indices]
+        edge_lengths = np.linalg.norm(
+            domain._vertices[edges[:, 1]] - domain._vertices[edges[:, 0]], axis=1)
+        if time_window is None:
+            time_window = domain._default_time_window()
+        if domain._time_mode == 'continuous' and time_window is not None:
+            tw = list(time_window)
+            if len(tw) != 2:
+                raise ValueError(
+                    f"add_neumann: continuous domain requires time_window=[t_start, t_end], "
+                    f"got {tw!r}."
+                )
+            time_window = tw
+        _tw = time_window
+        _is_time_point = (
+            _tw is not None
+            and len(_tw) >= 1
+            and (
+                (len(_tw) == 1)
+                or (len(_tw) == 2 and abs(float(_tw[0]) - float(_tw[1])) < 1e-12)
+            )
+        )
+        edge_normals = None if _is_time_point else domain._infer_edge_outward_normals(edges)
+        bc = MeshNodeBC(
+            node_positions=node_positions,
+            value=value,
+            bc_type="neumann",
+            component=component,
+            name=name,
+            time_window=_tw if domain._t_min is not None else None,
+            t_min=domain._t_min or 0.0,
+            t_max=domain._t_max or 1.0,
+            node_indices=node_idx,
+            edges=edges,
+            edge_lengths=edge_lengths,
+            edge_normals=edge_normals,
+        )
+        domain._check_bc_time_overlap(bc)
+        self.boundary_conditions.append(bc)
+        return self
+
+    def add_initial_condition(self, value=0.0, component: int = 0,
+                              name: str = 'ic') -> 'ProblemWeak':
+        """Add a Dirichlet initial condition: ``u(x, t_min) = value`` on interior nodes."""
+        domain = self.domain
+        if domain._time_mode == 'stationary':
+            raise ValueError(
+                "add_initial_condition requires a time-dependent domain. "
+                "Pass time=(t_min, t_max) or time=np.linspace(...) to DomainMesh."
+            )
+        interior_mask = domain.interior_node_mask
+        if domain._time_mode == 'discrete':
+            ic_window = [domain._t_min]
+        else:
+            ic_window = [domain._t_min, domain._t_min]
+        return self.add_dirichlet(
+            select=lambda v: interior_mask,
+            value=value,
+            component=component,
+            name=name,
+            time_window=ic_window,
+        )
+
+    def add_periodic(self, select_a, select_b, component=None,
+                     name: str = 'periodic') -> 'ProblemWeak':
+        """Add a periodic BC pairing nodes on two boundaries."""
+        from pinns.boundary import PeriodicBC
+        import numpy as np
+        from scipy.spatial import cKDTree
+        domain = self.domain
+        edges_a = domain._all_edges[domain._resolve_select(select_a)]
+        edges_b = domain._all_edges[domain._resolve_select(select_b)]
+        pts_a = domain._vertices[np.unique(edges_a)]
+        pts_b = domain._vertices[np.unique(edges_b)]
+        shift = pts_b.mean(axis=0) - pts_a.mean(axis=0)
+        pts_a_shifted = pts_a + shift
+        tree = cKDTree(pts_b)
+        dists, idx = tree.query(pts_a_shifted, k=1)
+        import warnings
+        max_dist = dists.max()
+        tol = np.linalg.norm(shift) * 0.1 + 1e-10
+        if max_dist > tol:
+            warnings.warn(
+                f"add_periodic('{name}'): largest pairing distance is {max_dist:.4g}."
+                " The two boundaries may not have matching node distributions.",
+                UserWarning,
+            )
+        pts_b_matched = pts_b[idx]
+        bc = PeriodicBC(
+            node_positions_a=pts_a.astype(np.float32),
+            node_positions_b=pts_b_matched.astype(np.float32),
+            component=component,
+            name=name,
+        )
+        self.boundary_conditions.append(bc)
+        return self
+
+    def add_bc(self, select, f, name=None) -> 'ProblemWeak':
+        """Add a custom mesh BC defined by a residual function."""
+        import inspect as _inspect_mod
+        import numpy as np
+        from pinns.boundary import MeshCustomBC
+        domain = self.domain
+        edge_indices = domain._resolve_select(select)
+        edges = domain._all_edges[edge_indices]
+        node_positions = domain._vertices[np.unique(edges)]
+        edge_lengths = np.linalg.norm(
+            domain._vertices[edges[:, 1]] - domain._vertices[edges[:, 0]], axis=1)
+        _f_params = list(_inspect_mod.signature(f).parameters.keys())
+        _is_weak = 'phi' in _f_params
+        _weak_fn = f if _is_weak else None
+        if isinstance(name, (list, tuple)):
+            for idx, oname in enumerate(name):
+                def _make_wrapper(fn, i):
+                    import inspect as _insp
+                    _params = list(_insp.signature(fn).parameters.keys())
+                    _n = len(_params)
+                    _has_phi = 'phi' in _params
+                    def _wrapper_weak(x, y, params, phi, derivative):
+                        result = fn(x, y, params, phi, derivative)
+                        if isinstance(result, (list, tuple)):
+                            return result[i]
+                        return result
+                    def _wrapper(x, y, params, derivative):
+                        result = fn(x, y, params, derivative)
+                        if isinstance(result, (list, tuple)):
+                            return result[i]
+                        return result
+                    def _wrapper3(x, y, params):
+                        result = fn(x, y, params)
+                        if isinstance(result, (list, tuple)):
+                            return result[i]
+                        return result
+                    def _wrapper2(x, y):
+                        result = fn(x, y)
+                        if isinstance(result, (list, tuple)):
+                            return result[i]
+                        return result
+                    if _has_phi:
+                        return _wrapper_weak
+                    elif _n >= 4:
+                        return _wrapper
+                    elif _n == 3:
+                        return _wrapper3
+                    else:
+                        return _wrapper2
+                bc = MeshCustomBC(
+                    node_positions=node_positions,
+                    f=_make_wrapper(f, idx),
+                    name=oname,
+                    output_names=[oname],
+                    edges=edges,
+                    edge_lengths=edge_lengths,
+                    is_weak=_is_weak,
+                    weak_fn=_weak_fn,
+                )
+                self.boundary_conditions.append(bc)
+            return self
+        bc = MeshCustomBC(
+            node_positions=node_positions,
+            f=f,
+            name=name,
+            output_names=[name] if name is not None else None,
+            edges=edges,
+            edge_lengths=edge_lengths,
+            is_weak=_is_weak,
+            weak_fn=_weak_fn,
+        )
+        self.boundary_conditions.append(bc)
+        return self
 
     @property
     def xmin(self):
@@ -2389,7 +2618,7 @@ class ProblemWeak:
         # Hard-constrained BCs are satisfied by the network exactly and are
         # not part of the soft optimisation problem, so we skip them here.
         _hard_names = self.hard_bc_names | self._rollout_ic_bc_names
-        for bc in self.domain.boundary_conditions:
+        for bc in self.boundary_conditions:
             if getattr(bc, 'name', None) in _hard_names:
                 continue
             raw_name = getattr(bc, 'name', None) or "bc"

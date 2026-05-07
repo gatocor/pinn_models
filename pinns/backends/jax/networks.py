@@ -1204,10 +1204,10 @@ class FBPINN:
         self.n_active = len(self.active_indices)
         
         # Get subdomain geometry as numpy arrays
-        centers, widths_lower, widths_upper = domain.to_numpy()
+        centers = domain.to_numpy()
         self.centers = centers
-        self.widths_lower = widths_lower
-        self.widths_upper = widths_upper
+        self.widths_lower = np.zeros_like(centers)  # no overlap by default
+        self.widths_upper = np.zeros_like(centers)
         
         lower_bounds, upper_bounds = domain.get_subdomain_bounds()
         self.lower_bounds = lower_bounds

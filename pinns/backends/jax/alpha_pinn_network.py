@@ -302,10 +302,9 @@ class AlphaPINN:
                 f"(got spatial_dims={domain._spatial_dims})."
             )
 
-        # Auto-detect mode from domain type
+        # Auto-detect mode: use state-integrator when domain has partitioned time
         if use_state is None:
-            from pinns.domain import DomainMeshDiscrete
-            use_state = isinstance(domain, DomainMeshDiscrete)
+            use_state = getattr(domain, 'is_time_partitioned', False)
 
         self.n_features       = n_features
         self.hidden_dims      = list(hidden_dims)

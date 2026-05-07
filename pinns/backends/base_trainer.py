@@ -973,18 +973,13 @@ class BaseTrainer(ABC):
         Returns:
             Target tensor (backend-specific), 1D shape (n_points,)
         """
-        from pinns.boundary import PointsetBC, MeshCustomBC
+        from pinns.boundary import PointsetBC, MeshCustomBC, CubicCustomBC
         
-        if isinstance(bc, MeshCustomBC):
-            # MeshCustomBC has no value attribute; its loss is computed in _compute_custom_bc_loss
+        if isinstance(bc, (MeshCustomBC, CubicCustomBC, PointsetBC)):
+            # These BCs have no scalar value attribute; loss computed elsewhere
             return None
         
-        if isinstance(bc, PointsetBC):
-            values = np.array(bc.values)
-            if values.ndim > 1:
-                values = values.squeeze(-1)
-            return self._to_tensor(values)
-        elif callable(bc.value):
+        if callable(bc.value):
             x_np = np.asarray(x)  # Convert to numpy for user function
             result = np.asarray(bc.value(x_np))
             # Squeeze to 1D if result is 2D (e.g., shape (n, 1))
@@ -1041,11 +1036,11 @@ class BaseTrainer(ABC):
         Returns:
             Loss tensor (backend-specific scalar)
         """
-        from pinns.boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC, MeshNodeBC, MeshCustomBC
+        from pinns.boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC, MeshNodeBC, MeshCustomBC, InitialConditionBC, CubicCustomBC
 
         y = self.network.forward(x, params_dict)
 
-        if isinstance(bc, MeshCustomBC):
+        if isinstance(bc, (MeshCustomBC, CubicCustomBC)):
             return self._compute_custom_bc_loss(bc, x, y, params_dict)
 
         if isinstance(bc, MeshNodeBC):
@@ -1089,7 +1084,7 @@ class BaseTrainer(ABC):
             else:
                 raise ValueError(f"Unknown bc_type: {bc.bc_type!r}")
 
-        if isinstance(bc, DirichletBC):
+        if isinstance(bc, DirichletBC) or isinstance(bc, InitialConditionBC):
             target = self._get_bc_target(bc, x)
             diff = y[:, bc.component] - target
             return self._mean_squared(diff)
@@ -1109,9 +1104,8 @@ class BaseTrainer(ABC):
             return self._mean_squared(residual)
         
         elif isinstance(bc, PointsetBC):
-            target = self._get_bc_target(bc, x)
-            diff = y[:, bc.component] - target
-            return self._mean_squared(diff)
+            per = self._compute_pointset_bc_losses_dict(bc, x, y)
+            return sum(per.values())
         
         else:
             raise ValueError(f"Unknown BC type: {type(bc)}")
@@ -1177,6 +1171,39 @@ class BaseTrainer(ABC):
         default_w = (weights_dict or {}).get(bc.name, 1.0)
         return default_w * self._mean_squared(residual)
 
+    def _compute_pointset_bc_losses_dict(self, bc, x, y, weights_dict=None):
+        """Return a ``{sub_name: weighted_scalar_loss}`` dict for a :class:`PointsetBC`.
+
+        One sub-loss is produced per column of ``bc.outputs`` / element of
+        ``bc.components``.  Sub-loss names come from ``bc.get_input_names()``
+        (auto-generated as ``name_0``, ``name_1``, … or via ``output_names``).
+
+        Args:
+            bc: A :class:`~pinns.boundary.PointsetBC` instance.
+            x:  Input tensor (already the bc points, passed for device/dtype ref).
+            y:  Network output tensor ``(N, n_outputs)``.
+            weights_dict: Optional weight dict; keys may be the base ``bc.name``
+                          (fallback) or individual sub-loss names.
+
+        Returns:
+            ``{sub_name: weighted_scalar_loss}``
+        """
+        from pinns.boundary import PointsetBC
+        device = y.device if hasattr(y, 'device') else 'cpu'
+        dtype  = y.dtype  if hasattr(y, 'dtype')  else None
+        if dtype is not None:
+            targets = bc.get_outputs(device=device, dtype=dtype)  # (N, K)
+        else:
+            targets = bc.get_outputs()
+        out_names = bc.get_input_names()
+        base_w = (weights_dict or {}).get(bc.name, 1.0) if (weights_dict and bc.name) else 1.0
+        result = {}
+        for k, (comp, oname) in enumerate(zip(bc.components, out_names)):
+            diff = y[:, comp] - targets[:, k]
+            w = (weights_dict or {}).get(oname, base_w)
+            result[oname] = w * self._mean_squared(diff)
+        return result
+
     def _compute_total_loss(self, data: Dict, params_dict: Dict[str, Any], weights_dict: Dict):
         """
         Compute total weighted loss from data dict.
@@ -1224,8 +1251,23 @@ class BaseTrainer(ABC):
             name_idx += 1
             if name in data:
                 x_bc = data[name]
-                from pinns.boundary import MeshCustomBC as _MeshCustomBC
-                if isinstance(bc, _MeshCustomBC):
+                from pinns.boundary import MeshCustomBC as _MeshCustomBC, CubicCustomBC as _CubicCustomBC, PointsetBC as _PointsetBC
+                if isinstance(bc, _PointsetBC):
+                    per_output = self._compute_pointset_bc_losses_dict(
+                        bc,
+                        x_bc,
+                        self.network.forward(x_bc, params_dict),
+                        weights_dict)
+                    weighted_bc_loss = sum(per_output.values())
+                    for oname, oloss in per_output.items():
+                        losses[oname] = oloss
+                    losses['bcs'].append(weighted_bc_loss)
+                    if total_loss is None:
+                        total_loss = weighted_bc_loss
+                    else:
+                        total_loss = total_loss + weighted_bc_loss
+                    continue
+                elif isinstance(bc, (_MeshCustomBC, _CubicCustomBC)):
                     per_output = self._compute_custom_bc_losses_dict(
                         bc, x_bc,
                         self.network.forward(x_bc, params_dict),
@@ -1427,10 +1469,14 @@ class BaseTrainer(ABC):
     
     def _sample_boundary_np(self, bc, n_points: int) -> np.ndarray:
         """Sample boundary points for a specific boundary condition."""
-        from pinns.boundary import PointsetBC, MeshNodeBC, MeshCustomBC
+        from pinns.boundary import PointsetBC, MeshNodeBC, MeshCustomBC, CubicCustomBC
 
         if isinstance(bc, PointsetBC):
-            return bc.points
+            import numpy as np
+            pts = bc.inputs
+            if hasattr(pts, 'detach'):
+                return pts.detach().cpu().numpy()
+            return np.asarray(pts)
 
         if isinstance(bc, (MeshNodeBC, MeshCustomBC)):
             pts, sampled_idx = self.problem.domain.sample_boundary_bc(bc, n_points, rng=self.rng)
@@ -1455,17 +1501,37 @@ class BaseTrainer(ABC):
                     method=method, transform=transform, params=params
                 )
                 
-                subdomain = getattr(bc, 'subdomain', None)
-                if subdomain is not None:
-                    sub_min, sub_max = subdomain
-                    for d in range(len(boundary)):
-                        if boundary[d] is None:
-                            orig_min = domain.xmin[d]
-                            orig_max = domain.xmax[d]
-                            orig_extent = orig_max - orig_min
-                            normalized = (points[:, d] - orig_min) / orig_extent
-                            points[:, d] = sub_min + normalized * (sub_max - sub_min)
-                
+                # subspace: list of (lo, hi) tuples, one per free dimension
+                # (free dims = those where boundary[d] is None), in order
+                subspace = getattr(bc, 'subspace', None)
+                if subspace is not None:
+                    free_dims = [d for d in range(len(boundary)) if boundary[d] is None]
+                    for i, (lo, hi) in enumerate(subspace):
+                        if i >= len(free_dims):
+                            break
+                        d = free_dims[i]
+                        orig_lo = domain.xmin[d]
+                        orig_hi = domain.xmax[d]
+                        orig_extent = orig_hi - orig_lo
+                        if orig_extent > 0:
+                            points[:, d] = orig_lo + (
+                                (points[:, d] - orig_lo) / orig_extent
+                            ) * (hi - lo) + (lo - orig_lo)
+
+                # time_subspace: (t_lo, t_hi) restricts the time dimension
+                time_subspace = getattr(bc, 'time_subspace', None)
+                if time_subspace is not None:
+                    t_dim = domain._spatial_dims
+                    if t_dim < points.shape[1]:
+                        t_lo, t_hi = time_subspace
+                        t_orig_lo = domain.xmin[t_dim]
+                        t_orig_hi = domain.xmax[t_dim]
+                        t_orig_extent = t_orig_hi - t_orig_lo
+                        if t_orig_extent > 0:
+                            points[:, t_dim] = t_orig_lo + (
+                                (points[:, t_dim] - t_orig_lo) / t_orig_extent
+                            ) * (t_hi - t_lo) + (t_lo - t_orig_lo)
+
                 return points
         
         raise ValueError(f"Invalid boundary specification: {boundary}")
