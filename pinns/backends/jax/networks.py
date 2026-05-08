@@ -253,7 +253,8 @@ class FNN:
                  unnormalize_output: bool = True,
                  input_transform: Optional[Callable] = None,
                  output_transform: Optional[Callable] = None,
-                 feature_encoding: Optional[Callable] = None):
+                 feature_encoding: Optional[Callable] = None,
+                 output_range=None):
         """
         Initialize FNN wrapper.
         
@@ -269,6 +270,11 @@ class FNN:
             output_transform: Optional hard constraint transform
             feature_encoding: Optional feature encoding (e.g., FourierFeatures).
                              Applied after normalization, before network forward pass.
+            output_range: Optional output unnormalization range.  Either a single
+                ``(ymin, ymax)`` pair (broadcast to all outputs) or a list of
+                ``(ymin, ymax)`` pairs, one per output.  If provided, calls
+                ``set_output_range`` immediately so the range is baked in before
+                the Trainer starts.
         """
         self.layer_sizes = list(layer_sizes)
         self.activation = activation
@@ -279,7 +285,7 @@ class FNN:
         self.output_transform = output_transform
         self.feature_encoding = feature_encoding
         
-        # Bounds (set by trainer)
+        # Bounds (set by trainer or constructor)
         self.input_min = None
         self.input_max = None
         self.output_min = None
@@ -291,6 +297,17 @@ class FNN:
             activation=activation,
             output_activation=output_activation
         )
+
+        # Apply output_range if provided at construction time
+        if output_range is not None:
+            if isinstance(output_range, (list, tuple)) and not isinstance(output_range[0], (list, tuple)):
+                n_out = layer_sizes[-1]
+                ymin = np.full(n_out, float(output_range[0]))
+                ymax = np.full(n_out, float(output_range[1]))
+            else:
+                ymin = np.array([r[0] for r in output_range], dtype=float)
+                ymax = np.array([r[1] for r in output_range], dtype=float)
+            self.set_output_range(ymin, ymax)
     
     def init(self, rng: jax.random.PRNGKey, dummy_input: jnp.ndarray = None) -> Dict:
         """Initialize network parameters."""

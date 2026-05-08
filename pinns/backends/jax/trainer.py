@@ -107,7 +107,7 @@ class Trainer(BaseTrainer):
         names = super()._get_bc_names()
         from pinns.problem_weak import ProblemWeak as _PW
         if isinstance(self.problem, _PW):
-            _hard = self.problem.hard_bc_names | self.problem._rollout_ic_bc_names
+            _hard = self.problem._rollout_ic_bc_names
             names = [n for n in names if n not in _hard]
         return names
 
@@ -168,11 +168,10 @@ class Trainer(BaseTrainer):
         # Only active when the user passes test_samples={'pde': N}.
         self._weak_test_loss = bool(_is_weak and _rts_n_nodes_test is not None)
 
-        # For ProblemWeak: remove hard-constrained BC data — output_transform
-        # satisfies them exactly so their soft loss is always zero.
+        # For ProblemWeak: rollout IC BCs are handled separately — no soft loss removal needed here.
         if _is_weak:
-            _hard = self.problem.hard_bc_names
-            for _k in _hard:
+            _rollout = self.problem._rollout_ic_bc_names
+            for _k in _rollout:
                 self._train_data.pop(_k, None)
                 self._train_targets.pop(_k, None)
                 if self._test_data:
@@ -501,6 +500,24 @@ class Trainer(BaseTrainer):
         
         return jax.vmap(single_grad_fwd)(x)
     
+    # ==================== Backend-specific helpers ====================
+
+    def _get_derivative_fn(self, params_dict=None):
+        """Return a derivative function for ProblemStrong metric computation.
+
+        Uses the current network parameters (non-JIT path for test loss etc.).
+        For JIT training, make_derivative_fn is called inline in compute_loss_strong.
+        """
+        from .functional import make_derivative_fn
+        network = self.network
+        params = network.params
+        _pd = params_dict
+
+        def _model_apply_metric(p, x):
+            return network.apply(p, x, _pd)
+
+        return make_derivative_fn(_model_apply_metric, params)
+
     # ==================== JIT Training Step ====================
     
     def _make_jit_train_step(self, weights, params_dict):
@@ -520,7 +537,8 @@ class Trainer(BaseTrainer):
 
         # ── Precompute PeriodicBC point arrays as JAX constants ──────────────
         # Periodic BCs use fixed mesh nodes — no sampling, no train_data lookup.
-        for bc in self.problem.domain.boundary_conditions:
+        _domain_bcs = getattr(getattr(self.problem, 'domain', None), 'boundary_conditions', [])
+        for bc in _domain_bcs:
             if isinstance(bc, PeriodicBC):
                 periodic_bcs.append({
                     'name':          bc.name,
@@ -534,7 +552,7 @@ class Trainer(BaseTrainer):
 
         # ── CubicPeriodicBC — sample pairs from domain at compile time ────────
         _n_out = len(self.problem.output_names) if (hasattr(self.problem, 'output_names') and self.problem.output_names) else getattr(self.problem, 'n_outputs', 1)
-        for bc in self.problem.domain.boundary_conditions:
+        for bc in _domain_bcs:
             if isinstance(bc, CubicPeriodicBC):
                 _rng = np.random.default_rng()
                 _pts_a = self.problem.domain.sample_boundary(bc.n_pairs, bc.dim, 0, rng=_rng)
@@ -554,10 +572,15 @@ class Trainer(BaseTrainer):
                     })
 
         from pinns.problem_weak import ProblemWeak as _ProblemWeak
-        _hard_bc_names = (self.problem.hard_bc_names
-                          if isinstance(self.problem, _ProblemWeak) else set())
+        _hard_bc_names = set()
+
+        # ProblemStrong terms are not legacy BCs — skip that loop entirely.
+        from pinns.problem import ProblemStrong as _PScheck
+        _problem_is_strong = isinstance(self.problem, _PScheck)
 
         for name in self._train_data.keys():
+            if _problem_is_strong:
+                break
             if name == 'pde':
                 continue
             # Hard-constrained BCs (ProblemWeak + output_transform) → skip soft loss
@@ -616,6 +639,63 @@ class Trainer(BaseTrainer):
         
         from pinns.problem_weak import ProblemWeak as _ProblemWeak
         _is_weak = isinstance(self.problem, _ProblemWeak)
+
+        # ── ProblemStrong: build inline JIT train step ────────────────────
+        from pinns.problem import ProblemStrong as _ProblemStrong
+        if isinstance(self.problem, _ProblemStrong):
+            _terms_strong = list(self.problem._terms)
+            _params_dict_s = params_dict
+            _weights_s = weights
+            _optim_s = self.optimizer
+            # Capture any network-level extra losses (e.g. X-PINN interface terms).
+            _net_losses = list(self.network.network_losses)
+
+            def _model_apply_s(params, x):
+                return self.network.apply(params, x, _params_dict_s)
+
+            def compute_loss_strong(params, train_data, targets_dict):
+                total_loss = jnp.array(0.0)
+                deriv_fn = make_derivative_fn(_model_apply_s, params)
+                for term in _terms_strong:
+                    if term.name not in train_data:
+                        continue
+                    x = train_data[term.name]
+                    u = _model_apply_s(params, x)
+                    if term.kind == 'points':
+                        output_col = term.output_idx if term.output_idx is not None else 0
+                        target = jnp.array(term.u_data, dtype=jnp.float32).flatten()
+                        residual = u[:, output_col] - target
+                    elif term.fn is not None and callable(term.fn):
+                        residual = term.fn(x, u, _params_dict_s, deriv_fn)
+                        if (term.eq_idx is not None
+                                and hasattr(residual, 'ndim') and residual.ndim == 2):
+                            residual = residual[:, term.eq_idx]
+                    elif term.fn is not None:
+                        output_col = term.output_idx if term.output_idx is not None else 0
+                        residual = u[:, output_col:output_col + 1] - float(term.fn)
+                    else:
+                        continue
+                    loss = jnp.mean(residual ** 2)
+                    w = _weights_s.get(term.name, 1.0)
+                    total_loss = total_loss + w * loss
+                # ── Network-level extra losses (architecture-driven) ──────
+                for nloss in _net_losses:
+                    x_nl = nloss.x if nloss.x is not None else train_data.get('pde')
+                    if x_nl is not None:
+                        nl_val = nloss.fn(params, x_nl)
+                        w_nl = _weights_s.get(nloss.name, nloss.weight)
+                        total_loss = total_loss + w_nl * nl_val
+                return total_loss
+
+            @jax.jit
+            def train_step_strong(params, opt_state, train_data, targets_dict):
+                loss, grads = jax.value_and_grad(compute_loss_strong)(
+                    params, train_data, targets_dict)
+                updates, new_opt_state = _optim_s.update(grads, opt_state, params)
+                new_params = optax.apply_updates(params, updates)
+                return new_params, new_opt_state, loss
+
+            return train_step_strong, True, False
 
         model_apply = self.network.apply
         pde_fn = None if _is_weak else self.problem.pde_fn
@@ -1220,8 +1300,8 @@ class Trainer(BaseTrainer):
         """Override to include weak-form PDE residual in metrics for ProblemWeak."""
         from pinns.problem_weak import ProblemWeak as _ProblemWeak
         if isinstance(self.problem, _ProblemWeak) and hasattr(self, '_weak_loss_fn'):
-            # Strip 'pde' and hard-constrained BCs (output_transform satisfies them exactly)
-            _hard = self.problem.hard_bc_names
+            # Strip 'pde' from soft BC data
+            _hard = set()
             bc_data = {k: v for k, v in data.items() if k != 'pde' and k not in _hard}
             total_loss, losses = super()._compute_total_loss(bc_data, params_dict, weights_dict)
             # Add weak PDE residual — always use full-batch loss fn for metrics
@@ -1245,11 +1325,8 @@ class Trainer(BaseTrainer):
         import numpy as _np
         from pinns.problem_weak import ProblemWeak as _ProblemWeak
         if isinstance(self.problem, _ProblemWeak) and hasattr(self, '_weak_loss_fn'):
-            # Strip 'pde', hard-constrained BCs, and internal '_'-prefixed keys.
-            # Hard BCs are satisfied exactly by output_transform; internal keys
-            # (_node_idx, _t_vals, etc.) are not BC data and must not be forwarded
-            # to the base class (which would produce float(None) on an empty loop).
-            _hard = self.problem.hard_bc_names
+            # Strip 'pde', and internal '_'-prefixed keys.
+            _hard = set()
             bc_data = {k: v for k, v in data.items()
                        if k != 'pde' and k not in _hard and not k.startswith('_')}
             if bc_data:
@@ -1506,7 +1583,7 @@ class Trainer(BaseTrainer):
             bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde' and not name.startswith('_')]
             self.history['loss_bcs'].append(bc_losses)
             
-            if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
+            if (any(v > 0 for v in (self.test_samples.values() if isinstance(self.test_samples, dict) else self.test_samples)) and self._test_data) or getattr(self, '_weak_test_loss', False):
                 _tw_data = self._test_data if self._test_data else {}
                 test_weights = {k: 1.0 for k in _tw_data.keys()}
                 test_total, _ = self._compute_total_loss_batched(
@@ -1574,7 +1651,7 @@ class Trainer(BaseTrainer):
                 else:
                     # Slow: full resampling
                     self._sample_train_data()
-                    if any(s > 0 for s in self.test_samples):
+                    if any(v > 0 for v in (self.test_samples.values() if isinstance(self.test_samples, dict) else self.test_samples)):
                         self._sample_test_data()
             
             # Adaptive resampling based on residuals
@@ -1722,7 +1799,7 @@ class Trainer(BaseTrainer):
                 self.history['loss_bcs'].append(bc_losses)
                 
                 # Test loss (if test data available)
-                if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
+                if (any(v > 0 for v in (self.test_samples.values() if isinstance(self.test_samples, dict) else self.test_samples)) and self._test_data) or getattr(self, '_weak_test_loss', False):
                     _tw_data = self._test_data if self._test_data else {}
                     test_weights = {k: 1.0 for k in _tw_data.keys()}
                     test_total, _ = self._compute_total_loss_batched(
@@ -1883,7 +1960,7 @@ class Trainer(BaseTrainer):
             bc_losses = [float(individual_losses.get(name, 0.0)) for name in self._train_data.keys() if name != 'pde' and not name.startswith('_')]
             self.history['loss_bcs'].append(bc_losses)
             
-            if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
+            if (any(v > 0 for v in (self.test_samples.values() if isinstance(self.test_samples, dict) else self.test_samples)) and self._test_data) or getattr(self, '_weak_test_loss', False):
                 _tw_data = self._test_data if self._test_data else {}
                 test_weights = {k: 1.0 for k in _tw_data.keys()}
                 test_total, _ = self._compute_total_loss_batched(
@@ -1938,7 +2015,7 @@ class Trainer(BaseTrainer):
                 self.history['loss_bcs'].append(bc_losses)
                 
                 # Test loss
-                if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
+                if (any(v > 0 for v in (self.test_samples.values() if isinstance(self.test_samples, dict) else self.test_samples)) and self._test_data) or getattr(self, '_weak_test_loss', False):
                     _tw_data = self._test_data if self._test_data else {}
                     test_weights = {k: 1.0 for k in _tw_data.keys()}
                     test_total, _ = self._compute_total_loss_batched(
@@ -2000,8 +2077,7 @@ class Trainer(BaseTrainer):
         bc_names = self._get_soft_bc_names()
 
         from pinns.problem_weak import ProblemWeak as _ProblemWeak
-        _hard_bc_names_lbfgs = (self.problem.hard_bc_names
-                                 if isinstance(self.problem, _ProblemWeak) else set())
+        _hard_bc_names_lbfgs = set()
         
         # Get precomputed targets for callable BCs
         train_targets = getattr(self, '_train_targets', {})
@@ -2012,7 +2088,7 @@ class Trainer(BaseTrainer):
         except ImportError:
             _periodic_types5 = ()
         _bc_name_idx5 = 0
-        for i, bc in enumerate(self.problem.boundary_conditions):
+        for i, bc in enumerate(getattr(self.problem, 'boundary_conditions', [])):
             from pinns.boundary import DirichletBC, NeumannBC, RobinBC, MeshNodeBC
             if _periodic_types5 and isinstance(bc, _periodic_types5):
                 continue
@@ -2060,7 +2136,46 @@ class Trainer(BaseTrainer):
                     neumann_bcs.append(bc_data)
             else:
                 dirichlet_bcs.append(bc_data)
-        
+
+        # ── ProblemStrong: build L-BFGS loss fn inline ────────────────────
+        from pinns.problem import ProblemStrong as _ProblemStrongLBFGS
+        if isinstance(self.problem, _ProblemStrongLBFGS):
+            _terms_lbfgs = list(self.problem._terms)
+            _params_dict_l = params_dict
+            _weights_l = weights
+
+            def _model_apply_l(params, x):
+                return self.network.apply(params, x, _params_dict_l)
+
+            def compute_loss_strong_lbfgs(params, train_data):
+                total_loss = jnp.array(0.0)
+                deriv_fn = make_derivative_fn(_model_apply_l, params)
+                for term in _terms_lbfgs:
+                    if term.name not in train_data:
+                        continue
+                    x = train_data[term.name]
+                    u = _model_apply_l(params, x)
+                    if term.kind == 'points':
+                        output_col = term.output_idx if term.output_idx is not None else 0
+                        target = jnp.array(term.u_data, dtype=jnp.float32).flatten()
+                        residual = u[:, output_col] - target
+                    elif term.fn is not None and callable(term.fn):
+                        residual = term.fn(x, u, _params_dict_l, deriv_fn)
+                        if (term.eq_idx is not None
+                                and hasattr(residual, 'ndim') and residual.ndim == 2):
+                            residual = residual[:, term.eq_idx]
+                    elif term.fn is not None:
+                        output_col = term.output_idx if term.output_idx is not None else 0
+                        residual = u[:, output_col:output_col + 1] - float(term.fn)
+                    else:
+                        continue
+                    loss = jnp.mean(residual ** 2)
+                    w = _weights_l.get(term.name, 1.0)
+                    total_loss = total_loss + w * loss
+                return total_loss
+
+            return compute_loss_strong_lbfgs
+
         pde_fn = self.problem.pde_fn
         pde_weight = weights.get('pde', 1.0)
         
@@ -2243,7 +2358,7 @@ def _initialize_lagrange_multipliers_impl(self):
     except ImportError:
         _periodic_types_L = ()
     _n_out_L = len(self.problem.output_names) if (hasattr(self.problem, 'output_names') and self.problem.output_names) else getattr(self.problem, 'n_outputs', 1)
-    for bc in self.problem.domain.boundary_conditions:
+    for bc in getattr(getattr(self.problem, 'domain', None), 'boundary_conditions', []):
         if not (_periodic_types_L and isinstance(bc, _periodic_types_L)):
             continue
         _comps_L = [bc.component] if bc.component is not None else list(range(_n_out_L))
@@ -2384,7 +2499,7 @@ def _make_al_loss_fn_impl(self, params_dict):
     _periodic_al_entries = []  # list of dicts with x_a, x_b, name, component, dim, match_deriv
     _n_out_al = len(self.problem.output_names) if (hasattr(self.problem, 'output_names') and self.problem.output_names) else getattr(self.problem, 'n_outputs', 1)
     import numpy as _np_al
-    for bc in self.problem.domain.boundary_conditions:
+    for bc in getattr(getattr(self.problem, 'domain', None), 'boundary_conditions', []):
         if not (_periodic_types4 and isinstance(bc, _periodic_types4)):
             continue
         if hasattr(bc, 'n_pairs'):  # CubicPeriodicBC
@@ -2411,7 +2526,7 @@ def _make_al_loss_fn_impl(self, params_dict):
                 'match_deriv': getattr(bc, 'match_x_derivative', False),
             })
     name_idx = 0
-    for i, bc in enumerate(self.problem.boundary_conditions):
+    for i, bc in enumerate(getattr(self.problem, 'boundary_conditions', [])):
         if _periodic_types4 and isinstance(bc, _periodic_types4):
             continue
         name = bc_names[name_idx]
@@ -2441,6 +2556,14 @@ def _make_al_loss_fn_impl(self, params_dict):
                 normal_dim, normal_sign = bc.get_normal_direction()
                 bc_info[name]['normal_dim'] = normal_dim
                 bc_info[name]['normal_sign'] = normal_sign
+
+    # ── ProblemStrong: AL mode not supported; raise clear error ───────────
+    from pinns.problem import ProblemStrong as _ProblemStrongAL
+    if isinstance(self.problem, _ProblemStrongAL):
+        raise NotImplementedError(
+            "Lagrangian/AL training mode is not supported for ProblemStrong. "
+            "Use standard Adam / L-BFGS training instead."
+        )
 
     pde_fn = self.problem.pde_fn
     network = self.network
@@ -2621,7 +2744,7 @@ def _train_lagrangian_mode_impl(self):
         self.history['train_loss'].append(mse0)
         self.history['loss_pde'].append([pde_mse0])
         self.history['loss_bcs'].append(bc_mse0)
-        if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
+        if (any(v > 0 for v in (self.test_samples.values() if isinstance(self.test_samples, dict) else self.test_samples)) and self._test_data) or getattr(self, '_weak_test_loss', False):
             metrics_batch_size = self._batch_size if self._batch_size and self._batch_size > 0 else 1000
             _tw_data0 = self._test_data if self._test_data else {}
             test_weights0 = {k: 1.0 for k in _tw_data0.keys()}
@@ -2679,7 +2802,7 @@ def _train_lagrangian_mode_impl(self):
             self.history.setdefault('al_bcs_lagrangian', []).append([float(losses.get(f'{name}_lagrangian', 0.0)) for name in bc_names])
             self.history['loss_pde'].append([pde_mse])
             self.history['loss_bcs'].append(bc_mse_losses)
-            if (any(s > 0 for s in self.test_samples) and self._test_data) or getattr(self, '_weak_test_loss', False):
+            if (any(v > 0 for v in (self.test_samples.values() if isinstance(self.test_samples, dict) else self.test_samples)) and self._test_data) or getattr(self, '_weak_test_loss', False):
                 metrics_batch_size = self._batch_size if self._batch_size and self._batch_size > 0 else 1000
                 _tw_data = self._test_data if self._test_data else {}
                 test_weights = {k: 1.0 for k in _tw_data.keys()}

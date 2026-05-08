@@ -272,6 +272,11 @@ class Trainer(BaseTrainer):
     def _mean_squared(self, tensor):
         """Compute mean squared value of a PyTorch tensor."""
         return torch.mean(tensor ** 2)
+
+    def _get_derivative_fn(self, params_dict=None):
+        """Return the PyTorch autodiff derivative helper for use in ProblemStrong term.fn."""
+        from pinns.backends.torch.functional import derivative
+        return derivative
     
     def _compute_directional_derivative(self, x, component: int, dim: int, params_dict):
         """Compute derivative of y[component] w.r.t. x[dim] using PyTorch autograd."""
@@ -385,7 +390,8 @@ class Trainer(BaseTrainer):
             bcs = [to_float(individual_losses.get(name, 0.0)) for name in bc_names]
             self.history['loss_bcs'].append(bcs)
             
-            if any(s > 0 for s in self.test_samples) and self._test_data:
+            _ts0 = self.test_samples
+            if any(v > 0 for v in (_ts0.values() if isinstance(_ts0, dict) else _ts0)) and self._test_data:
                 test_weights = {k: 1.0 for k in self._test_data.keys()}
                 test_total, _ = self._compute_total_loss_batched(
                     self._test_data, params_dict_init, test_weights, batch_size=metrics_batch_size
@@ -434,7 +440,8 @@ class Trainer(BaseTrainer):
                 else:
                     # Slow: full resampling
                     self._sample_train_data()
-                    if any(s > 0 for s in self.test_samples):
+                    _ts1 = self.test_samples
+                    if any(v > 0 for v in (_ts1.values() if isinstance(_ts1, dict) else _ts1)):
                         self._sample_test_data()
             
             # Adaptive resampling based on residuals
@@ -517,7 +524,8 @@ class Trainer(BaseTrainer):
             
             # Print progress
             if print_each > 0 and ((epoch + 1) % print_each == 0 or local_epoch == epochs - 1):
-                if any(s > 0 for s in self.test_samples) and self._test_data:
+                _ts2 = self.test_samples
+                if any(v > 0 for v in (_ts2.values() if isinstance(_ts2, dict) else _ts2)) and self._test_data:
                     # Batched test loss to avoid OOM
                     test_weights = {k: 1.0 for k in self._test_data.keys()}
                     test_total, _ = self._compute_total_loss_batched(
@@ -816,12 +824,29 @@ class _LagrangianTrainerInternal(Trainer):
         
         # BC residuals
         bc_names = self._get_bc_names()
-        for i, bc in enumerate(self.problem.boundary_conditions):
-            name = bc_names[i]
-            if name in data:
-                x_bc = data[name]
-                bc_residual = self._compute_bc_residual(bc, x_bc, params_dict)
-                residuals[name] = bc_residual.flatten()
+        from pinns.problem import ProblemStrong as _PSccr
+        if isinstance(self.problem, _PSccr):
+            # ProblemStrong: use terms not boundary_conditions
+            derivative_fn = self._get_derivative_fn()
+            for term in self.problem._terms:
+                if term.name in data and term.name != 'pde':
+                    x_bc = data[term.name]
+                    y = self.network.forward(x_bc, params_dict)
+                    if term.fn is not None and callable(term.fn):
+                        res = term.fn(x_bc, y, params_dict, derivative_fn)
+                        if term.eq_idx is not None and res.dim() == 2:
+                            res = res[:, term.eq_idx]
+                    else:
+                        out_col = term.output_idx or 0
+                        res = y[:, out_col:out_col + 1] - float(term.rhs if term.rhs is not None else term.fn)
+                    residuals[term.name] = res.flatten()
+        else:
+            for i, bc in enumerate(self.problem.boundary_conditions):
+                name = bc_names[i]
+                if name in data:
+                    x_bc = data[name]
+                    bc_residual = self._compute_bc_residual(bc, x_bc, params_dict)
+                    residuals[name] = bc_residual.flatten()
         
         return residuals
     
@@ -1137,7 +1162,8 @@ class _LagrangianTrainerInternal(Trainer):
             self.history['al_bcs_penalty'].append(bc_penalty_init)
             self.history['al_bcs_lagrangian'].append(bc_lagrangian_init)
             
-            if any(s > 0 for s in self.test_samples) and self._test_data:
+            _ts3 = self.test_samples
+            if any(v > 0 for v in (_ts3.values() if isinstance(_ts3, dict) else _ts3)) and self._test_data:
                 test_residuals = self._compute_constraint_residuals(self._test_data, params_dict_init)
                 test_mse = sum(torch.mean(g ** 2) for g in test_residuals.values())
                 self.history['test_loss'].append(to_float(test_mse))
@@ -1245,7 +1271,8 @@ class _LagrangianTrainerInternal(Trainer):
             self.history['loss_bcs'].append(bc_mse_losses)
             
             if print_each > 0 and ((epoch + 1) % print_each == 0 or self._outer_epoch == epochs - 1):
-                if any(s > 0 for s in self.test_samples) and self._test_data:
+                _ts4 = self.test_samples
+                if any(v > 0 for v in (_ts4.values() if isinstance(_ts4, dict) else _ts4)) and self._test_data:
                     # Compute test MSE loss (without λ terms)
                     test_residuals = self._compute_constraint_residuals(self._test_data, params_dict)
                     test_mse = sum(torch.mean(g ** 2) for g in test_residuals.values())

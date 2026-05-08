@@ -306,21 +306,30 @@ class BaseTrainer(ABC):
         self._setup_network_normalization()
         
         # Training configuration defaults
-        try:
-            from pinns.boundary import PeriodicBC as _PBC2, CubicPeriodicBC as _CPBC2
-            _periodic_types2 = (_PBC2, _CPBC2)
-        except ImportError:
-            _periodic_types2 = ()
-        n_bcs = sum(1 for bc in problem.boundary_conditions if not isinstance(bc, _periodic_types2))
-        expected_len = 1 + n_bcs
-        # For weak-form problems the PDE residual is assembled via cubature,
-        # not by sampling interior collocation points.  Set the first entry
-        # (PDE samples) to 0 so no interior sampling is performed.
+        from pinns.problem import ProblemStrong as _ProblemStrong
         from pinns.problem_weak import ProblemWeak as _ProblemWeak
-        _pde_samples = 0 if isinstance(problem, _ProblemWeak) else 100
-        self.train_samples = [_pde_samples] + [10] * n_bcs
-        self.test_samples = [0] + [0] * n_bcs
-        self.weights = [1.0] * expected_len
+        if isinstance(problem, _ProblemStrong):
+            # ProblemStrong: derive defaults from registered terms
+            term_names = [t.name for t in problem._terms]
+            n_terms = len(term_names)
+            _pde_samples = 0  # compile() will set proper values via dict
+            self.train_samples = {t.name: (1000 if t.kind == 'inner' else 10)
+                                  for t in problem._terms}
+            self.test_samples  = {t.name: 0 for t in problem._terms}
+            self.weights       = {t.name: 1.0 for t in problem._terms}
+        else:
+            try:
+                from pinns.boundary import PeriodicBC as _PBC2, CubicPeriodicBC as _CPBC2
+                _periodic_types2 = (_PBC2, _CPBC2)
+            except ImportError:
+                _periodic_types2 = ()
+            n_bcs = sum(1 for bc in problem.boundary_conditions
+                        if not isinstance(bc, _periodic_types2))
+            expected_len = 1 + n_bcs
+            _pde_samples = 0 if isinstance(problem, _ProblemWeak) else 100
+            self.train_samples = [_pde_samples] + [10] * n_bcs
+            self.test_samples = [0] + [0] * n_bcs
+            self.weights = [1.0] * expected_len
         self.learning_rate = 1e-3
         self.optimizer_name = "adam"
         self.optimizer = None
@@ -361,22 +370,19 @@ class BaseTrainer(ABC):
             if getattr(self.network, 'normalize_input', True):
                 self.network.set_input_range(xmin, xmax)
         
-        # Set output range from problem definition (only if unnormalization is enabled)
+        # Set output range on the network — output_range is owned by the network,
+        # not the problem.  Only call set_output_range if the network has not
+        # already been configured (i.e. output_range_min is None / absent).
         if hasattr(self.network, 'set_output_range'):
             if getattr(self.network, 'unnormalize_output', True):
-                if self.problem.output_range is not None:
-                    output_range = self.problem.output_range
-                    if isinstance(output_range, list):
-                        ymin = np.array([r[0] if r is not None else -1.0 for r in output_range])
-                        ymax = np.array([r[1] if r is not None else 1.0 for r in output_range])
-                    else:
-                        ymin, ymax = output_range
-                        ymin = np.array([ymin] * self.problem.n_outputs)
-                        ymax = np.array([ymax] * self.problem.n_outputs)
-                else:
+                already_set = (
+                    getattr(self.network, 'output_range_min', None) is not None
+                    or getattr(self.network, 'output_min', None) is not None
+                )
+                if not already_set:
                     ymin = -np.ones(self.problem.n_outputs)
                     ymax = np.ones(self.problem.n_outputs)
-                self.network.set_output_range(ymin, ymax)
+                    self.network.set_output_range(ymin, ymax)
     
     # ==================== Abstract Methods ====================
     
@@ -408,7 +414,8 @@ class BaseTrainer(ABC):
         else:
             self._sample_train_data()
         
-        if any(s > 0 for s in self.test_samples):
+        _ts = self.test_samples
+        if any(v > 0 for v in (_ts.values() if isinstance(_ts, dict) else _ts)):
             self._sample_test_data()
     
     def _sample_pool_data(self, pool_multiplier: int):
@@ -752,9 +759,6 @@ class BaseTrainer(ABC):
                         "text_color": "white",
                     }
         """
-        n_bcs = len(self._get_bc_names())
-        expected_len = 1 + n_bcs
-        
         # Store L-BFGS parameters
         self._lbfgs_max_iter = lbfgs_max_iter
         self._lbfgs_history_size = lbfgs_history_size
@@ -765,31 +769,41 @@ class BaseTrainer(ABC):
         old_soap_params = getattr(self, '_soap_params', None)
         self._soap_params = soap_params if soap_params is not None else {}
         
-        if train_samples is not None:
-            train_samples = self._convert_dict_to_list(train_samples, 'train_samples')
-            if len(train_samples) != expected_len:
-                raise ValueError(
-                    f"train_samples must have {expected_len} elements "
-                    f"(1 interior + {n_bcs} BCs), got {len(train_samples)}"
-                )
-            self.train_samples = train_samples
-        
-        if test_samples is not None:
-            test_samples = self._convert_dict_to_list(test_samples, 'test_samples')
-            if len(test_samples) != expected_len:
-                raise ValueError(
-                    f"test_samples must have {expected_len} elements, got {len(test_samples)}"
-                )
-            self.test_samples = test_samples
-        
-        if weights is not None:
-            self._raw_weights_dict = weights if isinstance(weights, dict) else None
-            weights = self._convert_dict_to_list(weights, 'weights')
-            if len(weights) != expected_len:
-                raise ValueError(
-                    f"weights must have {expected_len} elements, got {len(weights)}"
-                )
-            self.weights = weights
+        from pinns.problem import ProblemStrong as _PScompile
+        if isinstance(self.problem, _PScompile):
+            # ProblemStrong: train_samples/weights/test_samples are plain dicts; no list conversion
+            if train_samples is not None:
+                self.train_samples = dict(train_samples) if isinstance(train_samples, dict) else train_samples
+            if test_samples is not None:
+                self.test_samples = dict(test_samples) if isinstance(test_samples, dict) else test_samples
+            if weights is not None:
+                self.weights = dict(weights) if isinstance(weights, dict) else weights
+        else:
+            n_bcs = len(self._get_bc_names())
+            expected_len = 1 + n_bcs
+            if train_samples is not None:
+                train_samples = self._convert_dict_to_list(train_samples, 'train_samples')
+                if len(train_samples) != expected_len:
+                    raise ValueError(
+                        f"train_samples must have {expected_len} elements "
+                        f"(1 interior + {n_bcs} BCs), got {len(train_samples)}"
+                    )
+                self.train_samples = train_samples
+            if test_samples is not None:
+                test_samples = self._convert_dict_to_list(test_samples, 'test_samples')
+                if len(test_samples) != expected_len:
+                    raise ValueError(
+                        f"test_samples must have {expected_len} elements, got {len(test_samples)}"
+                    )
+                self.test_samples = test_samples
+            if weights is not None:
+                self._raw_weights_dict = weights if isinstance(weights, dict) else None
+                weights = self._convert_dict_to_list(weights, 'weights')
+                if len(weights) != expected_len:
+                    raise ValueError(
+                        f"weights must have {expected_len} elements, got {len(weights)}"
+                    )
+                self.weights = weights
         
         optimizer_changed = False
         if optimizer is not None and optimizer.lower() != self.optimizer_name:
@@ -1218,6 +1232,10 @@ class BaseTrainer(ABC):
         Returns:
             Tuple of (total_loss, losses_dict)
         """
+        from pinns.problem import ProblemStrong as _PSctl
+        if isinstance(self.problem, _PSctl):
+            return self._compute_strong_total_loss(data, params_dict, weights_dict)
+
         total_loss = None
         losses = {}
         
@@ -1287,7 +1305,110 @@ class BaseTrainer(ABC):
                     total_loss = total_loss + weighted_bc_loss
         
         return total_loss, losses
-    
+
+    def _compute_strong_total_loss(self, data: Dict, params_dict: Dict[str, Any], weights_dict: Dict):
+        """
+        Compute total weighted loss for ProblemStrong problems.
+
+        Each registered term's residual is evaluated via ``term.fn(x, u, pars, derivative)``.
+        Structural BC terms (add_dirichlet, add_neumann) with no callable fn use
+        ``_compute_strong_bc_residual``.
+
+        Returns:
+            Tuple of (total_loss, losses_dict)
+        """
+        total_loss = None
+        losses = {'bcs': []}
+        derivative_fn = self._get_derivative_fn(params_dict)
+
+        for term in self.problem._terms:
+            if term.name not in data:
+                continue
+            x = data[term.name]
+            y = self.network.forward(x, params_dict)
+
+            if term.kind == 'points':
+                # Data-fitting term: minimise ||u_pred - u_data||^2
+                output_col = term.output_idx if term.output_idx is not None else 0
+                target = self._to_tensor(np.asarray(term.u_data).flatten())
+                residual = y[:, output_col] - target
+
+            elif term.fn is not None and callable(term.fn):
+                # User-provided physics residual: fn(x, u, pars, derivative)
+                residual = term.fn(x, y, params_dict, derivative_fn)
+                # Multi-equation functions: pick the relevant column
+                if term.eq_idx is not None:
+                    has_dim = hasattr(residual, 'dim')  # torch tensor
+                    has_ndim = hasattr(residual, 'ndim')  # numpy / jax
+                    if (has_dim and residual.dim() == 2) or (has_ndim and residual.ndim == 2):
+                        residual = residual[:, term.eq_idx]
+
+            elif term.fn is not None:
+                # fn is a constant target value (e.g., add_initial(1, ...))
+                output_col = term.output_idx if term.output_idx is not None else 0
+                residual = y[:, output_col:output_col + 1] - float(term.fn)
+
+            elif term.rhs is not None:
+                # Structural BC terms (add_dirichlet, add_neumann, add_robin)
+                residual = self._compute_strong_bc_residual(term, x, y, params_dict, derivative_fn)
+
+            else:
+                continue  # Periodic and other unsupported kinds: skip
+
+            loss = self._mean_squared(residual)
+            w = weights_dict.get(term.name, 1.0)
+            weighted = w * loss
+            losses[term.name] = weighted
+            losses['bcs'].append(weighted)
+
+            if total_loss is None:
+                total_loss = weighted
+            else:
+                total_loss = total_loss + weighted
+
+        return total_loss, losses
+
+    def _compute_strong_bc_residual(self, term, x, y, params_dict, derivative_fn):
+        """Compute residual for structural add_dirichlet / add_neumann / add_robin terms."""
+        output_col = term.output_idx if term.output_idx is not None else 0
+        u = y[:, output_col:output_col + 1]
+
+        if term.kind in ('dirichlet', 'initial'):
+            rhs = term.rhs
+            if callable(rhs):
+                target = rhs(x, params_dict)
+                if hasattr(target, 'dim') and target.dim() == 2:
+                    target = target[:, 0:1]
+                elif hasattr(target, 'ndim') and target.ndim == 2:
+                    target = target[:, 0:1]
+            else:
+                target = float(rhs)
+            return u - target
+
+        elif term.kind == 'neumann':
+            raise NotImplementedError(
+                f"Automatic Neumann residual for term '{term.name}' is not yet supported. "
+                "Use add_boundary() with a callable fn that calls derivative(u, x, ...) directly."
+            )
+        elif term.kind == 'robin':
+            raise NotImplementedError(
+                f"Automatic Robin residual for term '{term.name}' is not yet supported. "
+                "Use add_boundary() with a callable fn."
+            )
+        else:
+            raise ValueError(f"Unexpected kind '{term.kind}' in _compute_strong_bc_residual")
+
+    def _get_derivative_fn(self, params_dict=None):
+        """Return backend-specific derivative function for use in ProblemStrong term.fn calls.
+
+        Args:
+            params_dict: Optional physics params dict to pass to the model apply function
+                         (e.g. for output transforms / scaling).
+
+        Subclasses must implement this to return the correct autodiff helper.
+        """
+        raise NotImplementedError("_get_derivative_fn must be implemented by the backend Trainer subclass.")
+
     def _compute_total_loss_batched(self, data: Dict, params_dict: Dict[str, Any], 
                                      weights_dict: Dict, batch_size: int = 1000):
         """
@@ -1455,7 +1576,10 @@ class BaseTrainer(ABC):
     # ==================== Sampling Methods ====================
     
     def _get_bc_by_name(self, name: str):
-        """Get boundary condition by name."""
+        """Get boundary condition (or ProblemStrong term) by name."""
+        from pinns.problem import ProblemStrong as _PSbc2
+        if isinstance(self.problem, _PSbc2):
+            return next((t for t in self.problem._terms if t.name == name), None)
         for bc in self.problem.boundary_conditions:
             if hasattr(bc, 'name') and bc.name == name:
                 return bc
@@ -1538,6 +1662,9 @@ class BaseTrainer(ABC):
     
     def _sample_points_np(self, name: str, n_samples: int) -> np.ndarray:
         """Sample points for a given loss term (returns numpy)."""
+        from pinns.problem import ProblemStrong as _PSsp
+        if isinstance(self.problem, _PSsp):
+            return self._sample_strong_term_np(name, n_samples)
         if name == 'pde':
             return self._sample_interior_np(n_samples)
         else:
@@ -1546,17 +1673,46 @@ class BaseTrainer(ABC):
                 return self._sample_boundary_np(bc, n_samples)
             else:
                 raise ValueError(f"Unknown loss term: {name}")
+
+    def _sample_strong_term_np(self, name: str, n_samples: int) -> np.ndarray:
+        """Sample points for a ProblemStrong residual term."""
+        term = next((t for t in self.problem._terms if t.name == name), None)
+        if term is None:
+            raise ValueError(f"Unknown ProblemStrong term: '{name}'")
+        if term.kind == 'points':
+            # Fixed observation points — return stored coordinates
+            return np.asarray(term.x_data)
+        params = self._build_params()
+        domain = self.problem.domain
+        region = None if term.region == 'all' else term.region
+        if term.kind == 'inner':
+            return domain.sample_interior(n_samples, region=region, rng=self.rng, params=params)
+        elif term.kind == 'initial':
+            # Sample full spatial domain at t = t_min
+            pts = domain.sample_interior(n_samples, rng=self.rng, params=params)
+            t_dim = getattr(domain, '_spatial_dims', 0)
+            if t_dim < pts.shape[1]:
+                pts[:, t_dim] = domain.xmin[t_dim]
+            return pts
+        elif term.kind in ('boundary', 'dirichlet', 'neumann', 'robin', 'periodic'):
+            return domain.sample_boundary(n_samples, region=region, rng=self.rng, params=params)
+        else:
+            raise ValueError(f"Unknown term kind: '{term.kind}' for term '{name}'")
     
-    def _list_to_dict_samples(self, samples_list: List[int]) -> Dict[str, int]:
-        """Convert list format samples to dict format."""
+    def _list_to_dict_samples(self, samples_list) -> Dict[str, int]:
+        """Convert list format samples to dict format. Dict input is returned as-is."""
+        if isinstance(samples_list, dict):
+            return samples_list
         bc_names = self._get_bc_names()
         result = {'pde': samples_list[0]}
         for i, name in enumerate(bc_names):
             result[name] = samples_list[i + 1]
         return result
     
-    def _list_to_dict_weights(self, weights_list: List[float]) -> Dict[str, float]:
-        """Convert list format weights to dict format."""
+    def _list_to_dict_weights(self, weights_list) -> Dict[str, float]:
+        """Convert list format weights to dict format. Dict input is returned as-is."""
+        if isinstance(weights_list, dict):
+            return weights_list
         bc_names = self._get_bc_names()
         result = {'pde': weights_list[0]}
         for i, name in enumerate(bc_names):
@@ -1603,6 +1759,8 @@ class BaseTrainer(ABC):
         
         Also precomputes target values for BCs with callable value functions.
         """
+        from pinns.problem import ProblemStrong as _PSsd
+        _is_strong = isinstance(self.problem, _PSsd)
         self._train_data = {}
         self._train_targets = {}  # Store precomputed target values
         samples_dict = self._list_to_dict_samples(self.train_samples)
@@ -1612,7 +1770,8 @@ class BaseTrainer(ABC):
                 self._train_data[name] = self._to_tensor(np_data)
                 
                 # Precompute target values for BCs with callable value functions
-                if name != 'pde':
+                # (old Problem API only; ProblemStrong computes residuals via term.fn)
+                if not _is_strong and name != 'pde':
                     bc = self._get_bc_by_name(name)
                     if bc is not None and hasattr(bc, 'value') and callable(bc.value):
                         target_np = bc.value(np_data)
@@ -1626,6 +1785,8 @@ class BaseTrainer(ABC):
     
     def _sample_test_data(self):
         """Sample test data and store as backend tensors."""
+        from pinns.problem import ProblemStrong as _PSstd
+        _is_strong = isinstance(self.problem, _PSstd)
         self._test_data = {}
         self._test_targets = {}  # Store precomputed target values
         samples_dict = self._list_to_dict_samples(self.test_samples)
@@ -1635,7 +1796,8 @@ class BaseTrainer(ABC):
                 self._test_data[name] = self._to_tensor(np_data)
                 
                 # Precompute target values for BCs with callable value functions
-                if name != 'pde':
+                # (old Problem API only; ProblemStrong computes residuals via term.fn)
+                if not _is_strong and name != 'pde':
                     bc = self._get_bc_by_name(name)
                     if bc is not None and hasattr(bc, 'value') and callable(bc.value):
                         target_np = bc.value(np_data)
@@ -1675,7 +1837,10 @@ class BaseTrainer(ABC):
     # ==================== Utility Methods ====================
 
     def _get_bc_names(self) -> List[str]:
-        """Get list of boundary condition names (excluding periodic BCs)."""
+        """Get list of boundary condition / term names."""
+        from pinns.problem import ProblemStrong as _PSbc
+        if isinstance(self.problem, _PSbc):
+            return [t.name for t in self.problem._terms]
         try:
             from pinns.boundary import PeriodicBC as _PBC, CubicPeriodicBC as _CPBC
             _periodic_types = (_PBC, _CPBC)
@@ -1718,8 +1883,13 @@ class BaseTrainer(ABC):
         """
         if internal is None:
             internal = {'global_step': self._global_epoch, 'step': 0}
+        from pinns.problem import ProblemStrong as _PSbp
+        if isinstance(self.problem, _PSbp):
+            fixed = self.problem.fixed_params
+        else:
+            fixed = self.problem.params
         return {
-            "fixed": self.problem.params,
+            "fixed": fixed,
             "infer": {},  # Reserved for future inverse problem support
             "internal": internal
         }
@@ -1770,12 +1940,23 @@ class BaseTrainer(ABC):
         Returns a diverging colormap if the output range is symmetric
         around zero, otherwise returns 'inferno'.
         """
-        if self.problem.output_range is None:
+        def _first_not_none(*attrs):
+            for a in attrs:
+                if a is not None:
+                    return a
+            return None
+        rmin = _first_not_none(getattr(self.network, 'output_range_min', None),
+                               getattr(self.network, 'output_min', None))
+        rmax = _first_not_none(getattr(self.network, 'output_range_max', None),
+                               getattr(self.network, 'output_max', None))
+        if rmin is None or rmax is None:
             return 'inferno'
-        elif self.problem.output_range[output_idx][0] == -self.problem.output_range[output_idx][1]:
-            return 'managua_r'
-        else:
-            return 'inferno'
+        try:
+            if rmin[output_idx] == -rmax[output_idx]:
+                return 'managua_r'
+        except (IndexError, TypeError):
+            pass
+        return 'inferno'
     
     def reset(self):
         """
@@ -2719,7 +2900,7 @@ class BaseTrainer(ABC):
         self._apply_plot_style(fig, axes)
         fig.tight_layout()
     
-    def plot_progress(self, save_path=None, n_points=200, fig=None, axes=None, display_handle=None):
+    def plot_progress(self, save_path=None, n_points=200, fig=None, axes=None, display_handle=None, **kwargs):
         """
         Generate a figure with loss curves and solution plots.
         

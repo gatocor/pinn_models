@@ -188,7 +188,7 @@ class FNN(nn.Module):
     def __init__(self, layer_sizes, activation='tanh', output_activation=None,
                  normalize_input=True, unnormalize_output=True, 
                  input_transform=None, output_transform=None, 
-                 feature_encoding=None, seed=None):
+                 feature_encoding=None, output_range=None, seed=None):
         super(FNN, self).__init__()
         
         if len(layer_sizes) < 2:
@@ -208,7 +208,7 @@ class FNN(nn.Module):
         self.register_buffer('input_min', None)
         self.register_buffer('input_max', None)
         
-        # Output unnormalization parameters (set by Trainer)
+        # Output unnormalization parameters (set by Trainer or constructor)
         self.register_buffer('output_min', None)
         self.register_buffer('output_max', None)
         
@@ -221,6 +221,21 @@ class FNN(nn.Module):
         
         # Initialize weights
         self._initialize_weights()
+
+        # Apply output_range if provided at construction time
+        if output_range is not None:
+            import numpy as _np
+            if isinstance(output_range, (list, tuple)) and not isinstance(output_range[0], (list, tuple)):
+                # Single (ymin, ymax) pair — broadcast to all outputs
+                n_out = layer_sizes[-1]
+                ymin = _np.full(n_out, float(output_range[0]))
+                ymax = _np.full(n_out, float(output_range[1]))
+            else:
+                # List of (ymin, ymax) per output
+                ymin = _np.array([r[0] for r in output_range], dtype=float)
+                ymax = _np.array([r[1] for r in output_range], dtype=float)
+            self.output_min = torch.as_tensor(ymin, dtype=torch.float32)
+            self.output_max = torch.as_tensor(ymax, dtype=torch.float32)
     
     def set_input_range(self, xmin, xmax):
         """Set input normalization range. Called by Trainer."""

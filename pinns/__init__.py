@@ -1,25 +1,18 @@
 """
 PINNS - Physics-Informed Neural Networks
 
-A multi-backend library for Physics-Informed Neural Networks (PINN) 
+A JAX-based library for Physics-Informed Neural Networks (PINN) 
 and Finite Basis PINN (FBPINN).
 
-Supported backends:
-- 'torch' (default): PyTorch-based implementation
-- 'jax': JAX/Flax/Optax-based implementation
+Default backend: 'jax' (JAX/Flax/Optax)
 
 Usage:
     import pinns
-    pinns.use_backend('jax')  # or 'torch'
-    
-Or via environment variable (before import):
-    import os
-    os.environ['PINNS_BACKEND'] = 'jax'
-    import pinns
 
-Or use backend-specific imports:
-    from pinns.backends.torch import FNN, FBPINN, Trainer
-    from pinns.backends.jax import FNN, FBPINN, Trainer
+Or override via environment variable:
+    import os
+    os.environ['PINNS_BACKEND'] = 'torch'
+    import pinns
 """
 
 __version__ = "0.1.0"
@@ -27,17 +20,22 @@ __version__ = "0.1.0"
 import os
 import sys
 
-# Backend selection - default from environment or 'torch'
-_BACKEND = os.environ.get('PINNS_BACKEND', 'torch').lower()
+# Backend selection - default from environment or 'jax'
+_BACKEND = os.environ.get('PINNS_BACKEND', 'jax').lower()
 
 # Storage for current backend classes
 _backend_classes = {}
 
 # Domain and Problem are backend-agnostic
 from .domain import DomainCubic, DomainMesh, SubdomainInfo, bump
-from .problem import Problem
+from .strategies import StrategyUnique, StrategyFB, StrategyX, StrategyStep, register_interface_loss
+from .problem import Problem, ProblemStrong
 from .problem_weak import ProblemWeak
 from . import meshes
+from . import base_models
+from . import layers
+from . import network
+from .network import Network, NetworkLoss
 
 # JAX-only mesh networks (always available if JAX is installed)
 try:
@@ -156,6 +154,8 @@ __all__ = [
     "get_backend",
     # Meshes
     "meshes",
+    # Base network models
+    "base_models",
     # Domain (backend-agnostic)
     "DomainCubic",
     "DomainMesh",
@@ -169,8 +169,18 @@ __all__ = [
     "FBPINN",
     "FourierFeatures",
     "RWFLayer",
+    # Composable network
+    "Network",
+    "NetworkLoss",
+    # Strategies
+    "StrategyUnique",
+    "StrategyFB",
+    "StrategyX",
+    "StrategyStep",
+    "register_interface_loss",
     # Problems
     "Problem",
+    "ProblemStrong",
     "ProblemWeak",
     # JAX-only mesh GNN
     "GNNMeshNetwork",

@@ -603,7 +603,7 @@ class ProblemWeak:
         Arguments (all JAX arrays):
           - ``x``          (n_pts, 2)       – quadrature point positions
           - ``y``          (n_pts, n_out)   – network output (same layout as strong form)
-          - ``params``     dict             – ``{fixed, infer, internal}`` (same as strong form)
+          - ``params``     dict             – ``{fixed, infer, internal, dependencies}`` (same as strong form)
           - ``phi``        (n_pts,)         – test function :math:`\varphi_j` values
           - ``grad_phi``   (n_pts, 2)       – :math:`\nabla\varphi_j` in physical coords
           - ``derivative`` callable or None – ``derivative(y, x, comp, order)`` (same API as
@@ -680,8 +680,7 @@ class ProblemWeak:
     obs_spatial: Optional[List[str]] = field(default=None)
     n_time_points: Optional[int] = None
     n_time_steps: Optional[int] = None
-    hard_constraints: Union[bool, List[str]] = True
-    ic_transition: Union[str, 'Callable'] = "tanh"
+    strategy: Optional[Any] = None
 
     # ── filled by __post_init__ ──────────────────────────────────────────
     cubature_data:    Dict       = field(init=False, default_factory=dict)
@@ -699,6 +698,16 @@ class ProblemWeak:
                 "ProblemWeak requires a DomainMesh domain; "
                 f"got {type(self.domain).__name__}."
             )
+
+        # ── Strategy setup ─────────────────────────────────────────────
+        if self.strategy is not None:
+            from .strategies import _STRATEGIES
+            if not isinstance(self.strategy, _STRATEGIES):
+                raise TypeError(
+                    f"strategy must be a StrategyBase, StrategyFB, StrategyX, or "
+                    f"StrategyStep instance, got {type(self.strategy).__name__!r}."
+                )
+            self.strategy.setup(self.domain)
 
         # ── Auto-populate from domain time mode ──────────────────────────────
         # Discrete time: read n_steps → n_time_steps
@@ -763,62 +772,11 @@ class ProblemWeak:
         # pairs), we use that directly; otherwise we fall back to distance
         # matching of the supplied node_positions.
 
-        dirichlet_vertex_set: set = set()
-
-        # Pass 1 — vertex DOFs
-        # Use hard_spatial_bc_names: groups collectively covering [t_min, t_max].
-        # IC BCs (hard via t-factorization, not FEM DOF removal) are excluded.
-        _hard_names_d = self.hard_spatial_bc_names
-        for bc in self.boundary_conditions:
-            if isinstance(bc, MeshNodeBC) and bc.bc_type == "dirichlet":
-                if getattr(bc, 'name', None) not in _hard_names_d:
-                    continue   # not a hard-constrained spatial BC — keep as soft
-                if bc.node_indices is not None:
-                    for ni in bc.node_indices:
-                        dirichlet_vertex_set.add(int(ni))
-                elif bc.edges is not None:
-                    for i0, i1 in bc.edges:
-                        dirichlet_vertex_set.add(int(i0))
-                        dirichlet_vertex_set.add(int(i1))
-                else:
-                    for xy in bc.node_positions:
-                        dists = np.linalg.norm(verts - xy, axis=1)
-                        dirichlet_vertex_set.add(int(np.argmin(dists)))
-
-        dirichlet_set = set(dirichlet_vertex_set)
-
-        # Pass 2 — edge interior DOFs for strong Dirichlet (N ≥ 2)
-        if self.lagrange_order >= 2:
-            for bc in self.boundary_conditions:
-                if isinstance(bc, MeshNodeBC) and bc.bc_type == "dirichlet":
-                    if getattr(bc, 'name', None) not in _hard_names_d:
-                        continue   # not a hard-constrained spatial BC — soft only
-                    if bc.node_indices is not None:
-                        for ni in bc.node_indices:
-                            # find edge DOFs adjacent to this vertex
-                            for key, dofs in edge_to_dofs.items():
-                                if int(ni) in key:
-                                    for idx in dofs:
-                                        dirichlet_set.add(idx)
-                    elif bc.edges is not None:
-                        for i0, i1 in bc.edges:
-                            key = (min(int(i0), int(i1)), max(int(i0), int(i1)))
-                            if key in edge_to_dofs:
-                                for idx in edge_to_dofs[key]:
-                                    dirichlet_set.add(idx)
-                    else:
-                        for dof_idx in range(len(verts), n_dofs):
-                            pos = dof_coords[dof_idx]
-                            dists = np.linalg.norm(verts - pos, axis=1)
-                            nn_v = int(np.argmin(dists))
-                            if nn_v in dirichlet_vertex_set:
-                                dirichlet_set.add(dof_idx)
-
+        # All nodes are free — Dirichlet BCs are enforced via soft loss or Lifting layer.
         all_dofs = np.arange(n_dofs, dtype=np.int64)
-        self.dirichlet_nodes = np.array(sorted(dirichlet_set), dtype=np.int64)
+        self.dirichlet_nodes = np.array([], dtype=np.int64)
         free_mask = np.ones(n_dofs, dtype=bool)
-        free_mask[self.dirichlet_nodes] = False
-        self.free_nodes = all_dofs[free_mask]
+        self.free_nodes = all_dofs
 
         # ── Split free nodes into inner and boundary ──────────────────────────
         # Boundary free nodes: any free node appearing on a non-Dirichlet BC edge
@@ -839,44 +797,6 @@ class ProblemWeak:
 
         # Store free_mask in cubature_data for easy access
         self.cubature_data['free_mask'] = free_mask
-
-        # ── Hard-constraint BC mask ───────────────────────────────────────────
-        # Build nodal bc_mask / bc_values from 'all'-time Dirichlet BCs.
-        # Exposed via self.output_transform as a callable for use as
-        # output_transform in any network (FNN, AlphaPINN, …).
-        n_out = len(self.output_names)
-        _bc_mask   = np.zeros((len(verts), n_out), dtype=np.float32)
-        _bc_values = np.zeros((len(verts), n_out), dtype=np.float32)
-        _hard_spatial = self.hard_spatial_bc_names
-        _hard_ic      = self.hard_ic_names
-        _ic_mask   = np.zeros((len(verts), n_out), dtype=np.float32)
-        _ic_values = np.zeros((len(verts), n_out), dtype=np.float32)
-        if _hard_spatial or _hard_ic:
-            for bc in self.boundary_conditions:
-                if not (isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet'):
-                    continue
-                bc_name = getattr(bc, 'name', None)
-                comp = getattr(bc, 'component', 0)
-                if comp >= n_out:
-                    continue
-                if bc.node_indices is not None:
-                    node_idx = bc.node_indices
-                elif bc.edges is not None:
-                    node_idx = np.unique(bc.edges)
-                else:
-                    continue
-                node_pos = verts[node_idx]
-                vals = bc.get_value(node_pos)
-                if bc_name in _hard_spatial:
-                    _bc_mask[node_idx, comp]   = 1.0
-                    _bc_values[node_idx, comp] = vals
-                elif bc_name in _hard_ic:
-                    _ic_mask[node_idx, comp]   = 1.0
-                    _ic_values[node_idx, comp] = vals
-        self._bc_mask_np   = _bc_mask
-        self._bc_values_np = _bc_values
-        self._ic_mask_np   = _ic_mask
-        self._ic_values_np = _ic_values
 
         # ── Nodal support volumes + boundary edge lengths ─────────────────────
         # For each node j we build a normaliser that makes R̂_j = R_j / norm_j
@@ -1139,46 +1059,6 @@ class ProblemWeak:
         return len(self.free_nodes)
 
     @staticmethod
-    def _make_ic_transition_fn(ic_transition):
-        """
-        Return a JAX-compatible callable ``f(t_shifted) -> factor`` where
-        ``t_shifted = t - t_min >= 0``.
-
-        Built-in options
-        ----------------
-        ``"tanh"`` *(default)*
-            ``jnp.tanh(t_shifted)`` — smooth ramp from 0 at ``t_min``,
-            quickly saturates.  Gradient is non-zero everywhere; preferred
-            for training stability.
-        ``"linear"``
-            ``t_shifted`` — plain linear envelope.  Equivalent to the
-            classic  ``u = u_IC + (t-t_min) * NN`` factorization.
-        Callable
-            Any differentiable function ``f(t_shifted: jnp.ndarray) -> jnp.ndarray``
-            of the same shape.  Must satisfy ``f(0) == 0`` for the IC to be
-            exactly satisfied at ``t = t_min``.
-
-        Example::
-
-            # Quadratic ramp
-            problem = ProblemWeak(
-                ...,
-                ic_transition=lambda t: t**2,
-            )
-        """
-        if callable(ic_transition):
-            return ic_transition
-        if ic_transition == "tanh":
-            import jax.numpy as _jnp
-            return lambda t: _jnp.tanh(t)
-        if ic_transition == "linear":
-            return lambda t: t
-        raise ValueError(
-            f"ic_transition must be 'tanh', 'linear', or a callable; "
-            f"got {ic_transition!r}."
-        )
-
-    @staticmethod
     def _bc_intervals_cover(windows, t0, t1, tol=1e-10) -> bool:
         """True when the union of *windows* (list of time_window lists) covers [t0, t1]."""
         if not windows:
@@ -1195,107 +1075,6 @@ class ProblemWeak:
                 return False
             cover = max(cover, hi)
         return cover >= t1 - tol
-
-    @property
-    def hard_spatial_bc_names(self) -> set:
-        """Names of **spatial** Dirichlet BCs that are hard-constrained.
-
-        These are full-time-coverage BCs (individually or collectively
-        covering ``[t_min, t_max]``) that are enforced via the network's
-        output mask-and-clamp transform.  They do NOT include IC BCs
-        (see :attr:`hard_ic_names`).
-        """
-        hc = self.hard_constraints
-        if hc is False or hc == []:
-            return set()
-
-        from .boundary import MeshNodeBC
-        from collections import defaultdict
-
-        t_min = getattr(self.domain, '_t_min', None)
-        t_max = getattr(self.domain, '_t_max', None)
-
-        # Group by (node-fingerprint, component), but only non-IC BCs
-        groups: dict = defaultdict(list)
-        for bc in self.boundary_conditions:
-            if not isinstance(bc, MeshNodeBC) or bc.bc_type != 'dirichlet':
-                continue
-            if getattr(bc, 'name', None) is None:
-                continue
-            # Skip point-time BCs (IC candidates)
-            tw = bc.time_window
-            if tw is not None:
-                pts = [float(v) for v in tw]
-                if len(pts) <= 2 and abs(pts[0] - pts[-1]) < 1e-10:
-                    continue   # point BC — belongs to IC category
-            ni = bc.node_indices
-            if ni is None:
-                continue
-            key = (tuple(sorted(ni.tolist())), bc.component)
-            groups[key].append(bc)
-
-        eligible: set = set()
-        for key, bcs in groups.items():
-            for bc in bcs:
-                if bc.is_full_time_coverage():
-                    eligible.add(bc.name)
-                    continue
-                if t_min is None or t_max is None:
-                    continue
-                windows = [b.time_window for b in bcs if b.time_window is not None]
-                if self._bc_intervals_cover(windows, t_min, t_max):
-                    eligible.add(bc.name)
-
-        if hc is True:
-            return eligible
-        return eligible & set(hc)
-
-    @property
-    def hard_ic_names(self) -> set:
-        """Names of **initial-condition** Dirichlet BCs that are hard-constrained.
-
-        These are point-time BCs at ``t = t_min`` enforced via the
-        ``u = u_IC(x) + (t - t_min) \\cdot \\text{NN}(x, t)`` factorization
-        in the network's output transform.  They are automatically detected
-        when ``hard_constraints=True`` or when their name is listed in
-        ``hard_constraints``.
-        """
-        hc = self.hard_constraints
-        if hc is False or hc == []:
-            return set()
-
-        t_min = getattr(self.domain, '_t_min', None)
-        if t_min is None:
-            return set()   # no time axis — ICs don't apply
-
-        from .boundary import MeshNodeBC
-        eligible: set = set()
-        for bc in self.boundary_conditions:
-            if not isinstance(bc, MeshNodeBC) or bc.bc_type != 'dirichlet':
-                continue
-            name = getattr(bc, 'name', None)
-            if name is None:
-                continue
-            tw = bc.time_window
-            if tw is None:
-                continue
-            pts = [float(v) for v in tw]
-            # IC = point BC at t_min
-            if len(pts) <= 2 and abs(pts[0] - t_min) < 1e-10 and abs(pts[-1] - t_min) < 1e-10:
-                eligible.add(name)
-
-        if hc is True:
-            return eligible
-        return eligible & set(hc)
-
-    @property
-    def hard_bc_names(self) -> set:
-        """Union of :attr:`hard_spatial_bc_names` and :attr:`hard_ic_names`.
-
-        Used by the trainer and ``show_problem()`` to exclude all
-        hard-constrained BCs from soft losses and display.
-        """
-        return self.hard_spatial_bc_names | self.hard_ic_names
 
     @property
     def _rollout_ic_bc_names(self) -> set:
@@ -1577,68 +1356,6 @@ class ProblemWeak:
             "internal": internal or {'global_step': 0, 'step': 0},
         }
 
-    @property
-    def output_transform(self):
-        """
-        Hard-constraint output transform derived from Dirichlet BCs on the domain.
-
-        Returns a callable ``f(x_original, y, params_dict) -> y`` that clamps
-        network outputs to their prescribed Dirichlet values at constrained
-        boundary nodes (only ``t_mode='all'`` BCs).
-
-        Pass directly to a network::
-
-            net = AlphaPINN(domain, n_features=32, hidden_dims=[128]*4,
-                            output_transform=problem.output_transform)
-
-        Returns ``None`` when ``hard_constraints=False`` or when there are no
-        eligible Dirichlet BCs on the domain.
-        """
-        has_spatial = bool(self.hard_spatial_bc_names) and np.any(self._bc_mask_np)
-        has_ic      = bool(self.hard_ic_names)          and np.any(self._ic_mask_np)
-        if not has_spatial and not has_ic:
-            return None
-
-        _verts = self.domain._vertices[:, :self.domain._spatial_dims].astype(np.float32)
-        _faces = self.domain._faces.astype(np.int32)
-        _bc_mask   = np.array(self._bc_mask_np,   dtype=np.float32)
-        _bc_values = np.array(self._bc_values_np, dtype=np.float32)
-        _ic_mask   = np.array(self._ic_mask_np,   dtype=np.float32)
-        _ic_values = np.array(self._ic_values_np, dtype=np.float32)
-        _t_min     = float(self.domain._t_min) if self.domain._t_min is not None else 0.0
-        _t_dim     = self.domain._spatial_dims   # index of the time column in x
-        _has_spatial = has_spatial
-        _has_ic      = has_ic
-        _transition_fn = self._make_ic_transition_fn(self.ic_transition)
-
-        def _transform(x_original, y, params_dict=None):
-            from .backends.jax.gnn_network import _interpolate_mesh
-            import jax.numpy as jnp
-            nodes = jnp.array(_verts)
-            faces = jnp.array(_faces)
-            spatial_dims = _verts.shape[1]
-            x_spatial = x_original[:, :spatial_dims]
-
-            # ── Step 1: IC hard constraint — u = u_IC(x) + f(t−t_min)·NN ───
-            if _has_ic:
-                ic_m = _interpolate_mesh(jnp.array(_ic_mask),   nodes, faces, x_spatial)
-                ic_v = _interpolate_mesh(jnp.array(_ic_values), nodes, faces, x_spatial)
-                t_shifted = x_original[:, _t_dim:_t_dim+1] - _t_min   # (n, 1)
-                factor = _transition_fn(t_shifted)                      # (n, 1)
-                # At IC nodes: y = ic_v + factor * y
-                # At other nodes: y unchanged
-                y = ic_v * ic_m + y * (1.0 - ic_m + ic_m * factor)
-
-            # ── Step 2: Spatial Dirichlet mask-and-clamp ────────────────────
-            if _has_spatial:
-                bc_m = _interpolate_mesh(jnp.array(_bc_mask),   nodes, faces, x_spatial)
-                bc_v = _interpolate_mesh(jnp.array(_bc_values), nodes, faces, x_spatial)
-                y = (1.0 - bc_m) * y + bc_m * bc_v
-
-            return y
-
-        return _transform
-
     def make_rollout_loss_fn(self, network, n_steps=None, face_batch_size=None, step_weights=None):
         """
         Return a JIT-able loss function that unrolls the GNN state-integrator
@@ -1720,8 +1437,8 @@ class ProblemWeak:
             """Build a scan step that calls volume_fn for each local test function.
 
             pdict layout seen by volume_fn:
-              pdict["fixed"]    — user params + u_prev_nodes (read by AlphaPINN)
-              pdict["internal"] — per-step assembler state: u_prev, dt, …
+              pdict["fixed"]        — user params + u_prev_nodes (read by AlphaPINN)
+              pdict["dependencies"] — per-step assembler state: u_prev, dt, …
             """
             _lm_free = _lumped_mass_free if lumped_mass_free is None else lumped_mass_free
 
@@ -1732,10 +1449,10 @@ class ProblemWeak:
                 grad_u_prev = jnp.einsum('kl,kli->ki', u_nodes[nid_f], gph_f)    # (FQ, 2)
 
                 # pdict["fixed"] carries u_prev_nodes so AlphaPINN can encode α^n
-                # pdict["internal"] carries per-step state for volume_fn
+                # pdict["dependencies"] carries per-step state for volume_fn
                 pdict = {
-                    "fixed":    {**_fixed_par, "u_prev_nodes": u_nodes},
-                    "internal": {"u_prev": u_prev_cub, "grad_u_prev": grad_u_prev, "dt": _dt},
+                    "fixed":        {**_fixed_par, "u_prev_nodes": u_nodes},
+                    "dependencies": {"u_prev": u_prev_cub, "grad_u_prev": grad_u_prev, "dt": _dt},
                 }
 
                 # Network forward: u^{n+1} at all mesh nodes
@@ -1883,8 +1600,8 @@ class ProblemWeak:
             grad_u_prev = jnp.einsum('kl,kli->ki', u_nodes[nid_f], gph_f)    # (FQ, 2)
 
             pdict = {
-                "fixed":    {**_fixed_par, "u_prev_nodes": u_nodes},
-                "internal": {"u_prev": u_prev_cub, "grad_u_prev": grad_u_prev, "dt": _dt},
+                "fixed":        {**_fixed_par, "u_prev_nodes": u_nodes},
+                "dependencies": {"u_prev": u_prev_cub, "grad_u_prev": grad_u_prev, "dt": _dt},
             }
 
             u_next_nodes = _net.apply(params, _mesh, pdict)[:, 0]   # (n_dofs,)
@@ -2615,11 +2332,10 @@ class ProblemWeak:
         # The quadratic ||B||^2 always appears (it is always in the loss).
         # The Lagrange inner product <λ, B> is added only when the BC name
         # is in lagrange_multipliers.
-        # Hard-constrained BCs are satisfied by the network exactly and are
-        # not part of the soft optimisation problem, so we skip them here.
-        _hard_names = self.hard_bc_names | self._rollout_ic_bc_names
+        # Rollout IC BCs are consumed as initial state and excluded from soft loss display.
+        _skip_names = self._rollout_ic_bc_names
         for bc in self.boundary_conditions:
-            if getattr(bc, 'name', None) in _hard_names:
+            if getattr(bc, 'name', None) in _skip_names:
                 continue
             raw_name = getattr(bc, 'name', None) or "bc"
             sym = self._latex_name(raw_name)

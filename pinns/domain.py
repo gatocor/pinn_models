@@ -51,6 +51,31 @@ class SubdomainInfo:
         return f"SubdomainInfo(index={self.index}, xmin={self.xmin.tolist()}, xmax={self.xmax.tolist()})"
 
 # ============================================================================
+# Stepper — fixed time partition for state-integrator (MoL / BPTT) problems
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Stepper — deprecated.  Use StrategyStep from pinns.strategies instead.
+# ---------------------------------------------------------------------------
+
+def Stepper():
+    """Deprecated factory — returns a :class:`~pinns.strategies.StrategyStep` instance.
+
+    Use ``StrategyStep()`` directly in new code.
+    """
+    import warnings
+    from .strategies import StrategyStep
+    warnings.warn(
+        "Stepper() is deprecated and will be removed in a future version. "
+        "Use StrategyStep() from pinns.strategies (or pinns) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return StrategyStep()
+
+
+
+# ============================================================================
 # Sampling utilities
 # ============================================================================
 
@@ -301,7 +326,9 @@ class DomainCubic:
     Args:
         space: List of per-dimension specifications.  Each element is either a
             ``(min, max)`` tuple (plain mode) or a strictly-increasing 1-D array
-            of breakpoints (partition mode).
+            of breakpoints (partition mode).  May be ``None`` (or omitted) when
+            ``time`` is provided and no spatial dimensions are needed (e.g. pure
+            ODE problems).
         sampling_method: Default interior sampling method.  One of
             ``"uniform"`` (default), ``"latin_hypercube"``/``"lhs"``,
             ``"sobol"``, ``"halton"``, or a callable
@@ -313,55 +340,67 @@ class DomainCubic:
             array/list with >2 values for a partitioned time axis.
     """
 
-    def __init__(self, space, sampling_method="uniform",
+    def __init__(self, space=None, sampling_method="uniform",
                  sampling_transform=None, time=None):
 
-        if not space:
-            raise ValueError("'space' must be a non-empty list.")
-
-        # ── Detect mode from the first element ───────────────────────────
-        # tuple → plain bound (min, max)
-        # array / list → partition breakpoints
-        _is_partition_elem = lambda e: not isinstance(e, tuple)
-        _modes = [_is_partition_elem(e) for e in space]
-        if any(_modes) and not all(_modes):
+        if space is None and time is None:
             raise ValueError(
-                "All elements of 'space' must be the same type: either all "
-                "2-tuples (plain bounds) or all arrays (partition breakpoints)."
-            )
-        _partition_mode = all(_modes)
+                "DomainCubic requires at least one of 'space' or 'time'.")
 
-        # ── Partition mode ────────────────────────────────────────────────
-        if _partition_mode:
-            self.grid_positions = [np.asarray(e, dtype=np.float64) for e in space]
-            for i, p in enumerate(self.grid_positions):
-                if len(p) < 2:
-                    raise ValueError(
-                        f"space[{i}] must have at least 2 breakpoints "
-                        f"to define at least 1 subdomain."
-                    )
-                if not np.all(np.diff(p) > 0):
-                    raise ValueError(
-                        f"space[{i}] must be strictly increasing."
-                    )
-            xmin = [p[0] for p in self.grid_positions]
-            xmax = [p[-1] for p in self.grid_positions]
+        _partition_mode = False
+
+        if space is not None:
+            if not space:
+                raise ValueError("'space' must be a non-empty list.")
+
+            # ── Detect mode from the first element ───────────────────────────
+            # tuple → plain bound (min, max)
+            # array / list → partition breakpoints
+            _is_partition_elem = lambda e: not isinstance(e, tuple)
+            _modes = [_is_partition_elem(e) for e in space]
+            if any(_modes) and not all(_modes):
+                raise ValueError(
+                    "All elements of 'space' must be the same type: either all "
+                    "2-tuples (plain bounds) or all arrays (partition breakpoints)."
+                )
+            _partition_mode = all(_modes)
+
+            # ── Partition mode ────────────────────────────────────────────────
+            if _partition_mode:
+                self.grid_positions = [np.asarray(e, dtype=np.float64) for e in space]
+                for i, p in enumerate(self.grid_positions):
+                    if len(p) < 2:
+                        raise ValueError(
+                            f"space[{i}] must have at least 2 breakpoints "
+                            f"to define at least 1 subdomain."
+                        )
+                    if not np.all(np.diff(p) > 0):
+                        raise ValueError(
+                            f"space[{i}] must be strictly increasing."
+                        )
+                xmin = [p[0] for p in self.grid_positions]
+                xmax = [p[-1] for p in self.grid_positions]
+            else:
+                # ── Plain mode ────────────────────────────────────────────────
+                self.grid_positions = None
+                for i, e in enumerate(space):
+                    if len(e) != 2:
+                        raise ValueError(
+                            f"space[{i}] must be a 2-tuple (min, max), got length {len(e)}."
+                        )
+                xmin = [float(e[0]) for e in space]
+                xmax = [float(e[1]) for e in space]
         else:
-            # ── Plain mode ────────────────────────────────────────────────
+            # ── No spatial dimensions (pure-time domain) ──────────────────
             self.grid_positions = None
-            for i, e in enumerate(space):
-                if len(e) != 2:
-                    raise ValueError(
-                        f"space[{i}] must be a 2-tuple (min, max), got length {len(e)}."
-                    )
-            xmin = [float(e[0]) for e in space]
-            xmax = [float(e[1]) for e in space]
+            xmin = []
+            xmax = []
 
         # ── Common bounds setup ───────────────────────────────────────────
         self.xmin = np.asarray(xmin, dtype=np.float64)
         self.xmax = np.asarray(xmax, dtype=np.float64)
 
-        if np.any(self.xmin >= self.xmax):
+        if len(self.xmin) > 0 and np.any(self.xmin >= self.xmax):
             raise ValueError("min must be strictly less than max in all dimensions.")
 
         self.n_dims = len(self.xmin)
@@ -371,7 +410,7 @@ class DomainCubic:
         # Storage for boundary conditions
         self.boundary_conditions: 'List[Union[DirichletBC, NeumannBC, RobinBC, PointsetBC]]' = []
 
-        # _spatial_dims must be set before _compute_subdomains
+        # _spatial_dims records the number of spatial-only dimensions
         self._spatial_dims = self.n_dims
 
         # ── Partition-specific setup ──────────────────────────────────────
@@ -500,7 +539,7 @@ class DomainCubic:
         if method is None:
             method = self.sampling_method
 
-        _BUILTIN_INNER = ('all', 'subdomains')
+        _BUILTIN_INNER = ('all', 'partition', 'subdomains')
 
         # ── list-of-regions branch ────────────────────────────────────────
         if isinstance(region, list):
@@ -574,13 +613,14 @@ class DomainCubic:
         # ── built-in region names ─────────────────────────────────────────
         if region == 'all' or region is None:
             region = None  # fall through to full-domain logic below
-        elif region == 'subdomains':
+        elif region == 'partition':
             if self.grid_positions is None:
                 raise ValueError(
-                    "region='subdomains' requires a partitioned domain "
-                    "(constructed with breakpoint arrays).")
+                    "region='partition' requires a partitioned domain. "
+                    "Use set_partition() or construct DomainCubic with breakpoint arrays.")
             mode = 'per_partition'
             region = None  # fall through to per-partition logic below
+            _partition_size = size  # carry 'size' into per-partition branch
 
         # ── single named custom region ────────────────────────────────────
         if region is not None:
@@ -606,16 +646,40 @@ class DomainCubic:
                 transform=transform, reject_outside=True, rng=rng, method=method, params=params
             )
         elif mode == 'per_partition':
-            points_per_subdomain = n_points // self.n_subdomains
-            remainder = n_points % self.n_subdomains
-            all_points = []
+            # Compute per-cell counts respecting _partition_size
+            all_sub_min, all_sub_max = [], []
             for dim_idx in range(self.n_subdomains):
-                multi_idx = self.get_multi_index(dim_idx)
-                sub_min = np.array([self.grid_positions[d][multi_idx[d]] for d in range(self._spatial_dims)])
-                sub_max = np.array([self.grid_positions[d][multi_idx[d] + 1] for d in range(self._spatial_dims)])
-                n_pts = points_per_subdomain + (1 if dim_idx < remainder else 0)
+                mi = self.get_multi_index(dim_idx)
+                all_sub_min.append([self.grid_positions[d][mi[d]] for d in range(self._spatial_dims)])
+                all_sub_max.append([self.grid_positions[d][mi[d] + 1] for d in range(self._spatial_dims)])
+            all_sub_min = np.array(all_sub_min)
+            all_sub_max = np.array(all_sub_max)
+
+            if isinstance(_partition_size, (list, tuple, np.ndarray)):
+                weights = np.asarray(_partition_size, dtype=float)
+                if len(weights) != self.n_subdomains:
+                    raise ValueError(
+                        f"size list length ({len(weights)}) must match n_subdomains "
+                        f"({self.n_subdomains}).")
+                weights = weights / weights.sum()
+            elif _partition_size == 'size':
+                vols = np.prod(all_sub_max - all_sub_min, axis=1).astype(float)
+                weights = vols / vols.sum()
+            else:  # 'equal'
+                weights = np.ones(self.n_subdomains) / self.n_subdomains
+
+            # Largest-remainder rounding so counts sum exactly to n_points
+            raw = weights * n_points
+            counts = np.floor(raw).astype(int)
+            fracs = raw - counts
+            for idx in np.argsort(-fracs)[:n_points - counts.sum()]:
+                counts[idx] += 1
+
+            all_points = []
+            for dim_idx, (sub_min, sub_max, n_pts) in enumerate(
+                    zip(all_sub_min, all_sub_max, counts)):
                 if n_pts > 0:
-                    s = sample_unit_hypercube(n_pts, self._spatial_dims, method=method, rng=rng)
+                    s = sample_unit_hypercube(int(n_pts), self._spatial_dims, method=method, rng=rng)
                     all_points.append(transform_samples(
                         s, sub_min, sub_max,
                         transform=transform, reject_outside=True, rng=rng, method=method, params=params
@@ -671,7 +735,8 @@ class DomainCubic:
         if transform is None:
             transform = self.sampling_transform
 
-        _BUILTIN_BOUNDARY = ('all', 'subdomains')
+        _BUILTIN_BOUNDARY = ('all', 'partition', 'partition_outer',
+                              'partition_inner')
 
         # ── list-of-regions branch ────────────────────────────────────────
         if isinstance(region, list):
@@ -706,46 +771,51 @@ class DomainCubic:
                         n_pts, dim, side, rng, method, transform, params))
             return np.vstack(all_pts)
 
-        if region == 'subdomains':
+        if region == 'partition_outer':
             if self.grid_positions is None:
                 raise ValueError(
-                    "region='subdomains' requires a partitioned domain.")
-            # distribute across all boundary subdomains
-            boundary_subs = []
-            for dim in range(self._spatial_dims):
-                for side in (0, 1):
-                    for s_idx in range(self.n_subdomains):
-                        mi = self.get_multi_index(s_idx)
-                        pos = mi[dim]
-                        if side == 0 and pos != 0:
-                            continue
-                        if side == 1 and pos != self.n_subdomains_per_dim[dim] - 1:
-                            continue
-                        boundary_subs.append((dim, side, mi))
-            n_bs = len(boundary_subs)
-            ppp = n_points // n_bs
-            rem = n_points % n_bs
-            all_pts = []
-            for i, (dim, side, mi) in enumerate(boundary_subs):
-                n_pts = ppp + (1 if i < rem else 0)
-                if n_pts == 0:
-                    continue
-                sub_lo = np.array([self.grid_positions[d][mi[d]]
-                                   for d in range(self._spatial_dims)])
-                sub_hi = np.array([self.grid_positions[d][mi[d] + 1]
-                                   for d in range(self._spatial_dims)])
-                bval = self.xmin[dim] if side == 0 else self.xmax[dim]
-                samples = sample_unit_hypercube(n_pts, self._spatial_dims,
-                                                method=method, rng=rng)
-                pts = transform_samples(samples, sub_lo, sub_hi, transform=None,
-                                        reject_outside=True, rng=rng,
-                                        method=method, params=params)
-                pts[:, dim] = bval
-                if self._t_min is not None:
-                    t = rng.uniform(self._t_min, self._t_max, (n_pts, 1))
-                    pts = np.hstack([pts, t])
-                all_pts.append(pts)
-            return np.vstack(all_pts)
+                    "region='partition_outer' requires a partitioned domain. "
+                    "Use set_partition() or construct DomainCubic with breakpoint arrays.")
+            return self._sample_partition_outer_boundary(
+                n_points, size, rng, method, transform, params)
+
+        if region == 'partition_inner':
+            if self.grid_positions is None:
+                raise ValueError(
+                    "region='partition_inner' requires a partitioned domain. "
+                    "Use set_partition() or construct DomainCubic with breakpoint arrays.")
+            return self._sample_partition_inner_boundaries(
+                n_points, size, rng, method, params)
+
+        if region == 'partition':
+            if self.grid_positions is None:
+                raise ValueError(
+                    "region='partition' (boundary) requires a partitioned domain. "
+                    "Use set_partition() or construct DomainCubic with breakpoint arrays.")
+            if isinstance(size, (list, tuple, np.ndarray)):
+                w = np.asarray(size, dtype=float)
+                if len(w) != 2:
+                    raise ValueError(
+                        "size for region='partition' (boundary) must have 2 weights: "
+                        "[outer_weight, inner_weight].")
+                w = w / w.sum()
+                n_outer = int(round(w[0] * n_points))
+                n_inner = n_points - n_outer
+            elif size == 'size':
+                # Weight by total area of outer vs inner faces
+                outer_area = self._partition_outer_area()
+                inner_area = self._partition_inner_area()
+                total = outer_area + inner_area
+                n_outer = int(round(outer_area / total * n_points))
+                n_inner = n_points - n_outer
+            else:  # 'equal'
+                n_outer = n_points // 2
+                n_inner = n_points - n_outer
+            outer = self._sample_partition_outer_boundary(
+                n_outer, size, rng, method, transform, params)
+            inner = self._sample_partition_inner_boundaries(
+                n_inner, size, rng, method, params)
+            return np.vstack([outer, inner])
 
         # ── single named custom region ────────────────────────────────────
         if isinstance(region, str):
@@ -888,6 +958,177 @@ class DomainCubic:
     # ------------------------------------------------------------------ #
     #  Custom region registration                                         #
     # ------------------------------------------------------------------ #
+
+    def _partition_outer_area(self):
+        """Total area of all outer boundary faces of the partition."""
+        total = 0.0
+        sp_ext = self.xmax[:self._spatial_dims] - self.xmin[:self._spatial_dims]
+        for d in range(self._spatial_dims):
+            face_area = np.prod(sp_ext[[dd for dd in range(self._spatial_dims) if dd != d]])
+            # Two sides × number of cells on each boundary face
+            n_boundary_cells_per_side = int(np.prod(
+                [self.n_subdomains_per_dim[dd] for dd in range(self._spatial_dims) if dd != d]))
+            total += 2 * n_boundary_cells_per_side * face_area
+        return total
+
+    def _partition_inner_area(self):
+        """Total area of all internal interfaces of the partition."""
+        total = 0.0
+        sp_ext = self.xmax[:self._spatial_dims] - self.xmin[:self._spatial_dims]
+        for d in range(self._spatial_dims):
+            n_ifaces = len(self.grid_positions[d]) - 2  # internal breakpoints
+            if n_ifaces <= 0:
+                continue
+            iface_area = np.prod(sp_ext[[dd for dd in range(self._spatial_dims) if dd != d]])
+            total += n_ifaces * iface_area
+        return total
+
+    def _sample_partition_outer_boundary(self, n_points, size, rng, method, transform, params):
+        """Sample from the outer boundary faces of partition cells that lie on the domain boundary."""
+        boundary_subs = []
+        for dim in range(self._spatial_dims):
+            for side in (0, 1):
+                for s_idx in range(self.n_subdomains):
+                    mi = self.get_multi_index(s_idx)
+                    pos = mi[dim]
+                    if side == 0 and pos != 0:
+                        continue
+                    if side == 1 and pos != self.n_subdomains_per_dim[dim] - 1:
+                        continue
+                    boundary_subs.append((dim, side, mi))
+
+        # Compute face areas for each boundary sub-face
+        face_areas = np.array([
+            np.prod([
+                self.grid_positions[dd][mi[dd] + 1] - self.grid_positions[dd][mi[dd]]
+                for dd in range(self._spatial_dims) if dd != dim
+            ])
+            for (dim, side, mi) in boundary_subs
+        ], dtype=float)
+
+        n_bs = len(boundary_subs)
+        if isinstance(size, (list, tuple, np.ndarray)):
+            weights = np.asarray(size, dtype=float)
+            if len(weights) != n_bs:
+                raise ValueError(
+                    f"size list length ({len(weights)}) must match the number of "
+                    f"boundary sub-faces ({n_bs}).")
+            weights = weights / weights.sum()
+        elif size == 'size':
+            weights = face_areas / face_areas.sum()
+        else:  # 'equal'
+            weights = np.ones(n_bs) / n_bs
+
+        raw = weights * n_points
+        counts = np.floor(raw).astype(int)
+        for idx in np.argsort(-(raw - counts))[:n_points - counts.sum()]:
+            counts[idx] += 1
+
+        all_pts = []
+        for n_pts, (dim, side, mi) in zip(counts, boundary_subs):
+            if n_pts == 0:
+                continue
+            sub_lo = np.array([self.grid_positions[d][mi[d]]
+                               for d in range(self._spatial_dims)])
+            sub_hi = np.array([self.grid_positions[d][mi[d] + 1]
+                               for d in range(self._spatial_dims)])
+            bval = self.xmin[dim] if side == 0 else self.xmax[dim]
+            samples = sample_unit_hypercube(n_pts, self._spatial_dims,
+                                            method=method, rng=rng)
+            pts = transform_samples(samples, sub_lo, sub_hi, transform=None,
+                                    reject_outside=True, rng=rng,
+                                    method=method, params=params)
+            pts[:, dim] = bval
+            if self._t_min is not None:
+                t = rng.uniform(self._t_min, self._t_max, (n_pts, 1))
+                pts = np.hstack([pts, t])
+            all_pts.append(pts)
+        return np.vstack(all_pts)
+
+    def _sample_partition_inner_boundaries(self, n_points, size, rng, method, params):
+        """
+        Sample from the internal interfaces between adjacent partition cells.
+
+        For each spatial dimension *d* and each internal breakpoint *p* (i.e.
+        ``grid_positions[d][1:-1]``), one interface is a co-dimension-1
+        hyperplane ``x_d = p`` spanning the full domain in all other dimensions.
+        Time is sampled uniformly when a time axis is present.
+
+        Args:
+            n_points: Total number of points.
+            size:    ``'equal'`` (default), ``'size'`` (weight by interface area),
+                     or an explicit list of weights per interface.
+            rng:      Random-number generator.
+            method:   Sampling method.
+            params:   Extra params dict (unused, kept for API consistency).
+
+        Returns:
+            np.ndarray: Shape ``(n_points, n_dims)``.
+        """
+        # Collect all internal interfaces: (dim, position)
+        interfaces = []
+        for d in range(self._spatial_dims):
+            for pos in self.grid_positions[d][1:-1]:
+                interfaces.append((d, float(pos)))
+
+        if not interfaces:
+            raise ValueError(
+                "Partition has no internal interfaces. "
+                "Each spatial dimension needs at least 3 breakpoints to create "
+                "at least one internal interface.")
+
+        # Interface areas: product of domain extents in all free dimensions
+        sp_min = self.xmin[:self._spatial_dims]
+        sp_max = self.xmax[:self._spatial_dims]
+        sp_ext = sp_max - sp_min
+        iface_areas = np.array([
+            np.prod(sp_ext[[dd for dd in range(self._spatial_dims) if dd != d]])
+            for (d, _) in interfaces
+        ], dtype=float)
+
+        n_ifaces = len(interfaces)
+        if isinstance(size, (list, tuple, np.ndarray)):
+            weights = np.asarray(size, dtype=float)
+            if len(weights) != n_ifaces:
+                raise ValueError(
+                    f"size list length ({len(weights)}) must match the number of "
+                    f"internal interfaces ({n_ifaces}).")
+            weights = weights / weights.sum()
+        elif size == 'size':
+            weights = iface_areas / iface_areas.sum()
+        else:  # 'equal'
+            weights = np.ones(n_ifaces) / n_ifaces
+
+        raw = weights * n_points
+        counts = np.floor(raw).astype(int)
+        for idx in np.argsort(-(raw - counts))[:n_points - counts.sum()]:
+            counts[idx] += 1
+
+        all_pts = []
+        for n_pts, (d, pos) in zip(counts, interfaces):
+            if n_pts == 0:
+                continue
+            # Sample free (non-fixed) spatial dimensions
+            free_dims = [dd for dd in range(self._spatial_dims) if dd != d]
+            n_free = len(free_dims)
+            if n_free == 0:
+                pts_sp = np.full((n_pts, 1), pos)
+            else:
+                free_lo = sp_min[free_dims]
+                free_hi = sp_max[free_dims]
+                s = sample_unit_hypercube(n_pts, n_free, method=method, rng=rng)
+                free_pts = transform_samples(
+                    s, free_lo, free_hi, transform=None,
+                    reject_outside=True, rng=rng, method=method, params=params)
+                pts_sp = np.empty((n_pts, self._spatial_dims))
+                for j, dd in enumerate(free_dims):
+                    pts_sp[:, dd] = free_pts[:, j]
+                pts_sp[:, d] = pos
+            if self._t_min is not None:
+                t = rng.uniform(self._t_min, self._t_max, (n_pts, 1))
+                pts_sp = np.hstack([pts_sp, t])
+            all_pts.append(pts_sp)
+        return np.vstack(all_pts)
 
     def _resolve_time_arg(self, time):
         """Convert a ``time`` argument to a ``(t_lo, t_hi)`` float pair.
@@ -1355,8 +1596,131 @@ class DomainCubic:
         if self.grid_positions is None:
             raise AttributeError(
                 "This method is only available for partitioned domains. "
-                "Construct with DomainCubic(space=[np.linspace(...), ...])."
+                "Use set_partition() or construct with "
+                "DomainCubic(space=[np.linspace(...), ...])."
             )
+
+    def set_partition(self, space=None, time=None):
+        """
+        Add (or replace) a partition grid on an existing domain.
+
+        A *partition* divides the domain into a regular grid of rectangular
+        cells.  Once set, you can:
+
+        * Sample from individual cells with a tuple region ``(i, j, ...)`` or
+          ``(i, j, t_idx)`` (time partition index appended when applicable).
+        * Sample all inner cells with ``region='partition'``.
+        * Sample outer boundary faces with ``region='partition_outer'``
+          in :meth:`sample_boundary`.
+        * Sample internal interfaces between cells with
+          ``region='partition_inner'``.
+        * Sample all boundaries (inner + outer) with ``region='partition'``.
+
+        Args:
+            space (list | None): One entry per spatial dimension.  Each entry
+                may be:
+
+                * An **integer** ``n`` — auto-generates ``n`` equally-spaced
+                  cells via ``np.linspace(xmin[d], xmax[d], n+1)``.
+                * A **strictly-increasing 1-D array** of breakpoints.  The
+                  first element must equal ``xmin[d]`` and the last must equal
+                  ``xmax[d]`` (within floating-point tolerance).  At least 2
+                  breakpoints (1 cell) per dimension are required; 3 or more
+                  are needed to produce internal interfaces.
+
+                Pass ``None`` to leave any existing spatial partition unchanged.
+            time (int | array-like | None): Time partition.  May be:
+
+                * An **integer** ``n`` — auto-generates ``n`` equally-spaced
+                  time slabs via ``np.linspace(t_min, t_max, n+1)``.
+                * A **strictly-increasing 1-D array** of breakpoints spanning
+                  ``[t_min, t_max]``.
+
+                Requires the domain to have a time axis.  Pass ``None`` to
+                leave any existing time partition unchanged.
+
+        Raises:
+            ValueError: If ``space`` / ``time`` are inconsistent with the
+                domain bounds, not strictly increasing, or too short.
+            AttributeError: If ``time`` is given but the domain has no time
+                axis.
+
+        Example::
+
+            dv = DomainCubic([[0, 1], [0, 1]], time=[0, 1])
+
+            # Integer shorthand: 10 cells in x, custom breakpoints in y, 2 time slabs
+            dv.set_partition(space=[10, [0, 0.2, 1]], time=2)
+
+            # Or with explicit breakpoints:
+            dv.set_partition(
+                space=[np.linspace(0, 1, 11), np.linspace(0, 1, 11)],
+                time=[0, 0.5, 1],
+            )
+            # sample interior of all cells
+            pts_inner = dv.sample_interior(1000, region='partition')
+            # sample internal interfaces
+            pts_iface = dv.sample_boundary(500, region='partition_inner')
+            # sample outer boundary faces
+            pts_outer = dv.sample_boundary(500, region='partition_outer')
+        """
+        if space is not None:
+            if len(space) != self._spatial_dims:
+                raise ValueError(
+                    f"'space' must have {self._spatial_dims} elements "
+                    f"(one per spatial dimension), got {len(space)}.")
+            # Allow integers: auto-generate uniform breakpoints for that dimension
+            resolved = []
+            for d, p in enumerate(space):
+                if isinstance(p, (int, np.integer)):
+                    lo = self.xmin[d]
+                    hi = self.xmax[d]
+                    resolved.append(np.linspace(lo, hi, int(p) + 1))
+                else:
+                    resolved.append(np.asarray(p, dtype=np.float64).ravel())
+            grid_positions = resolved
+            for d, (p, lo, hi) in enumerate(
+                    zip(grid_positions,
+                        self.xmin[:self._spatial_dims],
+                        self.xmax[:self._spatial_dims])):
+                if len(p) < 2:
+                    raise ValueError(
+                        f"space[{d}] must have at least 2 breakpoints "
+                        f"(got {len(p)}).")
+                if not np.all(np.diff(p) > 0):
+                    raise ValueError(f"space[{d}] must be strictly increasing.")
+                if not np.isclose(p[0], lo) or not np.isclose(p[-1], hi):
+                    raise ValueError(
+                        f"space[{d}] breakpoints must span the domain bounds "
+                        f"[{lo}, {hi}], got [{p[0]}, {p[-1]}].")
+            self.grid_positions = grid_positions
+            self.n_subdomains_per_dim = [len(p) - 1 for p in grid_positions]
+            self.n_subdomains = int(np.prod(self.n_subdomains_per_dim))
+            self._subdomain_centers = None
+            self._compute_subdomains()
+
+        if time is not None:
+            if self._t_min is None:
+                raise AttributeError(
+                    "Cannot set a time partition: the domain has no time axis. "
+                    "Pass time=... to DomainCubic() first.")
+            # Allow a single integer: auto-generate uniform time breakpoints
+            if isinstance(time, (int, np.integer)):
+                time = np.linspace(self._t_min, self._t_max, int(time) + 1)
+            time_arr = np.asarray(time, dtype=float).ravel()
+            if len(time_arr) < 2:
+                raise ValueError(
+                    "'time' must have at least 2 breakpoints.")
+            if not np.all(np.diff(time_arr) > 0):
+                raise ValueError("'time' breakpoints must be strictly increasing.")
+            if (not np.isclose(time_arr[0], self._t_min) or
+                    not np.isclose(time_arr[-1], self._t_max)):
+                raise ValueError(
+                    f"'time' breakpoints must span the domain time bounds "
+                    f"[{self._t_min}, {self._t_max}], "
+                    f"got [{time_arr[0]}, {time_arr[-1]}].")
+            self.time_grid_positions = time_arr
+            self.n_time_subdomains = len(time_arr) - 1
 
     def __len__(self):
         """Total number of subdomains (``n_subdomains``); requires a partitioned domain."""
@@ -1484,16 +1848,22 @@ class DomainCubic:
             return a - tol <= p_mid <= b + tol
 
         # ── Resolve region / boundary highlight sets ──────────────────────
-        _BUILTIN = ('all', 'subdomains')
+        _BUILTIN = ('all', 'partition', 'subdomains')
 
         def _resolve_region_set(arg, registry):
             """Return list of region keys to highlight, or special tokens."""
             if arg is None:
                 return []
             if arg == 'all':
-                return ['subdomains'] + list(registry.keys())
-            if arg == 'subdomains':
-                return ['subdomains']
+                # partition grid + all custom named regions
+                return ['partition'] + list(registry.keys())
+            if arg in ('partition', 'subdomains',
+                       'partition_outer', 'partition_inner'):
+                # partition grid only, no custom named regions
+                return ['partition']
+            if arg == 'custom':
+                # custom named regions only, no partition grid
+                return list(registry.keys())
             if isinstance(arg, str):
                 return [arg]
             return list(arg)  # list of strings
@@ -1501,7 +1871,15 @@ class DomainCubic:
         _highlight_inner = _resolve_region_set(region, self._inner_regions)
         _highlight_boundary = _resolve_region_set(boundary, self._boundary_regions)
 
-        # ── Colour cycles ─────────────────────────────────────────────────
+        # ── Partition boundary flags ───────────────────────────────────────
+        _draw_partition_outer = (boundary in ('partition', 'partition_outer', 'all'))
+        _draw_partition_inner = (boundary in ('partition', 'partition_inner', 'all'))
+        # Remove partition tokens from named-region list (handled separately)
+        _highlight_boundary = [b for b in _highlight_boundary
+                               if b not in ('partition', 'partition_outer',
+                                            'partition_inner', 'subdomains')]
+
+        # ── Colour palettes ────────────────────────────────────────────────
         _colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
         bc_color = {id(bc): _colors[i % len(_colors)]
                     for i, bc in enumerate(self.boundary_conditions)}
@@ -1514,6 +1892,9 @@ class DomainCubic:
                                  'darkcyan', 'goldenrod', 'slateblue']
         _boundary_colors = {name: _boundary_color_list[i % len(_boundary_color_list)]
                             for i, name in enumerate(self._boundary_regions)}
+        _partition_palette = ['#1f77b4', '#2ca02c', '#d62728', '#9467bd',
+                              '#8c564b', '#e377c2', '#bcbd22', '#17becf',
+                              '#ff7f0e', '#7f7f7f']
 
         # ── Figure layout ─────────────────────────────────────────────────
         n_panels = len(phases)
@@ -1528,7 +1909,9 @@ class DomainCubic:
             panel_w, panel_h = 5.5, 5.0
 
         if figsize is None:
-            figsize = (panel_w * n_panels, panel_h)
+            _has_legend = (region is not None or boundary is not None or show_bcs)
+            _legend_extra = 2.0 if _has_legend else 0.0
+            figsize = (panel_w * n_panels + _legend_extra, panel_h)
 
         if is_3d:
             from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -1580,26 +1963,25 @@ class DomainCubic:
                 ax.plot(xs, ys, zs, color='#555', linewidth=1.5)
 
             # ── highlighted inner regions ─────────────────────────────
-            if 'subdomains' in _highlight_inner and self.grid_positions is not None:
+            if any(k in _highlight_inner for k in ('partition', 'subdomains')) and self.grid_positions is not None:
                 lo_bounds, up_bounds = self.get_subdomain_bounds()
-                ext_lo = lo_bounds[:, :3]
-                ext_up = up_bounds[:, :3]
                 for i in range(self.n_subdomains):
+                    color = _partition_palette[i % len(_partition_palette)]
                     for dim in range(3):
                         for side in range(2):
                             verts = _face_verts_3d(dim, side,
-                                                   ext_lo[i].tolist(),
-                                                   ext_up[i].tolist())
+                                                   lo_bounds[i, :3].tolist(),
+                                                   up_bounds[i, :3].tolist())
                             ax.add_collection3d(Poly3DCollection(
-                                [verts], alpha=0.06,
-                                facecolor='tab:orange', edgecolor='tab:orange',
+                                [verts], alpha=0.10,
+                                facecolor=color, edgecolor=color,
                                 linewidth=0.4))
-                    for xs, ys, zs in _box_edges_3d(lo_bounds[i].tolist(),
-                                                     up_bounds[i].tolist()):
+                    for xs, ys, zs in _box_edges_3d(lo_bounds[i, :3].tolist(),
+                                                     up_bounds[i, :3].tolist()):
                         ax.plot(xs, ys, zs, color='grey', linewidth=0.7,
                                 linestyle='--')
             for rname in _highlight_inner:
-                if rname == 'subdomains' or rname not in self._inner_regions:
+                if rname in ('partition', 'subdomains') or rname not in self._inner_regions:
                     continue
                 r_lo, r_hi = self._inner_regions[rname]
                 rcolor = _inner_colors[rname]
@@ -1609,7 +1991,7 @@ class DomainCubic:
                             linestyle='-')
             # ── highlighted boundary regions ──────────────────────────
             for bname in _highlight_boundary:
-                if bname == 'subdomains' or bname not in self._boundary_regions:
+                if bname in ('partition', 'subdomains') or bname not in self._boundary_regions:
                     continue
                 reg = self._boundary_regions[bname]
                 bcolor = _boundary_colors[bname]
@@ -1621,6 +2003,28 @@ class DomainCubic:
                 ax.add_collection3d(Poly3DCollection(
                     [verts], alpha=0.35, facecolor=bcolor,
                     edgecolor=bcolor, linewidth=1.5))
+
+            # ── Partition boundary drawing ──────────────────────────────
+            lo3 = sp_min[:3].tolist()
+            hi3 = sp_max[:3].tolist()
+            if _draw_partition_outer:
+                for dim in range(min(3, self._spatial_dims)):
+                    for side in range(2):
+                        verts = _face_verts_3d(dim, side, lo3, hi3)
+                        ax.add_collection3d(Poly3DCollection(
+                            [verts], alpha=0.15, facecolor='#ff7f0e',
+                            edgecolor='#ff7f0e', linewidth=1.5))
+            if _draw_partition_inner and self.grid_positions is not None:
+                gp = self.grid_positions
+                for dim in range(min(3, self._spatial_dims)):
+                    for bk in gp[dim][1:-1]:
+                        lo_f = lo3.copy(); hi_f = hi3.copy()
+                        lo_f[dim] = bk; hi_f[dim] = bk
+                        verts = _face_verts_3d(dim, 0, lo_f, hi3)
+                        ax.add_collection3d(Poly3DCollection(
+                            [verts], alpha=0.20, facecolor='#d62728',
+                            edgecolor='#d62728', linewidth=1.0,
+                            linestyle='dashed'))
 
             if points is not None:
                 _pts = np.asarray(points)
@@ -1642,12 +2046,12 @@ class DomainCubic:
             legend_handles = []
             # legend entries for highlighted named inner regions
             for rname in _highlight_inner:
-                if rname != 'subdomains' and rname in self._inner_regions:
+                if rname not in ('partition', 'subdomains') and rname in self._inner_regions:
                     legend_handles.append(mpatches.Patch(
                         color=_inner_colors[rname], label=f'inner:{rname}'))
             # legend entries for highlighted boundary regions
             for bname in _highlight_boundary:
-                if bname != 'subdomains' and bname in self._boundary_regions:
+                if bname not in ('partition', 'subdomains') and bname in self._boundary_regions:
                     legend_handles.append(mpatches.Patch(
                         color=_boundary_colors[bname], label=f'boundary:{bname}'))
 
@@ -1687,7 +2091,8 @@ class DomainCubic:
                         legend_handles.append(mpatches.Patch(color=color, label=label))
             if legend_handles:
                 ax.legend(handles=legend_handles, fontsize=8,
-                          loc='upper right', framealpha=0.8)
+                          loc='upper left', bbox_to_anchor=(1.01, 1),
+                          borderaxespad=0, framealpha=0.8)
 
         # ── Helper: draw one 1-D panel ────────────────────────────────────
         def _draw_1d_panel(ax, phase):
@@ -1703,37 +2108,38 @@ class DomainCubic:
             ax.set_yticks([])
             ax.set_xlabel('x')
 
-            if 'subdomains' in _highlight_inner and self.grid_positions is not None:
+            if any(k in _highlight_inner for k in ('partition', 'subdomains')) and self.grid_positions is not None:
                 lo_bounds, up_bounds = self.get_subdomain_bounds()
-                ext_lo = lo_bounds[:, :1]
-                ext_up = up_bounds[:, :1]
                 for i in range(self.n_subdomains):
+                    color = _partition_palette[i % len(_partition_palette)]
                     core_lo = lo_bounds[i, 0]
                     core_up = up_bounds[i, 0]
-                    ex_lo   = ext_lo[i, 0]
-                    ex_up   = ext_up[i, 0]
-                    if core_lo > ex_lo:
-                        ax.axvspan(ex_lo, core_lo, alpha=0.15,
-                                   color='tab:orange', zorder=1)
-                    if ex_up > core_up:
-                        ax.axvspan(core_up, ex_up, alpha=0.15,
-                                   color='tab:orange', zorder=1)
+                    ax.axvspan(core_lo, core_up, alpha=0.30, color=color, zorder=2)
                     ax.axvline(core_lo, color='grey', linestyle='--',
                                linewidth=0.8, alpha=0.7)
                     ax.axvline(core_up, color='grey', linestyle='--',
                                linewidth=0.8, alpha=0.7)
             for rname in _highlight_inner:
-                if rname == 'subdomains' or rname not in self._inner_regions:
+                if rname in ('partition', 'subdomains') or rname not in self._inner_regions:
                     continue
                 r_lo, r_hi = self._inner_regions[rname]
                 rcolor = _inner_colors[rname]
                 ax.axvspan(r_lo[0], r_hi[0], alpha=0.25, color=rcolor, zorder=2)
             for bname in _highlight_boundary:
-                if bname == 'subdomains' or bname not in self._boundary_regions:
+                if bname in ('partition', 'subdomains') or bname not in self._boundary_regions:
                     continue
                 reg = self._boundary_regions[bname]
                 bcolor = _boundary_colors[bname]
                 ax.axvline(reg['fixed_val'], color=bcolor, linewidth=2.5, zorder=4)
+
+            # ── Partition boundary drawing ─────────────────────────────────
+            if _draw_partition_outer:
+                for coord in (sp_min[0], sp_max[0]):
+                    ax.axvline(coord, color='#ff7f0e', linewidth=2.5, zorder=5)
+            if _draw_partition_inner and self.grid_positions is not None:
+                for x in self.grid_positions[0][1:-1]:
+                    ax.axvline(x, color='#d62728', linewidth=1.5,
+                               linestyle='--', zorder=5)
 
             if points is not None:
                 _pts = np.asarray(points)
@@ -1742,11 +2148,11 @@ class DomainCubic:
 
             legend_handles = []
             for rname in _highlight_inner:
-                if rname != 'subdomains' and rname in self._inner_regions:
+                if rname not in ('partition', 'subdomains') and rname in self._inner_regions:
                     legend_handles.append(mpatches.Patch(
                         color=_inner_colors[rname], label=f'inner:{rname}'))
             for bname in _highlight_boundary:
-                if bname != 'subdomains' and bname in self._boundary_regions:
+                if bname not in ('partition', 'subdomains') and bname in self._boundary_regions:
                     legend_handles.append(mpatches.Patch(
                         color=_boundary_colors[bname], label=f'boundary:{bname}'))
 
@@ -1784,7 +2190,8 @@ class DomainCubic:
                         legend_handles.append(mpatches.Patch(color=color, label=label))
             if legend_handles:
                 ax.legend(handles=legend_handles, fontsize=8,
-                          loc='upper right', framealpha=0.8)
+                          loc='upper left', bbox_to_anchor=(1.01, 1),
+                          borderaxespad=0, framealpha=0.8)
 
         # ── Helper: draw one 2-D projection panel ─────────────────────────
         def _draw_2d_panel(ax, dx, dy, phase, title_prefix=""):
@@ -1805,29 +2212,20 @@ class DomainCubic:
                 edgecolor='#555', facecolor='#f5f5f5', linewidth=1.5, zorder=1
             ))
 
-            if 'subdomains' in _highlight_inner and self.grid_positions is not None:
+            if any(k in _highlight_inner for k in ('partition', 'subdomains')) and self.grid_positions is not None:
                 lo_bounds, up_bounds = self.get_subdomain_bounds()
-                ext_lo = lo_bounds
-                ext_up = up_bounds
                 for i in range(self.n_subdomains):
-                    ax.add_patch(mpatches.FancyBboxPatch(
-                        (ext_lo[i, dx], ext_lo[i, dy]),
-                        ext_up[i, dx] - ext_lo[i, dx],
-                        ext_up[i, dy] - ext_lo[i, dy],
-                        boxstyle='square,pad=0',
-                        edgecolor='tab:orange', facecolor='tab:orange',
-                        linewidth=0.6, alpha=0.12, zorder=2
-                    ))
+                    color = _partition_palette[i % len(_partition_palette)]
                     ax.add_patch(mpatches.FancyBboxPatch(
                         (lo_bounds[i, dx], lo_bounds[i, dy]),
                         up_bounds[i, dx] - lo_bounds[i, dx],
                         up_bounds[i, dy] - lo_bounds[i, dy],
                         boxstyle='square,pad=0',
-                        edgecolor='grey', facecolor='none',
-                        linewidth=0.8, linestyle='--', zorder=3
+                        edgecolor=color, facecolor=color,
+                        linewidth=0.8, alpha=0.30, zorder=2
                     ))
             for rname in _highlight_inner:
-                if rname == 'subdomains' or rname not in self._inner_regions:
+                if rname in ('partition', 'subdomains') or rname not in self._inner_regions:
                     continue
                 r_lo, r_hi = self._inner_regions[rname]
                 rcolor = _inner_colors[rname]
@@ -1839,12 +2237,35 @@ class DomainCubic:
                     linewidth=1.5, alpha=0.25, zorder=4
                 ))
             for bname in _highlight_boundary:
-                if bname == 'subdomains' or bname not in self._boundary_regions:
+                if bname in ('partition', 'subdomains') or bname not in self._boundary_regions:
                     continue
                 reg = self._boundary_regions[bname]
                 bcolor = _boundary_colors[bname]
                 _draw_face_2d(ax, reg['fixed_dim'], 0 if reg['fixed_val'] == reg['lo'][reg['fixed_dim']] else 1,
                               dx, dy, bcolor, linewidth=3.0)
+
+            # ── Partition boundary drawing ─────────────────────────────────
+            if _draw_partition_outer:
+                # domain outer faces
+                for dim in (dx, dy):
+                    for coord in (sp_min[dim], sp_max[dim]):
+                        side = 0 if coord == sp_min[dim] else 1
+                        _draw_face_2d(ax, dim, side, dx, dy, '#ff7f0e', linewidth=2.5)
+            if _draw_partition_inner and self.grid_positions is not None:
+                # internal breakpoint lines
+                gp = self.grid_positions
+                for dim in range(self._spatial_dims):
+                    interior = gp[dim][1:-1]  # skip first and last
+                    if dim == dx:
+                        for x in interior:
+                            ax.plot([x, x], [sp_min[dy], sp_max[dy]],
+                                    color='#d62728', linewidth=1.5,
+                                    linestyle='--', zorder=5)
+                    elif dim == dy:
+                        for y in interior:
+                            ax.plot([sp_min[dx], sp_max[dx]], [y, y],
+                                    color='#d62728', linewidth=1.5,
+                                    linestyle='--', zorder=5)
 
             margin = 0.04 * max(rw, rh)
             ax.set_xlim(sp_min[dx] - margin, sp_max[dx] + margin)
@@ -1860,11 +2281,11 @@ class DomainCubic:
 
             legend_handles = []
             for rname in _highlight_inner:
-                if rname != 'subdomains' and rname in self._inner_regions:
+                if rname not in ('partition', 'subdomains') and rname in self._inner_regions:
                     legend_handles.append(mpatches.Patch(
                         color=_inner_colors[rname], label=f'inner:{rname}'))
             for bname in _highlight_boundary:
-                if bname != 'subdomains' and bname in self._boundary_regions:
+                if bname not in ('partition', 'subdomains') and bname in self._boundary_regions:
                     legend_handles.append(mpatches.Patch(
                         color=_boundary_colors[bname], label=f'boundary:{bname}'))
 
@@ -1902,7 +2323,8 @@ class DomainCubic:
 
             if legend_handles:
                 ax.legend(handles=legend_handles, fontsize=8,
-                          loc='upper right', framealpha=0.8)
+                          loc='upper left', bbox_to_anchor=(1.01, 1),
+                          borderaxespad=0, framealpha=0.8)
 
         # ── Helper: draw a face edge in a 2-D projection ──────────────────
         def _draw_face_2d(ax, dim, side, dx, dy, color, linewidth=3):
@@ -2233,6 +2655,257 @@ class DomainMesh:
         # Named sampling regions (fully independent from the BC system).
         self._inner_regions:    dict = {}
         self._boundary_regions: dict = {}
+
+        # Partition (set via set_partition()).
+        self._partition_labels:          np.ndarray | None = None
+        self._partition_groups:          dict | None       = None
+        self._partition_interface_edges: np.ndarray | None = None
+        self._partition_interface_lengths: np.ndarray | None = None
+        self._time_grid_positions:       np.ndarray | None = None
+        self._n_time_partitions:         int                = 1
+
+    # ------------------------------------------------------------------ #
+    #  Partition                                                          #
+    # ------------------------------------------------------------------ #
+
+    def set_partition(self, space=None, time=None) -> None:
+        """Define a spatial (and/or temporal) partition on the mesh.
+
+        After calling this method the following *region* strings become
+        available in :meth:`sample_interior` and :meth:`sample_boundary`:
+
+        * ``'partition'`` — sample interior collocation points one per
+          (spatial group × time interval) cell, weighted by area × Δt.
+        * ``'partition_outer'`` — sample mesh boundary edges.
+        * ``'partition_inner'`` — sample interface edges *between* spatial
+          partition groups.
+        * ``'partition'`` — outer + inner boundary combined (in :meth:`sample_boundary`).
+
+        Args:
+            space: How to assign each mesh triangle to a partition group.
+
+                * **Callable** ``(centroids: ndarray) → int array`` — called
+                  with triangle centroids of shape ``(n_faces, spatial_dims)``
+                  and must return a 1-D integer array of length ``n_faces``
+                  with a group label (any integer) per triangle.
+                  Example: ``lambda c: (c[:, 0] > 0.5).astype(int)``
+                * **int** — automatically split the mesh into this many
+                  roughly equal-area groups using K-means clustering on
+                  triangle centroids (requires *scikit-learn*).
+
+            time: Time axis breakpoints (only meaningful when the domain has
+                a time axis):
+
+                * **int** — number of equal-width intervals; breakpoints are
+                  generated with ``np.linspace(t_min, t_max, n+1)``.
+                * **array-like** — explicit breakpoints (e.g. ``[0, 0.5, 1]``).
+
+        Example::
+
+            # Two spatial halves via callable + 4 equal time intervals
+            domain.set_partition(
+                space=lambda c: (c[:, 0] > 0.5).astype(int),
+                time=4)
+
+            # Automatic K-means split into 6 groups, 3 time intervals
+            domain.set_partition(space=6, time=3)
+        """
+        # ── Spatial partition ────────────────────────────────────────────
+        if space is not None:
+            centroids = (self._vertices[self._faces[:, 0]] +
+                         self._vertices[self._faces[:, 1]] +
+                         self._vertices[self._faces[:, 2]]) / 3.0
+
+            if isinstance(space, (int, np.integer)):
+                n_groups = int(space)
+                try:
+                    from sklearn.cluster import KMeans
+                    km = KMeans(n_clusters=n_groups, random_state=0, n_init='auto')
+                    labels = km.fit_predict(centroids,
+                                            sample_weight=self._tri_areas)
+                except ImportError:
+                    # Fallback: sort by first principal axis via centroid PCA
+                    cen = centroids - centroids.mean(axis=0)
+                    _, _, vt = np.linalg.svd(cen, full_matrices=False)
+                    proj = cen @ vt[0]
+                    order = np.argsort(proj)
+                    labels = np.empty(len(self._faces), dtype=int)
+                    # Area-weighted split into n_groups equal-area buckets
+                    cumarea = np.cumsum(self._tri_areas[order])
+                    total   = cumarea[-1]
+                    edges_t = np.linspace(0, total, n_groups + 1)
+                    for g in range(n_groups):
+                        mask = (cumarea > edges_t[g]) & (cumarea <= edges_t[g + 1])
+                        if g == 0:
+                            mask |= (cumarea <= edges_t[1])
+                        labels[order[mask]] = g
+            else:
+                labels = np.asarray(space(centroids), dtype=int).ravel()
+                if len(labels) != len(self._faces):
+                    raise ValueError(
+                        f"set_partition: space callable returned {len(labels)} "
+                        f"labels but the mesh has {len(self._faces)} triangles.")
+
+            self._partition_labels = labels
+            unique_labels = np.unique(labels)
+            self._partition_groups = {}
+            for lbl in unique_labels:
+                face_idx = np.where(labels == lbl)[0]
+                areas    = self._tri_areas[face_idx]
+                self._partition_groups[int(lbl)] = {
+                    'face_indices': face_idx,
+                    'tri_probs':    areas / areas.sum(),
+                    'total_area':   float(areas.sum()),
+                }
+
+            # ── Interface edges (shared between triangles of different groups) ──
+            edge_to_faces: dict = {}
+            for fi, face in enumerate(self._faces):
+                for j in range(3):
+                    v0 = int(face[j])
+                    v1 = int(face[(j + 1) % 3])
+                    key = (min(v0, v1), max(v0, v1))
+                    edge_to_faces.setdefault(key, []).append(fi)
+            iface = [list(key) for key, flist in edge_to_faces.items()
+                     if len(flist) == 2 and labels[flist[0]] != labels[flist[1]]]
+            if iface:
+                self._partition_interface_edges = np.array(iface, dtype=np.int64)
+                p0 = self._vertices[self._partition_interface_edges[:, 0]]
+                p1 = self._vertices[self._partition_interface_edges[:, 1]]
+                self._partition_interface_lengths = np.linalg.norm(p1 - p0, axis=1)
+            else:
+                self._partition_interface_edges   = np.empty((0, 2), dtype=np.int64)
+                self._partition_interface_lengths = np.empty(0)
+
+        # ── Time partition ───────────────────────────────────────────────
+        if time is not None:
+            if self._t_min is None:
+                raise ValueError(
+                    "set_partition: 'time' requires the domain to have a time "
+                    "axis.  Construct DomainMesh with a time=(t_min, t_max) or "
+                    "time-steps array.")
+            if isinstance(time, (int, np.integer)):
+                self._time_grid_positions = np.linspace(
+                    self._t_min, self._t_max, int(time) + 1)
+            else:
+                self._time_grid_positions = np.asarray(time, dtype=float).ravel()
+                if len(self._time_grid_positions) < 2:
+                    raise ValueError(
+                        "set_partition: 'time' must have at least 2 breakpoints.")
+            self._n_time_partitions = len(self._time_grid_positions) - 1
+
+    # ── Partition sampling helpers ──────────────────────────────────────
+
+    def _sample_partition_interior(self, n_points: int, size, rng) -> np.ndarray:
+        """Sample interior points across (spatial group × time interval) cells."""
+        groups = self._partition_groups
+        grp_keys = list(groups.keys())
+        n_sp = len(grp_keys)
+
+        # Time intervals
+        if self._time_grid_positions is not None:
+            t_breaks = self._time_grid_positions
+            t_spans  = np.diff(t_breaks)
+            n_t      = len(t_spans)
+        else:
+            t_spans  = np.array([1.0]) if self._t_min is None else np.array([self._t_max - self._t_min])
+            n_t      = 1
+
+        n_cells = n_sp * n_t
+
+        # Compute weights per cell
+        sp_areas = np.array([groups[k]['total_area'] for k in grp_keys])
+        if size == 'equal':
+            cell_weights = np.ones(n_cells, dtype=float)
+        elif size == 'size':
+            cell_weights = np.tile(sp_areas, n_t) * np.repeat(t_spans, n_sp)
+        else:
+            arr = np.asarray(size, dtype=float)
+            if arr.size == n_cells:
+                cell_weights = arr.ravel()
+            elif arr.size == n_sp:
+                cell_weights = np.tile(arr, n_t)
+            else:
+                raise ValueError(
+                    f"set_partition interior: 'size' has {arr.size} elements "
+                    f"but there are {n_cells} cells ({n_sp} spatial × {n_t} time).")
+        cell_weights = cell_weights / cell_weights.sum()
+
+        # Largest-remainder rounding
+        raw     = cell_weights * n_points
+        counts  = raw.astype(int)
+        remains = raw - counts
+        deficit = n_points - counts.sum()
+        if deficit > 0:
+            top = np.argsort(remains)[::-1][:deficit]
+            counts[top] += 1
+
+        parts = []
+        for ci, cnt in enumerate(counts):
+            if cnt == 0:
+                continue
+            sp_i = ci % n_sp
+            t_i  = ci // n_sp
+            grp  = groups[grp_keys[sp_i]]
+            # spatial barycentric
+            f    = self._faces[grp['face_indices']]
+            v    = self._vertices
+            sel  = rng.choice(len(f), cnt, p=grp['tri_probs'])
+            A    = v[f[sel, 0]]
+            B    = v[f[sel, 1]]
+            C    = v[f[sel, 2]]
+            r1   = rng.uniform(0.0, 1.0, cnt)
+            r2   = rng.uniform(0.0, 1.0, cnt)
+            swap = r1 + r2 > 1.0
+            r1[swap] = 1.0 - r1[swap]
+            r2[swap] = 1.0 - r2[swap]
+            pts_sp = r1[:, None] * A + r2[:, None] * B + (1 - r1 - r2)[:, None] * C
+            # time
+            if self._t_min is not None:
+                if self._time_grid_positions is not None:
+                    t = rng.uniform(t_breaks[t_i], t_breaks[t_i + 1], (cnt, 1))
+                else:
+                    t = rng.uniform(self._t_min, self._t_max, (cnt, 1))
+                parts.append(np.hstack([pts_sp, t]))
+            else:
+                parts.append(pts_sp)
+
+        return np.vstack(parts) if parts else np.empty((0, self.n_dims))
+
+    def _sample_partition_outer_boundary(self, n_points: int, size, rng) -> np.ndarray:
+        """Sample points on the outer mesh boundary (existing boundary edges)."""
+        if self._bnd_edge_probs is None or len(self._bnd_edges) == 0:
+            raise ValueError(
+                "region='partition_outer': the mesh has no detected boundary edges.")
+        idx     = rng.choice(len(self._bnd_edges), n_points,
+                              p=self._bnd_edge_probs)
+        t_param = rng.uniform(0.0, 1.0, (n_points, 1))
+        v0      = self._vertices[self._bnd_edges[idx, 0]]
+        v1      = self._vertices[self._bnd_edges[idx, 1]]
+        pts_sp  = v0 + t_param * (v1 - v0)
+        if self._t_min is not None:
+            return np.hstack([pts_sp,
+                               rng.uniform(self._t_min, self._t_max, (n_points, 1))])
+        return pts_sp
+
+    def _sample_partition_inner_boundary(self, n_points: int, size, rng) -> np.ndarray:
+        """Sample points on interface edges between partition groups."""
+        if (self._partition_interface_edges is None or
+                len(self._partition_interface_edges) == 0):
+            raise ValueError(
+                "region='partition_inner': no interface edges found. "
+                "Did you call set_partition(space=...)?")
+        lengths = self._partition_interface_lengths
+        probs   = lengths / lengths.sum()
+        idx     = rng.choice(len(self._partition_interface_edges), n_points, p=probs)
+        t_param = rng.uniform(0.0, 1.0, (n_points, 1))
+        v0      = self._vertices[self._partition_interface_edges[idx, 0]]
+        v1      = self._vertices[self._partition_interface_edges[idx, 1]]
+        pts_sp  = v0 + t_param * (v1 - v0)
+        if self._t_min is not None:
+            return np.hstack([pts_sp,
+                               rng.uniform(self._t_min, self._t_max, (n_points, 1))])
+        return pts_sp
 
     # ------------------------------------------------------------------ #
     #  Region registration                                                #
@@ -2862,6 +3535,12 @@ class DomainMesh:
             rng = np.random.default_rng()
         if region is None or region == 'all':
             return self._sample_region_interior_all(n_points, rng)
+        if region == 'partition':
+            if self._partition_groups is None:
+                raise ValueError(
+                    "region='partition' requires set_partition(space=...) to be "
+                    "called first.")
+            return self._sample_partition_interior(n_points, size, rng)
         if isinstance(region, str):
             if region not in self._inner_regions:
                 raise KeyError(
@@ -2931,6 +3610,28 @@ class DomainMesh:
         # ── New region-based API ─────────────────────────────────────────
         if region is None or region == 'all':
             return self._sample_boundary_all_edges(n_points, rng)
+        if region == 'partition_outer':
+            return self._sample_partition_outer_boundary(n_points, size, rng)
+        if region == 'partition_inner':
+            return self._sample_partition_inner_boundary(n_points, size, rng)
+        if region == 'partition':
+            # split n_points between outer and inner boundary by length
+            outer_total = (self._bnd_edge_lengths.sum()
+                           if self._bnd_edge_lengths is not None else 0.0)
+            inner_total = (self._partition_interface_lengths.sum()
+                           if self._partition_interface_lengths is not None
+                              and len(self._partition_interface_lengths) > 0 else 0.0)
+            total = outer_total + inner_total
+            if total == 0:
+                raise ValueError("region='boundary': no boundary or interface edges found.")
+            n_outer = int(round(n_points * outer_total / total))
+            n_inner = n_points - n_outer
+            parts = []
+            if n_outer > 0:
+                parts.append(self._sample_partition_outer_boundary(n_outer, size, rng))
+            if n_inner > 0:
+                parts.append(self._sample_partition_inner_boundary(n_inner, size, rng))
+            return np.vstack(parts)
         if isinstance(region, str):
             if region not in self._boundary_regions:
                 raise KeyError(
@@ -3155,10 +3856,18 @@ class DomainMesh:
         # name   → draw only that region
         # None   → draw nothing
         _inner_all = (region == 'all')
+        _inner_partition = region in ('partition', 'all')
         if region is None or region == 'none':
             _inner_highlight = []
         elif region == 'all':
-            _inner_highlight = []   # handled separately as full-mesh fill
+            # partition grid + all custom named regions
+            _inner_highlight = list(self._inner_regions.keys())
+        elif region in ('partition', 'subdomains'):
+            # partition grid only, no custom named regions
+            _inner_highlight = []
+        elif region in ('custom', 'inner'):
+            # custom named regions only, no partition grid
+            _inner_highlight = list(self._inner_regions.keys())
         elif isinstance(region, str):
             _inner_highlight = [region]
         elif isinstance(region, list):
@@ -3167,10 +3876,19 @@ class DomainMesh:
             _inner_highlight = []
 
         _bnd_all = (boundary == 'all')
+        _bnd_inner = boundary in ('partition_inner', 'partition')
+        _bnd_outer = boundary in ('partition_outer', 'partition', 'all')
         if boundary is None:
             _bnd_highlight = []
         elif boundary == 'all':
-            _bnd_highlight = []     # handled separately as full-boundary draw
+            # partition boundaries + all custom named boundary regions
+            _bnd_highlight = list(self._boundary_regions.keys())
+        elif boundary in ('partition_inner', 'partition_outer', 'partition'):
+            # partition boundaries only, no custom named boundary regions
+            _bnd_highlight = []
+        elif boundary in ('custom', 'inner'):
+            # custom named boundary regions only
+            _bnd_highlight = list(self._boundary_regions.keys())
         elif isinstance(boundary, str):
             _bnd_highlight = [boundary]
         elif isinstance(boundary, list):
@@ -3236,7 +3954,9 @@ class DomainMesh:
         n_panels = len(phases)
         panel_w, panel_h = 6.0, 5.5
         if figsize is None:
-            figsize = (panel_w * n_panels, panel_h)
+            _has_legend = (region is not None or boundary is not None or show_bcs)
+            _legend_extra = 2.0 if _has_legend else 0.0
+            figsize = (panel_w * n_panels + _legend_extra, panel_h)
 
         fig, axes = plt.subplots(1, n_panels, figsize=figsize, squeeze=False)
         axes = axes[0]   # (n_panels,)
@@ -3248,7 +3968,20 @@ class DomainMesh:
             self._draw_background(ax, show_mesh)
 
             # ── Highlight inner regions ────────────────────────────────────
-            if _inner_all:
+            if _inner_partition and self._partition_groups is not None:
+                # One colour per partition group
+                _part_palette = ['#1f77b4', '#2ca02c', '#d62728', '#9467bd',
+                                  '#8c564b', '#e377c2', '#bcbd22', '#17becf',
+                                  '#ff7f0e', '#7f7f7f']
+                for gi, (lbl, grp) in enumerate(self._partition_groups.items()):
+                    fidx  = grp['face_indices']
+                    color = _part_palette[gi % len(_part_palette)]
+                    tris  = v[f[fidx]]
+                    poly  = mcoll.PolyCollection(
+                        tris, facecolor=color, edgecolor='none', alpha=0.40,
+                        zorder=2, label=f'[P] group {lbl}')
+                    ax.add_collection(poly)
+            elif _inner_all:
                 # Fill all triangles as one unified region
                 tris = v[f]
                 poly = mcoll.PolyCollection(
@@ -3269,15 +4002,29 @@ class DomainMesh:
                     ax.add_collection(poly)
 
             # ── Highlight boundary regions ─────────────────────────────────
-            if _bnd_all:
-                # Draw all boundary edges as one unified colour
-                all_edges = self._bnd_edges          # (E, 2)
+            if _bnd_outer and self._bnd_edges is not None and len(self._bnd_edges) > 0:
+                all_edges = self._bnd_edges
+                segs = np.stack([v[all_edges[:, 0]], v[all_edges[:, 1]]], axis=1)
+                lcol = mcoll.LineCollection(
+                    segs, colors='#ff7f0e', linewidths=3.0, zorder=4,
+                    label='outer boundary')
+                ax.add_collection(lcol)
+            elif _bnd_all and not _bnd_outer:
+                # legacy 'all' without partition: draw all boundary edges
+                all_edges = self._bnd_edges
                 segs = np.stack([v[all_edges[:, 0]], v[all_edges[:, 1]]], axis=1)
                 lcol = mcoll.LineCollection(
                     segs, colors='#ff7f0e', linewidths=3.0, zorder=4,
                     label='boundary')
                 ax.add_collection(lcol)
-            else:
+            if _bnd_inner and self._partition_interface_edges is not None and len(self._partition_interface_edges) > 0:
+                ie   = self._partition_interface_edges
+                segs = np.stack([v[ie[:, 0]], v[ie[:, 1]]], axis=1)
+                lcol = mcoll.LineCollection(
+                    segs, colors='#d62728', linewidths=2.0, linestyles='--',
+                    zorder=5, label='inner boundary')
+                ax.add_collection(lcol)
+            if not _bnd_outer and not _bnd_inner:
                 for nm in _bnd_highlight:
                     if nm not in self._boundary_regions:
                         continue
@@ -3318,7 +4065,8 @@ class DomainMesh:
             visible = [(h, l) for h, l in zip(handles, labels)
                        if not l.startswith("_")]
             if visible:
-                ax.legend(*zip(*visible), loc="upper right",
+                ax.legend(*zip(*visible), loc='upper left',
+                          bbox_to_anchor=(1.01, 1), borderaxespad=0,
                           fontsize=8, framealpha=0.85)
 
         t_info = (f" × t∈[{self._t_min:.3g}, {self._t_max:.3g}]"
