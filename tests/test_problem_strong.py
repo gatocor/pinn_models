@@ -3,8 +3,8 @@ import numpy as np
 import pytest
 
 from pinns.domain import DomainCubic
-from pinns.problem import ProblemStrong
-from pinns.strategies import StrategyUnique, StrategyFB, StrategyX, StrategyStep
+from pinns.problems.problem_strong import ProblemStrong
+from pinns import PartitionFB, PartitionX, StepperStep
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +27,7 @@ def _domain_1d_time():
 
 
 def _domain_1d_step():
-    """1-D+time domain with a partitioned time axis — required by StrategyStep."""
+    """1-D+time domain with a partitioned time axis — required by StepperStep."""
     return DomainCubic(space=[(0.0, 1.0)], time=np.linspace(0.0, 1.0, 6))
 
 
@@ -63,21 +63,17 @@ class TestConstruction:
 
     # ── strategy validation ──────────────────────────────────────────────
 
-    def test_valid_strategy_base(self):
-        p = ProblemStrong(_domain_1d(), ['u'], strategy=StrategyUnique())
-        assert isinstance(p.strategy, StrategyUnique)
-
     def test_valid_strategy_fb(self):
-        p = ProblemStrong(_domain_1d(), ['u'], strategy=StrategyFB())
-        assert isinstance(p.strategy, StrategyFB)
+        p = ProblemStrong(_domain_1d(), ['u'], strategy=PartitionFB())
+        assert isinstance(p.strategy, PartitionFB)
 
     def test_valid_strategy_x(self):
-        p = ProblemStrong(_domain_1d(), ['u'], strategy=StrategyX())
-        assert isinstance(p.strategy, StrategyX)
+        p = ProblemStrong(_domain_1d(), ['u'], strategy=PartitionX())
+        assert isinstance(p.strategy, PartitionX)
 
     def test_valid_strategy_step(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StrategyStep())
-        assert isinstance(p.strategy, StrategyStep)
+        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StepperStep())
+        assert isinstance(p.strategy, StepperStep)
         assert p.stepper is p.strategy
 
     def test_bad_strategy_raises(self):
@@ -92,13 +88,13 @@ class TestConstruction:
     # ── stepper= backward compat ─────────────────────────────────────────
 
     def test_stepper_compat(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], stepper=StrategyStep())
-        assert isinstance(p.strategy, StrategyStep)
+        p = ProblemStrong(_domain_1d_step(), ['u'], stepper=StepperStep())
+        assert isinstance(p.strategy, StepperStep)
         assert p.stepper is p.strategy
 
     def test_stepper_bad_type_raises(self):
         with pytest.raises(TypeError, match="stepper must be"):
-            ProblemStrong(_domain_1d_step(), ['u'], stepper=StrategyUnique())
+            ProblemStrong(_domain_1d_step(), ['u'], stepper=PartitionFB())
 
 
 # ---------------------------------------------------------------------------
@@ -333,9 +329,9 @@ class TestParams:
 
 class TestAddDependency:
     def _stepping_problem(self):
-        """ProblemStrong with StrategyStep ready for add_dependency."""
+        """ProblemStrong with StepperStep ready for add_dependency."""
         return ProblemStrong(
-            _domain_1d_step(), ['u'], strategy=StrategyStep()
+            _domain_1d_step(), ['u'], strategy=StepperStep()
         )
 
     def test_basic(self):
@@ -380,12 +376,12 @@ class TestAddDependency:
 
     def test_requires_strategy_step(self):
         p = ProblemStrong(_domain_1d_step(), ['u'])  # no strategy
-        with pytest.raises(TypeError, match="StrategyStep"):
+        with pytest.raises(TypeError, match="StepperStep"):
             p.add_dependency('u_prev')
 
     def test_requires_strategy_step_not_base(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StrategyUnique())
-        with pytest.raises(TypeError, match="StrategyStep"):
+        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=PartitionFB())
+        with pytest.raises(TypeError, match="StepperStep"):
             p.add_dependency('u_prev')
 
 
@@ -399,17 +395,17 @@ class TestIsSteppingAndValidate:
         assert p.is_stepping is False
 
     def test_is_stepping_with_strategy_step(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StrategyStep())
+        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StepperStep())
         assert p.is_stepping is True
 
     def test_validate_ok_stepping_with_ic(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StrategyStep())
+        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StepperStep())
         p.add_dependency('u_prev')
         p.add_initial(_res, name='ic')
         p.validate()  # should not raise
 
     def test_validate_stepping_no_ic_raises(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StrategyStep())
+        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StepperStep())
         p.add_dependency('u_prev')
         with pytest.raises(ValueError, match="initial condition"):
             p.validate()

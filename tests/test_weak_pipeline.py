@@ -37,7 +37,7 @@ def check(name, condition, detail=""):
 # TEST 1 — Cubature weights sum to element area
 # ============================================================
 print("\n=== TEST 1: cubature weights sum to area ===")
-from pinns.problem_weak import _triangle_cubature, _precompute_volume
+from pinns.problems.problem_weak import _triangle_cubature, _precompute_volume
 
 for order in [1, 2, 3, 4, 5]:
     ref_pts, ref_w = _triangle_cubature(order)
@@ -86,7 +86,7 @@ for k in range(2):
 print("\n=== TEST 4: phi_a(vertex_b) = delta_{ab} ===")
 # For face 0 = (0,1,2): vertices are at barycentric (1,0,0),(0,1,0),(0,0,1)
 # which correspond to reference coords (xi, eta) = (0,0), (1,0), (0,1)
-from pinns.problem_weak import _lagrange_basis_and_grad
+from pinns.problems.problem_weak import _lagrange_basis_and_grad
 ref_corners = np.array([[0., 0.], [1., 0.], [0., 1.]])
 phi_corners, _ = _lagrange_basis_and_grad(ref_corners, N=1)   # (3, 3)
 check("phi at ref corners = identity matrix",
@@ -189,7 +189,6 @@ check("row sums of K = 0 (∇1=0)", np.allclose(row_sums, 0, atol=1e-10),
 # ============================================================
 print("\n=== TEST 8: loss_fn on exact solution ≈ 0 ===")
 import pinns
-pinns.use_backend("jax")
 
 # Build a tiny real mesh (pygmsh-free): just our 2 triangles
 # Feed it to DomainMesh via a mock mesh object
@@ -205,7 +204,7 @@ try:
     domain = pinns.DomainMesh(mock_mesh)
 
     # No BCs → all 4 nodes free
-    from pinns.problem_weak import ProblemWeak
+    from pinns.problems.problem_weak import ProblemWeak
 
     def volume_fn_test(x, y, params, phi, grad_phi, derivative=None):
         du_dx = derivative(y, x, 0, (0,))
@@ -307,7 +306,7 @@ except Exception as e:
 # TEST 10 — _ref_nodes_pqr: correct count and unique entries
 # ============================================================
 print("\n=== TEST 10: _ref_nodes_pqr node count and uniqueness ===")
-from pinns.problem_weak import _ref_nodes_pqr
+from pinns.problems.problem_weak import _ref_nodes_pqr
 
 for N in [1, 2, 3, 4]:
     nodes = _ref_nodes_pqr(N)
@@ -325,7 +324,7 @@ for N in [1, 2, 3, 4]:
 # TEST 11 — _lagrange_basis_and_grad: partition of unity & Kronecker
 # ============================================================
 print("\n=== TEST 11: Lagrange basis – partition of unity & Kronecker delta ===")
-from pinns.problem_weak import _lagrange_basis_and_grad
+from pinns.problems.problem_weak import _lagrange_basis_and_grad
 
 for N in [1, 2, 3]:
     nodes  = _ref_nodes_pqr(N)
@@ -356,7 +355,7 @@ for N in [1, 2, 3]:
 # TEST 12 — _build_higher_order_mesh: DOF count & position accuracy
 # ============================================================
 print("\n=== TEST 12: higher-order mesh DOF counts and midpoint positions ===")
-from pinns.problem_weak import _build_higher_order_mesh
+from pinns.problems.problem_weak import _build_higher_order_mesh
 
 # 2-triangle unit-square mesh: 4 vertices, 5 unique edges, 2 elements
 verts_sq = np.array([[0., 0.], [1., 0.], [1., 1.], [0., 1.]], dtype=np.float64)
@@ -554,7 +553,7 @@ except Exception as e:
 # TEST 17 — _precompute_boundary_edges: shapes, weights, phi
 # ============================================================
 print("\n=== TEST 17: _precompute_boundary_edges shapes & correctness ===")
-from pinns.problem_weak import _precompute_boundary_edges
+from pinns.problems.problem_weak import _precompute_boundary_edges
 
 # Bottom edge of unit square: node 0=(0,0) → node 1=(1,0), normal=(0,-1)
 # Right  edge:                node 1=(1,0) → node 2=(1,1), normal=(1,0)
@@ -565,7 +564,7 @@ for order in [1, 2, 3]:
     bd = _precompute_boundary_edges(VERTS, edges_test, normals_test, order)
     E, Q = 2, len(_edge_cubature_1d(order)[0]) if False else bd['pts'].shape[1]
     # --- import helper so we can verify Q independently
-    from pinns.problem_weak import _edge_cubature_1d as _ec1d
+    from pinns.problems.problem_weak import _edge_cubature_1d as _ec1d
     Q_exp = len(_ec1d(order)[0])
 
     check(f"order={order}: pts   shape = (2, {Q_exp}, 2)",
@@ -609,7 +608,7 @@ check("edge 0: phi-interpolated x equals pts[:,0]",
 print("\n=== TEST 18: boundary_fn dict → boundary_fn_data populated ===")
 try:
     import pinns, types
-    from pinns.problem_weak import ProblemWeak
+    from pinns.problems.problem_weak import ProblemWeak
 
     # Mesh with labelled right and bottom edges
     mock_bc = types.SimpleNamespace()
@@ -816,7 +815,7 @@ try:
     import types
     import jax, jax.numpy as jnp
     import pinns
-    from pinns.problem_weak import ProblemWeak
+    from pinns.problems.problem_weak import ProblemWeak
 
     # VERTS / FACES defined at the top of this file ([0,1]^2, 2 triangles)
     # Right edge: node 1=(1,0) → node 2=(1,1)
@@ -911,7 +910,7 @@ try:
     import types
     import jax, jax.numpy as jnp
     import pinns
-    from pinns.problem_weak import ProblemWeak
+    from pinns.problems.problem_weak import ProblemWeak
 
     edges_right_23 = np.array([[1, 2]], dtype=np.int64)   # right edge of unit square
 
@@ -1012,7 +1011,7 @@ try:
     import types
     import jax, jax.numpy as jnp
     import pinns
-    from pinns.problem_weak import _precompute_boundary_edges, ProblemWeak
+    from pinns.problems.problem_weak import _precompute_boundary_edges, ProblemWeak
 
     # ── (a & b) unit right edge: node 1=(1,0) → node 2=(1,1), length=1 ──────
     verts_sq = VERTS          # [[0,0],[1,0],[1,1],[0,1]]

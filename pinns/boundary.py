@@ -575,7 +575,7 @@ class MeshNodeBC:
     def is_full_time_coverage(self) -> bool:
         """True if the BC is active over the entire time domain ``[t_min, t_max]``.
 
-        Used by :class:`~pinns.problem_weak.ProblemWeak` to decide which BCs
+        Used by :class:`~pinns.problems.problem_weak.ProblemWeak` to decide which BCs
         can be imposed as hard constraints.  Returns ``True`` for purely
         spatial domains (no time axis) as well as for continuous-interval BCs
         whose window spans ``[t_min, t_max]`` exactly.

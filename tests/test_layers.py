@@ -1,4 +1,4 @@
-"""Tests for pinns.layers — all composable layer types.
+"""Tests for pinns.models.layers — all composable layer types.
 
 Run with:
     conda run -n pinn python -m pytest tests/test_layers.py -v --override-ini addopts=
@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from pinns.layers import (
+from pinns.models.layers import (
     FourierFeatures, GNNFeatures, LaplacianFeatures, AlphaTransform,
     Normalize, Denormalize,
     FNN, WFFNN, ResNet, PirateNet,
@@ -131,16 +131,17 @@ class TestFourierFeatures:
         assert "sigma=5.0" in r
 
     def test_compose_with_fnn(self):
-        """FourierFeatures can be used as feature_encoding with FNN."""
-        from pinns.base_models import FNN
+        """FourierFeatures can be used as input to an FNN layer."""
+        from pinns.models.layers.fnn import FNNModule
         ff = FourierFeatures(input_dim=2, n_features=8)
-        net = FNN(layer_sizes=[ff.output_dim, 32, 1], feature_encoding=ff)
-        params = net.init(RNG)
-        y = net.apply(params, jnp.ones((BATCH, 2)))
+        module = FNNModule(layer_sizes=(ff.output_dim, 32, 1))
+        features = ff(jnp.ones((BATCH, 2)))
+        params = module.init(RNG, features[:1])
+        y = module.apply(params, features)
         assert y.shape == (BATCH, 1)
 
     def test_aliased_in_layers_module(self):
-        import pinns.layers as T
+        import pinns.models.layers as T
         assert T.FourierFeatures is FourierFeatures
 
 
@@ -280,18 +281,18 @@ class TestGNNFeatures:
         assert "hidden_dim=8" in r
 
     def test_compose_with_fnn(self, simple_domain, query_spatial):
-        """GNNFeatures can be used as feature_encoding with FNN."""
-        from pinns.base_models import FNN
+        """GNNFeatures can be used as input to an FNN layer."""
+        from pinns.models.layers.fnn import FNNModule
         enc = GNNFeatures(simple_domain, hidden_dim=8, message_steps=1)
-        net = FNN(layer_sizes=[enc.output_dim, 16, 1])
-        net_params = net.init(RNG)
+        module = FNNModule(layer_sizes=(enc.output_dim, 16, 1))
         enc_params = enc.init(jax.random.PRNGKey(1))
         features = enc(enc_params, query_spatial)
-        y = net.apply(net_params, features)
+        net_params = module.init(RNG, features[:1])
+        y = module.apply(net_params, features)
         assert y.shape == (BATCH, 1)
 
     def test_aliased_in_layers_module(self):
-        import pinns.layers as T
+        import pinns.models.layers as T
         assert T.GNNFeatures is GNNFeatures
 
 
@@ -349,18 +350,17 @@ class TestLaplacianFeatures:
         assert AlphaTransform is LaplacianFeatures
 
     def test_compose_with_fnn(self, simple_domain, query_spatial):
-        """LaplacianFeatures can be used as feature_encoding with FNN."""
-        from pinns.base_models import FNN
+        """LaplacianFeatures can be used as input to an FNN layer."""
+        from pinns.models.layers.fnn import FNNModule
         enc = LaplacianFeatures(simple_domain, n_features=3)
-        # layer_sizes[0] == enc.output_dim so the default dummy (1, 3) is correct.
-        # Do NOT pass a spatial (1, 2) dummy — FNN.init bypasses the encoding.
-        net = FNN(layer_sizes=[enc.output_dim, 16, 1], feature_encoding=enc)
-        params = net.init(RNG)
-        y = net.apply(params, query_spatial)
+        features = enc(query_spatial)
+        module = FNNModule(layer_sizes=(enc.output_dim, 16, 1))
+        params = module.init(RNG, features[:1])
+        y = module.apply(params, features)
         assert y.shape == (BATCH, 1)
 
     def test_aliased_in_layers_module(self):
-        import pinns.layers as T
+        import pinns.models.layers as T
         assert T.LaplacianFeatures is LaplacianFeatures
         assert T.AlphaTransform is AlphaTransform
 
@@ -532,14 +532,14 @@ class TestContextFields:
 
 
 # ===========================================================================
-# Normalize / Denormalize (standalone — no Network required)
+# Normalize / Denormalize (standalone — no ModelBase required)
 # ===========================================================================
 
 class TestNormalizeLayer:
 
     def test_spatial_normalize(self, simple_domain):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1)
         layer = Normalize()
         net.add(layer)
         params = net.init(RNG)
@@ -550,22 +550,22 @@ class TestNormalizeLayer:
         assert float(out.max()) <=  1.0 + 1e-5
 
     def test_init_returns_empty(self, simple_domain):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1)
         layer = Normalize()
         net.add(layer)
         assert layer.init(RNG) == {}
 
     def test_repr(self, simple_domain):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1)
         layer = Normalize()
         net.add(layer)
         assert "Normalize" in repr(layer)
 
     def test_denormalize_noop_without_range(self, simple_domain):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1)
         layer = Denormalize()
         net.add(layer)
         x = jnp.ones((BATCH, 1))
@@ -573,8 +573,8 @@ class TestNormalizeLayer:
         assert jnp.allclose(x, out)
 
     def test_denormalize_rescales(self, simple_domain):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1, output_range=(0.0, 2.0))
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1, output_range=(0.0, 2.0))
         layer = Denormalize()
         net.add(layer)
         # Input -1 → 0.0, input 1 → 2.0
@@ -590,15 +590,15 @@ class TestNormalizeLayer:
 class TestFNNLayer:
 
     def test_configure_sets_layer_sizes(self, simple_domain, query_spatial):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1)
         layer = FNN([32, 32])
         net.add(layer)
         assert layer._layer_sizes == [2, 32, 32, 1]
 
     def test_forward_shape(self, simple_domain, query_spatial):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=2)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=2)
         layer = FNN([64])
         net.add(layer)
         params = layer.init(RNG)
@@ -606,16 +606,16 @@ class TestFNNLayer:
         assert out.shape == (BATCH, 2)
 
     def test_repr(self, simple_domain):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1)
         layer = FNN([32])
         net.add(layer)
         assert "FNN" in repr(layer)
         assert "[2, 32, 1]" in repr(layer)
 
     def test_wffnn_configure_and_forward(self, simple_domain, query_spatial):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1)
         layer = WFFNN([32])
         net.add(layer)
         params = layer.init(RNG)
@@ -630,8 +630,8 @@ class TestFNNLayer:
 class TestResNetLayer:
 
     def test_configure_and_forward(self, simple_domain, query_spatial):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1)
         layer = ResNet(hidden_dim=16, n_blocks=2)
         net.add(layer)
         params = layer.init(RNG)
@@ -639,16 +639,16 @@ class TestResNetLayer:
         assert out.shape == (BATCH, 1)
 
     def test_repr(self, simple_domain):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1)
         layer = ResNet(hidden_dim=16, n_blocks=2)
         net.add(layer)
         assert "ResNet" in repr(layer)
         assert "hidden_dim=16" in repr(layer)
 
     def test_spacetime_input(self, spacetime_domain, query_spacetime):
-        from pinns.network import Network
-        net = Network(spacetime_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(spacetime_domain, output_dim=1)
         layer = ResNet(hidden_dim=16, n_blocks=2)
         net.add(layer)
         params = layer.init(RNG)
@@ -656,8 +656,8 @@ class TestResNetLayer:
         assert out.shape == (BATCH, 1)
 
     def test_multi_output(self, simple_domain, query_spatial):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=3)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=3)
         layer = ResNet(hidden_dim=32, n_blocks=1)
         net.add(layer)
         params = layer.init(RNG)
@@ -672,8 +672,8 @@ class TestResNetLayer:
 class TestPirateNetLayer:
 
     def test_configure_and_forward(self, simple_domain, query_spatial):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1)
         layer = PirateNet(hidden_dim=16, n_blocks=2)
         net.add(layer)
         params = layer.init(RNG)
@@ -681,16 +681,16 @@ class TestPirateNetLayer:
         assert out.shape == (BATCH, 1)
 
     def test_repr(self, simple_domain):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=1)
         layer = PirateNet(hidden_dim=16, n_blocks=2)
         net.add(layer)
         assert "PirateNet" in repr(layer)
         assert "hidden_dim=16" in repr(layer)
 
     def test_spacetime_input(self, spacetime_domain, query_spacetime):
-        from pinns.network import Network
-        net = Network(spacetime_domain, output_dim=1)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(spacetime_domain, output_dim=1)
         layer = PirateNet(hidden_dim=16, n_blocks=2)
         net.add(layer)
         params = layer.init(RNG)
@@ -698,8 +698,8 @@ class TestPirateNetLayer:
         assert out.shape == (BATCH, 1)
 
     def test_multi_output(self, simple_domain, query_spatial):
-        from pinns.network import Network
-        net = Network(simple_domain, output_dim=3)
+        from pinns.models.model_base import ModelBase
+        net = ModelBase(simple_domain, output_dim=3)
         layer = PirateNet(hidden_dim=32, n_blocks=1)
         net.add(layer)
         params = layer.init(RNG)
@@ -713,25 +713,25 @@ class TestPirateNetLayer:
 
 
 def test_layers_module_exports():
-    import pinns.layers as L
+    import pinns.models.layers as L
     for name in [
         "FourierFeatures", "GNNFeatures", "LaplacianFeatures", "AlphaTransform",
         "Normalize", "Denormalize",
         "FNN", "WFFNN", "ResNet", "PirateNet",
     ]:
-        assert hasattr(L, name), f"pinns.layers missing {name}"
+        assert hasattr(L, name), f"pinns.models.layers missing {name}"
 
 
 def test_pinns_has_layers_attribute():
     import pinns
     assert hasattr(pinns, "layers")
-    assert hasattr(pinns.layers, "FourierFeatures")
-    assert hasattr(pinns.layers, "GNNFeatures")
-    assert hasattr(pinns.layers, "LaplacianFeatures")
-    assert hasattr(pinns.layers, "Normalize")
-    assert hasattr(pinns.layers, "FNN")
-    assert hasattr(pinns.layers, "ResNet")
-    assert hasattr(pinns.layers, "PirateNet")
+    assert hasattr(pinns.models.layers, "FourierFeatures")
+    assert hasattr(pinns.models.layers, "GNNFeatures")
+    assert hasattr(pinns.models.layers, "LaplacianFeatures")
+    assert hasattr(pinns.models.layers, "Normalize")
+    assert hasattr(pinns.models.layers, "FNN")
+    assert hasattr(pinns.models.layers, "ResNet")
+    assert hasattr(pinns.models.layers, "PirateNet")
 
 
 if __name__ == "__main__":
