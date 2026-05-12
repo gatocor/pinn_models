@@ -1078,4 +1078,3 @@ class ProblemStrong:
 # ---------------------------------------------------------------------------
 
 #: Deprecated — use :class:`ProblemStrong` directly.
-Problem = ProblemStrong

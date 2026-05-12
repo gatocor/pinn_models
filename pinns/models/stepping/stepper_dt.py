@@ -31,8 +31,7 @@ class StepperDt:
 
         m = create_model(domain, output_dim=1,
                          context_range=[(0.0, 1.0)],
-                         stepper=True,
-                         stepper_strategy=StepperDt(dt=0.01))
+                         stepper=StepperDt(dt=0.01))
 
         # Rollout for 50 steps starting at t=0:
         traj = m.rollout(params, x_spatial, initial_output, n_steps=50, t0=0.0)

@@ -344,9 +344,9 @@ def _build_bc_arrays(domain, n_nodes: int, n_outputs: int, verts: np.ndarray):
     """Build hard-BC mask and value arrays from domain Dirichlet BCs."""
     bc_mask   = np.zeros((n_nodes, n_outputs), dtype=np.float32)
     bc_values = np.zeros((n_nodes, n_outputs), dtype=np.float32)
-    from pinns.boundary import MeshNodeBC
+    from pinns.terms import TermMeshNodeBC
     for bc in getattr(domain, 'boundary_conditions', []):
-        if not (isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet'):
+        if not (isinstance(bc, TermMeshNodeBC) and bc.bc_type == 'dirichlet'):
             continue
         t_mode = getattr(bc, 't_mode', None)
         if t_mode not in (None, 'all'):

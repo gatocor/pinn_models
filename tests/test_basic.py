@@ -1,91 +1,91 @@
-"""Basic tests for pinns package."""
+"""Basic tests for the pinns package — current API only."""
 
 import numpy as np
-import torch
 import pytest
 
 
 def test_import():
-    """Test that the package can be imported."""
+    """Package imports cleanly and exposes key symbols."""
     import pinns
     assert hasattr(pinns, '__version__')
-    assert hasattr(pinns, 'DomainCubicPartition')
     assert hasattr(pinns, 'FNN')
-    assert hasattr(pinns, 'FBPINN')
+    assert hasattr(pinns, 'ModelBase')
+    assert hasattr(pinns, 'DomainCubic')
+    assert hasattr(pinns, 'DomainMesh')
+    assert hasattr(pinns, 'TermDirichletBC')
+    assert hasattr(pinns, 'TermNeumannBC')
+    assert hasattr(pinns, 'TermCollection')
+    assert hasattr(pinns, 'ProblemStrong')
+    assert hasattr(pinns, 'ProblemWeak')
 
 
-def test_domain_partition():
-    """Test DomainCubicPartition creation."""
-    from pinns import DomainCubicPartition
-    
-    domain = DomainCubicPartition(
-        positions=[np.linspace(0, 1, 5), np.linspace(0, 2, 3)],
-        widths=[np.full(5, 0.3), np.full(3, 0.8)]
-    )
-    
-    assert domain.n_dims == 2
-    assert domain.n_subdomains == 15  # 5 * 3
-    assert len(domain) == 15
+def test_domain_cubic():
+    """DomainCubic creation and interior sampling."""
+    from pinns import DomainCubic
+
+    domain = DomainCubic(space=[(0.0, 1.0), (0.0, 1.0)])
+    points = domain.sample_interior(500)
+    assert points.shape == (500, 2)
+    assert (points >= 0.0).all()
+    assert (points <= 1.0).all()
 
 
 def test_vanilla_network():
-    """Test FNN creation and forward pass."""
-    from pinns import FNN
-    
-    net = FNN([2, 32, 32, 1], activation='tanh')
-    x = torch.randn(100, 2)
-    y = net(x)
-    
+    """ModelBase + FNN layer creation and forward pass."""
+    from pinns import ModelBase, FNN, DomainCubic
+    import jax
+    import jax.numpy as jnp
+
+    domain = DomainCubic(space=[(0.0, 1.0), (0.0, 1.0)])
+    net = ModelBase(domain, output_dim=1)
+    net.add(FNN([32, 32], activation='tanh'))
+
+    rng = jax.random.PRNGKey(0)
+    params = net.init(rng)
+    x = jnp.ones((100, 2))
+    y = net.apply(params, x, {})
+
     assert y.shape == (100, 1)
 
 
-def test_fbpinn():
-    """Test FBPINN creation and forward pass."""
-    from pinns import DomainCubicPartition, FNN, FBPINN
-    
-    domain = DomainCubicPartition(
-        positions=[np.linspace(0, 1, 3)],
-        widths=[np.full(3, 0.5)]
-    )
-    
-    network = FNN([1, 16, 1])
-    fbpinn = FBPINN(domain, network, sigma=0.1)
-    
-    x = torch.randn(50, 1)
-    y = fbpinn(x)
-    
-    assert y.shape == (50, 1)
-
-
 def test_boundary_conditions():
-    """Test boundary condition creation."""
-    from pinns import DirichletBC, NeumannBC, BoundaryConditions
-    
-    bc1 = DirichletBC(boundary=(0, None), value=0.0, component=0)
-    bc2 = NeumannBC(boundary=(None, 1), value=1.0, component=0)
-    
-    bcs = BoundaryConditions()
+    """TermDirichletBC / TermNeumannBC creation and TermCollection."""
+    from pinns import TermDirichletBC, TermNeumannBC, TermCollection
+
+    bc1 = TermDirichletBC(region='xmin', value=0.0, component=0, name='left')
+    bc2 = TermNeumannBC(region='xmax', value=1.0, component=0, name='right')
+
+    bcs = TermCollection()
     bcs.add(bc1)
     bcs.add(bc2)
-    
+
     assert len(bcs) == 2
-    assert len(bcs.dirichlet) == 1
-    assert len(bcs.neumann) == 1
+    assert bc1.region == 'xmin'
+    assert bc1.value == 0.0
+    assert bc2.region == 'xmax'
+    assert bc2.name == 'right'
 
 
-def test_sampling():
-    """Test domain sampling."""
-    from pinns import DomainCubicPartition
-    
-    domain = DomainCubicPartition(
-        positions=[np.linspace(0, 1, 5), np.linspace(0, 1, 5)],
-        widths=[np.full(5, 0.3), np.full(5, 0.3)]
-    )
-    
-    # Interior sampling
-    points = domain.sample_interior(1000, mode='uniform')
-    assert points.shape == (1000, 2)
-    
-    # Boundary sampling
-    boundary_points = domain.sample_boundary(100, boundary_dim=0, boundary_side='lower')
-    assert boundary_points.shape == (100, 2)
+def test_term_points():
+    """TermPoints with observation data."""
+    from pinns import TermPoints
+
+    x_obs = np.random.rand(50, 2).astype(np.float32)
+    u_obs = np.zeros(50, dtype=np.float32)
+
+    term = TermPoints(inputs=x_obs, outputs=u_obs, components=0, name='obs')
+    assert term.inputs.shape == (50, 2)
+    assert term.outputs.shape == (50, 1)
+    assert term.components == [0]
+
+
+def test_term_collection_repr():
+    """TermCollection __repr__ works."""
+    from pinns import TermDirichletBC, TermCollection
+
+    col = TermCollection()
+    col.add(TermDirichletBC(region='xmin', value=0.0))
+    col.add(TermDirichletBC(region='xmax', value=1.0))
+    r = repr(col)
+    assert 'TermCollection' in r
+    assert 'TermDirichletBC' in r

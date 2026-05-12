@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union, Literal, Tuple, Lis
 from dataclasses import dataclass
 
 if TYPE_CHECKING:
-    from ..boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC
+    from ..terms import TermDirichletBC, TermNeumannBC, TermRobinBC, TermPoints
 
 # ============================================================================
 # Subdomain info class for easy filtering
@@ -408,7 +408,7 @@ class DomainCubic:
         self.sampling_transform = sampling_transform
 
         # Storage for boundary conditions
-        self.boundary_conditions: 'List[Union[DirichletBC, NeumannBC, RobinBC, PointsetBC]]' = []
+        self.boundary_conditions: 'List[Union[TermDirichletBC, TermNeumannBC, TermRobinBC, TermPoints]]' = []
 
         # _spatial_dims records the number of spatial-only dimensions
         self._spatial_dims = self.n_dims
@@ -819,6 +819,15 @@ class DomainCubic:
             inner = self._sample_partition_inner_boundaries(
                 n_inner, size, rng, method, params)
             return np.vstack([outer, inner])
+
+        # ── built-in face labels: 'xmin', 'xmax', 'ymin', etc. ─────────────
+        if isinstance(region, str) and region.strip().lower() in self._BOUNDARY_LABEL_MAP:
+            tup = self._parse_boundary_str(region)
+            for dim, side in enumerate(tup):
+                if side is not None:
+                    return self._sample_face(
+                        n_points, dim, side, rng, method, transform, params)
+            raise ValueError(f"_parse_boundary_str returned no fixed dim for {region!r}")
 
         # ── single named custom region ────────────────────────────────────
         if isinstance(region, str):
@@ -1427,6 +1436,22 @@ class DomainCubic:
         tup[dim] = side
         return tuple(tup)
 
+    def get_face_normal_direction(self, region: str):
+        """Return ``(dim, sign)`` for a named boundary face.
+
+        Returns ``None`` if `region` is not a built-in face label.
+        `sign` is ``+1`` for the upper face and ``-1`` for the lower face.
+        """
+        key = region.strip().lower()
+        if key not in self._BOUNDARY_LABEL_MAP:
+            return None
+        dim_or_t, side = self._BOUNDARY_LABEL_MAP[key]
+        if dim_or_t == 't':
+            dim = self._spatial_dims
+        else:
+            dim = int(dim_or_t)
+        return (dim, 1 if side == 1 else -1)
+
     def _validate_subspace(self, boundary: Tuple, subspace, name: str) -> None:
         """Validate that all (lo, hi) ranges in *subspace* lie within the domain.
 
@@ -1804,7 +1829,6 @@ class DomainCubic:
 
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
-        from pinns.boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC, CubicPeriodicBC, InitialConditionBC
 
         sp_min = self.xmin[:self._spatial_dims]
         sp_max = self.xmax[:self._spatial_dims]
@@ -2065,13 +2089,13 @@ class DomainCubic:
                     color = bc_color[id(bc)]
                     label = getattr(bc, 'name', None) or type(bc).__name__
                     bc_boundary = getattr(bc, 'boundary', None)
-                    if isinstance(bc, PointsetBC):
+                    if hasattr(bc, 'inputs'):
                         pts_in = np.asarray(bc.inputs)
                         ax.scatter(pts_in[:, 0], pts_in[:, 1], pts_in[:, 2],
                                    s=30, color=color, marker='x')
                         legend_handles.append(mpatches.Patch(color=color, label=label))
                         continue
-                    if isinstance(bc, CubicPeriodicBC):
+                    if getattr(bc, 'bc_type', None) == 'cubic_periodic':
                         for side in (0, 1):
                             verts = _face_verts_3d(bc.dim, side, lo, hi)
                             ax.add_collection3d(Poly3DCollection(
@@ -2166,13 +2190,13 @@ class DomainCubic:
                     color = bc_color[id(bc)]
                     label = getattr(bc, 'name', None) or type(bc).__name__
                     bc_boundary = getattr(bc, 'boundary', None)
-                    if isinstance(bc, PointsetBC):
+                    if hasattr(bc, 'inputs'):
                         pts_in = np.asarray(bc.inputs)
                         ax.scatter(pts_in[:, 0], np.zeros(len(pts_in)),
                                    s=30, color=color, zorder=5, marker='x')
                         legend_handles.append(mpatches.Patch(color=color, label=label))
                         continue
-                    if isinstance(bc, CubicPeriodicBC):
+                    if getattr(bc, 'bc_type', None) == 'cubic_periodic':
                         for side in (0, 1):
                             coord = sp_min[bc.dim] if side == 0 else sp_max[bc.dim]
                             ax.plot([coord], [0], 'o', color=color,
@@ -2300,14 +2324,14 @@ class DomainCubic:
                     label = getattr(bc, 'name', None) or type(bc).__name__
                     bc_boundary = getattr(bc, 'boundary', None)
 
-                    if isinstance(bc, PointsetBC):
+                    if hasattr(bc, 'inputs'):
                         pts_in = np.asarray(bc.inputs)
                         ax.scatter(pts_in[:, dx], pts_in[:, dy],
                                    s=30, color=color, zorder=5, marker='x')
                         legend_handles.append(mpatches.Patch(color=color, label=label))
                         continue
 
-                    if isinstance(bc, CubicPeriodicBC):
+                    if getattr(bc, 'bc_type', None) == 'cubic_periodic':
                         for side in (0, 1):
                             _draw_face_2d(ax, bc.dim, side, dx, dy, color, linewidth=2.5)
                         legend_handles.append(mpatches.Patch(color=color, label=label))

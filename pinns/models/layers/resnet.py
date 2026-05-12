@@ -35,6 +35,7 @@ class ResNetModule(nn.Module):
     n_blocks: int = 4
     activation: str = "tanh"
     layer_norm: bool = True
+    output_projection: bool = True
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -47,7 +48,9 @@ class ResNetModule(nn.Module):
                 layer_norm=self.layer_norm,
                 name=f"block_{i}",
             )(x)
-        return nn.Dense(self.output_dim, name="output")(x)
+        if self.output_projection:
+            return nn.Dense(self.output_dim, name="output")(x)
+        return x
 
 
 class ResNet:
@@ -67,6 +70,9 @@ class ResNet:
         Activation function name (default ``'tanh'``).
     layer_norm : bool
         Apply LayerNorm inside each block (default ``True``).
+    output_dim : int or None, optional
+        Output width.  When ``None`` (default) the ModelBase's ``output_dim``
+        is used.  Pass an explicit ``int`` to override.
     """
 
     def __init__(
@@ -75,27 +81,31 @@ class ResNet:
         n_blocks: int = 4,
         activation: str = "tanh",
         layer_norm: bool = True,
+        output_dim: Optional[int] = None,
     ):
         self.hidden_dim = hidden_dim
         self.n_blocks   = n_blocks
         self.activation = activation
         self.layer_norm = layer_norm
+        self._output_dim_override = output_dim
         self._module: Optional[ResNetModule] = None
         self._input_dim: Optional[int] = None
         self._output_dim: Optional[int] = None
 
     def _configure(self, network, input_dim: int) -> int:
         self._input_dim  = input_dim
-        self._output_dim = network.output_dim
+        self._output_dim = self._output_dim_override if self._output_dim_override is not None else network.output_dim
+        output_projection = True
         self._module = ResNetModule(
             input_dim=input_dim,
-            output_dim=network.output_dim,
+            output_dim=self._output_dim,
             hidden_dim=self.hidden_dim,
             n_blocks=self.n_blocks,
             activation=self.activation,
             layer_norm=self.layer_norm,
+            output_projection=output_projection,
         )
-        return network.output_dim
+        return self._output_dim
 
     def init(self, rng) -> Dict:
         assert self._module is not None, "ResNet not configured — add to a ModelBase first"

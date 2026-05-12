@@ -7,7 +7,7 @@ Factory function for building standard PINN architectures.
 
 and optionally wraps the result with :class:`~pinns.models.model_partitioned.ModelPartitioned`
 (``partition=PartitionFB(…)`` or ``partition=PartitionX(…)``) and/or
-:class:`~pinns.models.model_stepper.ModelStepper` (``stepper=True``).
+:class:`~pinns.models.model_stepper.ModelStepper` (``stepper=StepperDt(...)``).
 
 Return types
 ------------
@@ -46,9 +46,7 @@ def create_model(
     n_context: int = 0,
     context_range: Optional[List[Tuple[float, float]]] = None,
     partition: Optional[Union[PartitionFB, PartitionX]] = None,
-    partition_time: bool = True,
-    stepper: bool = False,
-    stepper_strategy: Optional[StepperDt] = None,
+    stepper: Optional[StepperDt] = None,
 ) -> Union[ModelBase, ModelPartitioned, ModelStepper]:
     """
     Build a standard PINN architecture and optionally wrap it for
@@ -87,23 +85,21 @@ def create_model(
         Physical output range used by ``Denormalize``.
     n_context : int
         Number of trailing context columns in the input.  Automatically set
-        to *output_dim* when ``stepper=True``.  Default ``0``.
+        to *output_dim* when *stepper* is not ``None``.  Default ``0``.
     context_range : list of ``(min, max)`` pairs, optional
         Physical range of the context columns for normalisation.
-        Forwarded to the first ``Normalize`` layer.  When ``stepper=True``
+        Forwarded to the first ``Normalize`` layer.  When *stepper* is not ``None``
         this is also passed to :class:`~pinns.models.model_stepper.ModelStepper`.
     partition : ``PartitionFB`` | ``PartitionX`` | None
         When given, wraps the :class:`~pinns.models.model_base.ModelBase` with a
         :class:`~pinns.models.model_partitioned.ModelPartitioned` using this strategy
         as the subdomain prototype.  Cannot be combined with *spatial*.
-    partition_time : bool
-        Forwarded to :class:`~pinns.models.model_partitioned.ModelPartitioned`.
-        Default ``True``.
-    stepper : bool
-        When ``True``, wraps the result with
-        :class:`~pinns.models.model_stepper.ModelStepper`.  Sets ``n_context`` to
-        *output_dim* automatically and passes *context_range* to it.
-        Default ``False``.
+    stepper : StepperDt | StepperStep | None
+        When given, wraps the result with
+        :class:`~pinns.models.model_stepper.ModelStepper`, sets ``n_context`` to
+        *output_dim* automatically, and passes *context_range* and this strategy
+        to it.  ``partition_time`` is set to ``False`` automatically when a
+        stepper is provided.  Default ``None``.
 
     Returns
     -------
@@ -133,7 +129,7 @@ def create_model(
 
         m = create_model(domain, output_dim=1,
                          context_range=[(0.0, 1.0)],
-                         stepper=True)
+                         stepper=StepperDt(dt=0.1))
         # m is a ModelStepper
         traj = m.rollout(params, x_spatial, t_values, u0)
 
@@ -142,7 +138,7 @@ def create_model(
         m = create_model(domain, output_dim=2,
                          partition=PartitionFB(overlap=0.3),
                          context_range=[(-1., 1.), (-1., 1.)],
-                         stepper=True)
+                         stepper=StepperDt(dt=0.1))
         # m is a ModelStepper wrapping a ModelPartitioned
     """
     # ── Validate ──────────────────────────────────────────────────────
@@ -151,7 +147,7 @@ def create_model(
         raise ValueError(
             "create_model: denormalize=True requires output_range to be specified."
         )
-    if stepper:
+    if stepper is not None:
         # ModelStepper requires n_context == output_dim.
         n_context = output_dim
 
@@ -179,6 +175,7 @@ def create_model(
         base.add(Denormalize())
 
     # ── Optionally wrap with ModelPartitioned ──────────────────────────
+    partition_time = stepper is None
     if partition is not None:
         result: Union[ModelBase, ModelPartitioned] = ModelPartitioned(
             base, partition, partition_time=partition_time
@@ -187,9 +184,9 @@ def create_model(
         result = base
 
     # ── Optionally wrap with ModelStepper ──────────────────────────────
-    if stepper:
+    if stepper is not None:
         return ModelStepper(result, context_range=context_range,
-                            strategy=stepper_strategy)
+                            strategy=stepper)
 
     return result
 

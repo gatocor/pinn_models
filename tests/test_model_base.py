@@ -21,6 +21,7 @@ from pinns.models.model_partitioned import ModelPartitioned
 from pinns.models.model_stepper import ModelStepper
 from pinns.models.layers import Normalize, Denormalize, FNN, ResNet, PirateNet
 from pinns import PartitionFB, PartitionX, StepperStep
+from pinns.models.stepping import StepperDt
 
 RNG = jax.random.PRNGKey(0)
 
@@ -118,20 +119,20 @@ class TestModelConstruction:
 
     def test_features_inserted_before_core(self, domain):
         """Features appear before FNN in the layer list."""
-        from pinns.models.layers import FourierFeatures
-        feats = FourierFeatures(input_dim=2, n_features=64)
+        from pinns.models.layers import RandomFourierFeatures
+        feats = RandomFourierFeatures(n_features=64)
         m = Model(domain, output_dim=1, features=feats)
         names = [type(l).__name__ for l in m._layers]
-        assert names.index('FourierFeatures') < names.index('FNN')
+        assert names.index('RandomFourierFeatures') < names.index('FNN')
 
     def test_slot_order_full(self, domain):
         """Normalize → Features → FNN → Denormalize."""
-        from pinns.models.layers import FourierFeatures
+        from pinns.models.layers import RandomFourierFeatures
         m = Model(domain, output_dim=1,
-                  features=FourierFeatures(input_dim=2, n_features=16),
+                  features=RandomFourierFeatures(n_features=16),
                   denormalize=True, output_range=(-1.0, 1.0))
         names = [type(l).__name__ for l in m._layers]
-        assert names == ['Normalize', 'FourierFeatures', 'FNN', 'Denormalize']
+        assert names == ['Normalize', 'RandomFourierFeatures', 'FNN', 'Denormalize']
 
     def test_output_dim_stored(self, domain):
         m = Model(domain, output_dim=3)
@@ -142,7 +143,7 @@ class TestModelConstruction:
         assert isinstance(m, ModelPartitioned)
 
     def test_with_temporal_strategy(self, domain_time):
-        m = Model(domain_time, output_dim=1, stepper=True,
+        m = Model(domain_time, output_dim=1, stepper=StepperDt(),
                   context_range=[(0.0, 1.0)])
         assert isinstance(m, ModelStepper)
 
@@ -349,3 +350,106 @@ class TestModelRepr:
         m = Model(domain, output_dim=1, normalize=False)
         r = repr(m)
         assert 'Normalize' not in r
+
+
+# ---------------------------------------------------------------------------
+# output_dim override — FNN, WFFNN, ResNet, PirateNet
+# ---------------------------------------------------------------------------
+
+from pinns.models.layers import WFFNN
+from pinns.domain import DomainCubic
+
+_DOMAIN_2D  = DomainCubic(space=[(0.0, 1.0), (0.0, 1.0)])
+_OUTPUT_DIM = 3    # non-trivial final output, distinct from hidden dim
+_HIDDEN_DIM = 64
+_KEY        = jax.random.PRNGKey(42)
+
+
+def _fwd(net: ModelBase) -> jnp.ndarray:
+    params = net.init(_KEY)
+    return net.apply(params, jnp.ones((8, 2)))
+
+
+class TestFNNOutputDim:
+    def test_default_uses_network_output_dim(self):
+        net = ModelBase(_DOMAIN_2D, output_dim=_OUTPUT_DIM)
+        net.add(Normalize())
+        layer = FNN([_HIDDEN_DIM, _HIDDEN_DIM])
+        net.add(layer)
+        assert layer._layer_sizes[-1] == _OUTPUT_DIM
+        assert _fwd(net).shape == (8, _OUTPUT_DIM)
+
+    def test_explicit_output_dim_overrides(self):
+        # output_dim=<int> → use that width instead of network.output_dim
+        net = ModelBase(_DOMAIN_2D, output_dim=_OUTPUT_DIM)
+        net.add(Normalize())
+        layer_mid   = FNN([_HIDDEN_DIM, _HIDDEN_DIM], output_dim=_HIDDEN_DIM)
+        layer_final = FNN([_HIDDEN_DIM, _HIDDEN_DIM])
+        net.add(layer_mid)
+        net.add(layer_final)
+        assert layer_mid._layer_sizes[-1]   == _HIDDEN_DIM,  "intermediate must use override"
+        assert layer_final._layer_sizes[-1] == _OUTPUT_DIM,  "final must use network.output_dim"
+        assert _fwd(net).shape == (8, _OUTPUT_DIM)
+
+
+class TestWFFNNOutputDim:
+    def test_default_uses_network_output_dim(self):
+        net = ModelBase(_DOMAIN_2D, output_dim=_OUTPUT_DIM)
+        net.add(Normalize())
+        layer = WFFNN([_HIDDEN_DIM, _HIDDEN_DIM])
+        net.add(layer)
+        assert layer._layer_sizes[-1] == _OUTPUT_DIM
+        assert _fwd(net).shape == (8, _OUTPUT_DIM)
+
+    def test_explicit_output_dim_overrides(self):
+        net = ModelBase(_DOMAIN_2D, output_dim=_OUTPUT_DIM)
+        net.add(Normalize())
+        layer_mid   = WFFNN([_HIDDEN_DIM, _HIDDEN_DIM], output_dim=_HIDDEN_DIM)
+        layer_final = FNN([_HIDDEN_DIM])
+        net.add(layer_mid)
+        net.add(layer_final)
+        assert layer_mid._layer_sizes[-1]   == _HIDDEN_DIM
+        assert layer_final._layer_sizes[-1] == _OUTPUT_DIM
+        assert _fwd(net).shape == (8, _OUTPUT_DIM)
+
+
+class TestResNetOutputDim:
+    def test_default_uses_network_output_dim(self):
+        net = ModelBase(_DOMAIN_2D, output_dim=_OUTPUT_DIM)
+        net.add(Normalize())
+        layer = ResNet(hidden_dim=_HIDDEN_DIM, n_blocks=2)
+        net.add(layer)
+        assert layer._output_dim == _OUTPUT_DIM
+        assert _fwd(net).shape == (8, _OUTPUT_DIM)
+
+    def test_explicit_output_dim_overrides(self):
+        net = ModelBase(_DOMAIN_2D, output_dim=_OUTPUT_DIM)
+        net.add(Normalize())
+        layer_mid   = ResNet(hidden_dim=_HIDDEN_DIM, n_blocks=2, output_dim=_HIDDEN_DIM)
+        layer_final = FNN([_HIDDEN_DIM])
+        net.add(layer_mid)
+        net.add(layer_final)
+        assert layer_mid._output_dim        == _HIDDEN_DIM
+        assert layer_final._layer_sizes[-1] == _OUTPUT_DIM
+        assert _fwd(net).shape == (8, _OUTPUT_DIM)
+
+
+class TestPirateNetOutputDim:
+    def test_default_uses_network_output_dim(self):
+        net = ModelBase(_DOMAIN_2D, output_dim=_OUTPUT_DIM)
+        net.add(Normalize())
+        layer = PirateNet(hidden_dim=_HIDDEN_DIM, n_blocks=2)
+        net.add(layer)
+        assert layer._output_dim == _OUTPUT_DIM
+        assert _fwd(net).shape == (8, _OUTPUT_DIM)
+
+    def test_explicit_output_dim_overrides(self):
+        net = ModelBase(_DOMAIN_2D, output_dim=_OUTPUT_DIM)
+        net.add(Normalize())
+        layer_mid   = PirateNet(hidden_dim=_HIDDEN_DIM, n_blocks=2, output_dim=_HIDDEN_DIM)
+        layer_final = FNN([_HIDDEN_DIM])
+        net.add(layer_mid)
+        net.add(layer_final)
+        assert layer_mid._output_dim        == _HIDDEN_DIM
+        assert layer_final._layer_sizes[-1] == _OUTPUT_DIM
+        assert _fwd(net).shape == (8, _OUTPUT_DIM)

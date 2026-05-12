@@ -40,6 +40,7 @@ class PirateNetModule(nn.Module):
     activation: str = "tanh"
     rwf_mu: float = 0.5
     rwf_sigma: float = 0.1
+    output_projection: bool = True
 
     @nn.compact
     def __call__(self, x):
@@ -55,7 +56,9 @@ class PirateNetModule(nn.Module):
                 rwf_sigma=self.rwf_sigma,
                 name=f"block_{i}",
             )(h, U, V)
-        return DenseRWF(self.output_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="output")(h)
+        if self.output_projection:
+            return DenseRWF(self.output_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="output")(h)
+        return h
 
 
 class PirateNet:
@@ -76,6 +79,9 @@ class PirateNet:
         Activation function name (default ``'tanh'``).
     rwf_mu, rwf_sigma : float
         Random Weight Factorisation parameters.
+    output_dim : int or None, optional
+        Output width.  When ``None`` (default) the ModelBase's ``output_dim``
+        is used.  Pass an explicit ``int`` to override.
     """
 
     def __init__(
@@ -85,29 +91,33 @@ class PirateNet:
         activation: str = "tanh",
         rwf_mu: float = 0.5,
         rwf_sigma: float = 0.1,
+        output_dim: Optional[int] = None,
     ):
         self.hidden_dim = hidden_dim
         self.n_blocks   = n_blocks
         self.activation = activation
         self.rwf_mu     = rwf_mu
         self.rwf_sigma  = rwf_sigma
+        self._output_dim_override = output_dim
         self._module: Optional[PirateNetModule] = None
         self._input_dim: Optional[int] = None
         self._output_dim: Optional[int] = None
 
     def _configure(self, network, input_dim: int) -> int:
         self._input_dim  = input_dim
-        self._output_dim = network.output_dim
+        self._output_dim = self._output_dim_override if self._output_dim_override is not None else network.output_dim
+        output_projection = True
         self._module = PirateNetModule(
             input_dim=input_dim,
-            output_dim=network.output_dim,
+            output_dim=self._output_dim,
             hidden_dim=self.hidden_dim,
             n_blocks=self.n_blocks,
             activation=self.activation,
             rwf_mu=self.rwf_mu,
             rwf_sigma=self.rwf_sigma,
+            output_projection=output_projection,
         )
-        return network.output_dim
+        return self._output_dim
 
     def init(self, rng) -> Dict:
         assert self._module is not None, "PirateNet not configured — add to a ModelBase first"

@@ -62,13 +62,12 @@ Neumann boundary data for each Neumann BC (stored in
     ``phi``        (n_edges, n_eq, 2)    – P1 basis values at the 2 endpoints
     ``normals``    (n_edges, 2)          – outward unit normals
     ``edge_ids``   (n_edges, 2)          – global node indices of edge endpoints
-    ``bc``                                – the ``MeshNodeBC`` object
+    ``bc``                                – the ``TermMeshNodeBC`` object
 """
 
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, field
 from typing import Callable, Dict, Any, List, Optional, Union
 
 import numpy as np
@@ -94,14 +93,16 @@ def _triangle_cubature(order: int):
                         [1/6, 2/3]])
         w   = np.full(3, 1/6)
     elif order == 3:
-        # 4-point Dunavant, exact degree 3
-        a1, b1 = 1/3, 1/3
-        a2, b2 = 0.6, 0.2
-        pts = np.array([[a1, b1],
-                        [a2, b2],
-                        [b2, a2],
-                        [b2, b2]])
-        w   = np.array([-9/32, 25/96, 25/96, 25/96])
+        # 6-point degree-4 Dunavant rule (all positive weights); also integrates
+        # degree-3 polynomials exactly – avoids the well-known negative-weight
+        # 4-point degree-3 rule.
+        a1, b1 = 0.108103018168070, 0.445948490915965
+        a2, b2 = 0.816847572980459, 0.091576213509771
+        pts = np.array([[a1, b1], [b1, a1], [b1, b1],
+                        [a2, b2], [b2, a2], [b2, b2]])
+        w1 = 0.111690794839005
+        w2 = 0.054975871827661
+        w   = np.array([w1, w1, w1, w2, w2, w2])
     elif order == 4:
         # 6-point Dunavant, exact degree 4
         a1, b1 = 0.108103018168070, 0.445948490915965
@@ -583,122 +584,198 @@ def _precompute_lm_boundary(vertices:          np.ndarray,
 # ProblemWeak
 # ---------------------------------------------------------------------------
 
-@dataclass
 class ProblemWeak:
     """
     Weak-form (Galerkin) problem on a mesh with order-N Lagrange test functions.
 
+    Interface mirrors :class:`~pinns.problems.ProblemStrong`: construct with
+    ``domain`` and ``output_names``, then register terms with
+    :meth:`add_inner`, :meth:`add_dirichlet`, :meth:`add_neumann`, and attach
+    the reference solution with :meth:`add_solution`.
+
     Parameters
     ----------
     domain : DomainMesh
-        Mesh domain.  Boundary conditions are attached via
-        ``domain.add_dirichlet(...)`` / ``domain.add_neumann(...)``.
-    volume_fn : callable
-        Weak-form volume integrand.  Mirrors the strong-form
-        ``pde_fn(x, y, params, derivative=None)`` with two extra trailing
-        arguments for the test function::
-
-            volume_fn(x, y, params, phi, derivative=None) -> (n_pts,)
-
-        Arguments (all JAX arrays):
-          - ``x``          (n_pts, 2)       – quadrature point positions
-          - ``y``          (n_pts, n_out)   – network output (same layout as strong form)
-          - ``params``     dict             – ``{fixed, infer, internal, dependencies}`` (same as strong form)
-          - ``phi``        (n_pts,)         – test function :math:`\varphi_j` values
-          - ``grad_phi``   (n_pts, 2)       – :math:`\nabla\varphi_j` in physical coords
-          - ``derivative`` callable or None – ``derivative(y, x, comp, order)`` (same API as
-            strong form; provided by the assembler)
-        Returns: ``(n_pts,)`` per-quadrature-point integrand values.
-    boundary_fn : dict[str, callable] or None
-        Weak-form Neumann (traction) boundary integrands, one per boundary
-        name.  Each callable is evaluated at the boundary quadrature points
-        and its result is **subtracted** from the corresponding residual
-        vector(s) as the RHS traction integral::
-
-            boundary_fn = {
-                "right": lambda x, y, params, phi, derivative: (t1*phi, t2*phi)
-            }
-
-        Signature: ``f(x, y, params, phi, derivative) -> array or tuple``
-
-          - ``x``          (n_pts, 2)         – boundary quadrature coords
-          - ``y``          (n_pts, n_out)     – network output at those pts
-          - ``params``     dict               – same as ``volume_fn``
-          - ``phi``        (n_pts,)           – test-function values
-          - ``derivative`` callable           – same derivative API
-
-        The return must match the number of components returned by
-        ``volume_fn`` (scalar or tuple of length n_comp).  Each returned
-        array is ``∫ f_k φ_j ds`` and is subtracted from ``R_k``.  The key
-        must match the name used in ``domain.add_bc``.
-    params : dict
-        Fixed problem parameters passed as ``params["fixed"]``.
-    input_names : list[str]
-        Names for input dimensions.
+        Mesh domain.  Named boundary regions for :meth:`add_dirichlet` and
+        :meth:`add_neumann` are registered on the domain beforehand via
+        ``domain.add_boundary(select, name=...)``.
     output_names : list[str]
-        Names for output components.
-    output_range : tuple or list[tuple] or None
-        Per-output unnormalization range.
+        Names for the network output components.
     cubature_order : int
         Polynomial exactness order for the cubature rules (1–5, default 3).
-        For accurate weak-form integration with order-N test functions use at
-        least ``cubature_order ≥ 2*lagrange_order``.
     lagrange_order : int
         Polynomial order of the Lagrange test-function space (default 1 → P1).
-        N=2 gives P2 (quadratic), N=3 gives P3 (cubic), etc.
     basis : str
         Test function basis — currently only ``"lagrange"`` is supported.
-    solution : callable or None
-        Reference solution for error tracking.
+    params : dict or None
+        Fixed problem parameters passed as ``params["fixed"]``.
+    strategy : optional
+        FB/X-PINN or time-stepping strategy.
 
-    Attributes (set during ``__post_init__``)
-    -----------------------------------------
-    cubature_data : dict
-        Precomputed volume cubature arrays (see module docstring).
-    neumann_data : list[dict]
-        Precomputed edge cubature arrays for each Neumann BC.
-    free_nodes : np.ndarray  (n_free,)
-        Global DOF indices not constrained by Dirichlet conditions.
-    dirichlet_nodes : np.ndarray  (n_dir,)
-        Global DOF indices constrained by Dirichlet conditions.
+    Examples
+    --------
+    ::
+
+        problem = ProblemWeak(domain, output_names=["u"], cubature_order=3)
+        problem.add_inner(volume_fn, name="pde")
+        problem.add_dirichlet(0.0, name="bottom", region="bottom")
+        problem.add_solution(lambda xy: np.sin(np.pi * xy[:, 0]))
     """
 
-    domain: Any                                           # DomainMesh
-    volume_fn: Callable
-    boundary_fn: Optional[Union[Callable, Dict[str, Callable]]] = None
-    params: Dict[str, Any] = field(default_factory=dict)
-    input_names: List[str] = field(default_factory=list)
-    output_names: List[str] = field(default_factory=list)
-    output_range: Optional[Union[tuple, List[Optional[tuple]]]] = None
-    cubature_order: int = 3
-    lagrange_order: int = 1
-    basis: str = "lagrange"
-    solution: Optional[Callable] = None
-    lagrange_multipliers: List[str] = field(default_factory=list)
-    obs_fn: Optional[Callable] = field(default=None)
-    obs_names: Optional[List[str]] = field(default=None)
-    obs_spatial: Optional[List[str]] = field(default=None)
-    n_time_points: Optional[int] = None
-    n_time_steps: Optional[int] = None
-    strategy: Optional[Any] = None
-
-    # ── filled by __post_init__ ──────────────────────────────────────────
-    cubature_data:    Dict       = field(init=False, default_factory=dict)
-    neumann_data:     List       = field(init=False, default_factory=list)
-    boundary_fn_data: List       = field(init=False, default_factory=list)
-    free_nodes:       np.ndarray = field(init=False, default=None)
-    dirichlet_nodes:  np.ndarray = field(init=False, default=None)
-
-    def __post_init__(self):
+    def __init__(
+        self,
+        domain,
+        output_names,
+        *,
+        cubature_order: int = 3,
+        lagrange_order: int = 1,
+        basis: str = "lagrange",
+        params: Optional[Dict[str, Any]] = None,
+        strategy=None,
+        input_names: Optional[List[str]] = None,
+        output_range=None,
+        lagrange_multipliers: Optional[List[str]] = None,
+        obs_fn=None,
+        obs_names=None,
+        obs_spatial=None,
+        n_time_points: Optional[int] = None,
+        n_time_steps: Optional[int] = None,
+        # backward-compat: volume_fn can be passed to constructor or via add_inner()
+        volume_fn: Optional[Callable] = None,
+        solution: Optional[Callable] = None,
+        boundary_fn=None,
+    ):
         from ..domain import DomainMesh
-        from .boundary import MeshNodeBC
 
-        if not isinstance(self.domain, DomainMesh):
+        if not isinstance(domain, DomainMesh):
             raise TypeError(
                 "ProblemWeak requires a DomainMesh domain; "
-                f"got {type(self.domain).__name__}."
+                f"got {type(domain).__name__}."
             )
 
+        self.domain             = domain
+        self.output_names       = list(output_names)
+        self.cubature_order     = cubature_order
+        self.lagrange_order     = lagrange_order
+        self.basis              = basis
+        self.params             = dict(params) if params else {}
+        self.strategy           = strategy
+        self.input_names        = list(input_names) if input_names else []
+        self.output_range       = output_range
+        self.lagrange_multipliers = list(lagrange_multipliers) if lagrange_multipliers else []
+        self.obs_fn             = obs_fn
+        self.obs_names          = obs_names
+        self.obs_spatial        = obs_spatial
+        self.n_time_points      = n_time_points
+        self.n_time_steps       = n_time_steps
+        # _inner_terms: list of {'fn': callable, 'name': str} for weak-form
+        # volume integrands.  Multiple add_inner() calls register separate terms,
+        # each with its own weight / Lagrange multiplier.
+        self._inner_terms: list = []
+        if volume_fn is not None:
+            self._inner_terms.append({'fn': volume_fn, 'name': 'pde'})
+        self.solution           = solution           # set here or via add_solution()
+        self.boundary_fn        = boundary_fn        # legacy
+
+        # ── runtime-filled ───────────────────────────────────────────────
+        self.cubature_data:    Dict       = {}
+        self.neumann_data:     List       = []
+        self.boundary_fn_data: List       = []
+        self.free_nodes:       np.ndarray = None
+        self.dirichlet_nodes:  np.ndarray = None
+
+        self._init_body()
+
+    # ── Backward-compat properties ────────────────────────────────────────
+
+    @property
+    def volume_fn(self):
+        """First (or only) volume integrand.  Access via :meth:`add_inner`."""
+        return self._inner_terms[0]['fn'] if self._inner_terms else None
+
+    @volume_fn.setter
+    def volume_fn(self, fn):
+        if fn is None:
+            return
+        if self._inner_terms:
+            self._inner_terms[0]['fn'] = fn
+        else:
+            self._inner_terms.append({'fn': fn, 'name': 'pde'})
+
+    @property
+    def _volume_name(self):
+        """Name of the first (or only) inner volume term."""
+        return self._inner_terms[0]['name'] if self._inner_terms else 'pde'
+
+    @_volume_name.setter
+    def _volume_name(self, name):
+        if self._inner_terms:
+            self._inner_terms[0]['name'] = name
+        else:
+            self._inner_terms.append({'fn': None, 'name': name})
+
+    # ---------------------------------------------------------------------- #
+    #  Term registration (mirrors ProblemStrong)                             #
+    # ---------------------------------------------------------------------- #
+
+    def add_inner(self, fn: Callable, name: str = 'pde',
+                  lagrange: bool = False) -> 'ProblemWeak':
+        """Register the weak-form **volume integrand** (bilinear form).
+
+        Signature::
+
+            fn(x, y, params, phi, derivative) -> (n_pts,)
+
+        Args:
+            fn: Weak-form integrand callable.
+            name: Label for this term (used in loss display). Default ``'pde'``.
+            lagrange: If ``True``, enforce this term via an augmented-Lagrangian
+                multiplier instead of a soft penalty weight.
+
+        Returns:
+            ``self`` for method chaining.
+        """
+        # If a term with this name already exists, replace its fn (idempotent
+        # behaviour for re-compilation).  Otherwise append a new term.
+        for _t in self._inner_terms:
+            if _t['name'] == name:
+                _t['fn'] = fn
+                break
+        else:
+            self._inner_terms.append({'fn': fn, 'name': name})
+        if lagrange and name is not None and name not in self.lagrange_multipliers:
+            self.lagrange_multipliers.append(name)
+        return self
+
+    def add_solution(self, fn: Callable) -> 'ProblemWeak':
+        """Attach a reference / analytical solution for error tracking.
+
+        Args:
+            fn: Callable ``fn(xy, params=None) -> array`` where ``xy`` has
+                shape ``(n, n_dims)``.
+
+        Returns:
+            ``self`` for method chaining.
+        """
+        self.solution = fn
+        return self
+
+    def add_fixed(self, **kwargs) -> 'ProblemWeak':
+        """Register fixed (non-trainable) problem parameters.
+
+        These are accessible inside residual functions as ``params["fixed"]``.
+
+        Returns:
+            ``self`` for method chaining.
+        """
+        self.params.update(kwargs)
+        return self
+
+    # ---------------------------------------------------------------------- #
+    #  Internal initialisation body (formerly __post_init__)                 #
+    # ---------------------------------------------------------------------- #
+
+    def _init_body(self):
         # ── Strategy setup ─────────────────────────────────────────────
         if self.strategy is not None:
             from ..models.partition import PartitionFB, PartitionX
@@ -736,8 +813,12 @@ class ProblemWeak:
         self.n_dims    = self.domain.n_dims
         self.n_outputs = len(self.output_names)
 
+        # Auto-derive input_names from domain if not supplied
         if not self.input_names:
-            raise ValueError("input_names is required.")
+            _SPATIAL = ('x', 'y', 'z', 'x4', 'x5', 'x6', 'x7', 'x8')
+            _has_time = getattr(self.domain, '_t_min', None) is not None
+            _n_spatial = getattr(self.domain, '_spatial_dims', self.n_dims - int(_has_time))
+            self.input_names = list(_SPATIAL[:_n_spatial]) + (['t'] if _has_time else [])
         if len(self.input_names) != self.n_dims:
             raise ValueError(
                 f"input_names has {len(self.input_names)} elements "
@@ -817,9 +898,10 @@ class ProblemWeak:
                 _support_vol[_node_ids_np[_k, _a]] += _elem_areas[_k]
         # L_j will be filled in after boundary_fn_data is built (below)
         self._support_vol_tmp = _support_vol   # hold temporarily
+        from pinns.terms import TermNeumannBC as _TermNeumannBC
         self.neumann_data = []
         for bc in self.boundary_conditions:
-            if isinstance(bc, MeshNodeBC) and bc.bc_type == "neumann" and bc.edges is not None:
+            if isinstance(bc, _TermNeumannBC) and getattr(bc, 'edges', None) is not None:
                 data = _precompute_boundary_edges(
                     verts, bc.edges, bc.edge_normals, self.cubature_order
                 )
@@ -979,25 +1061,14 @@ class ProblemWeak:
         self._check_bc_coverage()
 
     def _check_bc_coverage(self):
-        """Warn if boundary nodes or interior nodes appear uncovered.
-
-        For each output component this verifies:
-
-        1. **Spatial boundary nodes** are in at least one BC
-           (Dirichlet or Neumann) that has full or partial time coverage.
-        2. **Interior nodes** are covered at ``t = t_min`` by at least one BC
-           (typically the initial condition).
-
-        Issues a ``UserWarning`` for each uncovered component rather than
-        raising an exception, because partial coverage can be intentional.
-        """
+        """Warn if boundary nodes or interior nodes appear uncovered."""
         import warnings
-        from .boundary import MeshNodeBC
+        from pinns.terms import TermDirichletBC, TermNeumannBC
 
         has_time = self.domain._t_min is not None
         n_outputs = len(self.output_names)
-        bnd_mask = self.domain.boundary_node_mask      # (n_verts,)
-        int_mask = self.domain.interior_node_mask      # (n_verts,)
+        bnd_mask = self.domain._boundary_node_mask     # (n_verts,)
+        int_mask = ~bnd_mask                           # interior = not boundary
         bnd_node_ids = set(np.where(bnd_mask)[0].tolist())
         int_node_ids = set(np.where(int_mask)[0].tolist())
 
@@ -1008,7 +1079,7 @@ class ProblemWeak:
             ic_covered:  set = set()
 
             for bc in self.boundary_conditions:
-                if not isinstance(bc, MeshNodeBC):
+                if not isinstance(bc, (TermDirichletBC, TermNeumannBC)):
                     continue
                 if bc.component != comp:
                     continue
@@ -1092,10 +1163,10 @@ class ProblemWeak:
         t_min = getattr(self.domain, '_t_min', None)
         if t_min is None:
             return set()
-        from .boundary import MeshNodeBC
+        from pinns.terms import TermDirichletBC
         eligible: set = set()
         for bc in self.boundary_conditions:
-            if not isinstance(bc, MeshNodeBC) or bc.bc_type != 'dirichlet':
+            if not isinstance(bc, TermDirichletBC):
                 continue
             name = getattr(bc, 'name', None)
             if name is None:
@@ -1117,10 +1188,85 @@ class ProblemWeak:
     #  Boundary-condition builders                                       #
     # ------------------------------------------------------------------ #
 
-    def add_dirichlet(self, select, value, component: int = 0,
-                      name: str = None, time_window=None) -> 'ProblemWeak':
-        """Add a Dirichlet BC: ``u = value`` on the selected nodes."""
-        from pinns.boundary import MeshNodeBC
+    def add_dirichlet(
+        self,
+        value,
+        name: str = None,
+        region: str = 'all',
+        component: int = 0,
+        outputs=None,
+        time_window=None,
+        lagrange: bool = False,
+        # backward compat: old call was add_dirichlet(select, value, component, name, time_window)
+        _select_compat=None,
+    ) -> 'ProblemWeak':
+        """Add a **Dirichlet** BC: ``u = value`` on a named boundary region.
+
+        Mirrors :meth:`~pinns.problems.ProblemStrong.add_dirichlet`.
+
+        Args:
+            value: Prescribed boundary value.  Scalar, array, or callable
+                ``g(x, params) -> array``.
+            name: Label for this term.
+            region: Named boundary region registered via
+                ``domain.add_boundary(select, name=region)``, or ``'all'``
+                (default) to apply to the entire boundary.
+            component: Which output component this BC applies to (default 0).
+            outputs: Alias for ``component`` (ignored when ``component`` is given).
+            time_window: ``[t_start, t_end]`` for transient problems.
+            lagrange: If ``True``, enable per-point Lagrange multipliers for
+                this BC (mirroring :meth:`~pinns.problems.ProblemStrong.add_dirichlet`).
+
+        Returns:
+            ``self`` for method chaining.
+        """
+        # ── Detect old-style call: add_dirichlet(select, value, component, name, ...)
+        if callable(value) and not callable(name) and (
+            isinstance(name, (int, float, complex, np.ndarray))
+            or (name is None and _select_compat is None)
+        ):
+            # value is actually the select callable in the old API
+            # Signature was: add_dirichlet(select, value, component=0, name=None, ...)
+            # Disambiguate: if `name` is a number it was the old `value` arg
+            import warnings
+            warnings.warn(
+                "add_dirichlet(select, value, ...) is deprecated. "
+                "Use add_dirichlet(value, name, region=...) instead.",
+                DeprecationWarning, stacklevel=2,
+            )
+            select = value
+            value  = name
+            # remaining positional args have shifted — just use _select_compat
+            return self._add_dirichlet_impl(
+                select=select, value=value,
+                component=component if not isinstance(component, str) else 0,
+                name=component if isinstance(component, str) else None,
+                time_window=time_window,
+                lagrange=lagrange,
+            )
+        # ── New-style call ────────────────────────────────────────────────
+        select = self._resolve_region(region)
+        return self._add_dirichlet_impl(
+            select=select, value=value, component=component,
+            name=name, time_window=time_window, lagrange=lagrange,
+        )
+
+    def _resolve_region(self, region: str):
+        """Return a 1-D integer node-index array for the given region name."""
+        if region == 'all':
+            return np.where(self.domain._boundary_node_mask)[0].astype(np.intp)
+        if region not in self.domain._boundary_regions:
+            raise ValueError(
+                f"Boundary region {region!r} is not registered on the domain. "
+                f"Available: {list(self.domain._boundary_regions.keys())}"
+            )
+        return self.domain._boundary_regions[region]['node_indices']
+
+    def _add_dirichlet_impl(self, select, value, component: int = 0,
+                             name: str = None, time_window=None,
+                             lagrange: bool = False) -> 'ProblemWeak':
+        """Internal Dirichlet-BC registration."""
+        from pinns.terms import TermDirichletBC
         domain = self.domain
         node_idx = domain._resolve_node_select(select)
         if len(node_idx) == 0:
@@ -1139,27 +1285,77 @@ class ProblemWeak:
             if t_a > t_b + 1e-12:
                 raise ValueError(f"time_window[0]={t_a} must be ≤ time_window[1]={t_b}.")
             time_window = tw
-        bc = MeshNodeBC(
-            node_positions=node_positions,
+        _region = getattr(select, '__name__', 'mesh_region')
+        bc = TermDirichletBC(
+            region=_region,
             value=value,
-            bc_type="dirichlet",
             component=component,
             name=name,
-            time_window=time_window,
-            t_min=domain._t_min or 0.0,
-            t_max=domain._t_max or 1.0,
-            node_indices=node_idx,
-            edges=None,
-            edge_lengths=None,
         )
+        bc.node_positions = node_positions
+        bc.node_indices = node_idx
+        bc.edges = None
+        bc.edge_lengths = None
+        bc.time_window = time_window
+        bc.t_min = domain._t_min or 0.0
+        bc.t_max = domain._t_max or 1.0
         domain._check_bc_time_overlap(bc)
         self.boundary_conditions.append(bc)
+        if lagrange and name is not None and name not in self.lagrange_multipliers:
+            self.lagrange_multipliers.append(name)
         return self
 
-    def add_neumann(self, select, value, component: int = 0,
-                    name: str = None, time_window=None) -> 'ProblemWeak':
-        """Add a Neumann BC: ``du/dn = value`` on the selected boundary nodes."""
-        from pinns.boundary import MeshNodeBC
+    def add_neumann(
+        self,
+        value,
+        name: str = None,
+        region: str = 'all',
+        component: int = 0,
+        outputs=None,
+        time_window=None,
+        lagrange: bool = False,
+    ) -> 'ProblemWeak':
+        """Add a **Neumann** BC: ``du/dn = value`` on a named boundary region.
+
+        Mirrors :meth:`~pinns.problems.ProblemStrong.add_neumann`.
+
+        Args:
+            value: Prescribed normal-flux value.  Scalar, array, or callable.
+            name: Label for this term.
+            region: Named boundary region, or ``'all'`` (default).
+            component: Which output component (default 0).
+            time_window: ``[t_start, t_end]`` for transient problems.
+            lagrange: If ``True``, enable per-point Lagrange multipliers.
+
+        Returns:
+            ``self`` for method chaining.
+        """
+        # ── Detect old-style call: add_neumann(select, value, ...)
+        if callable(value) and (name is None or isinstance(name, (int, float, np.ndarray))):
+            import warnings
+            warnings.warn(
+                "add_neumann(select, value, ...) is deprecated. "
+                "Use add_neumann(value, name, region=...) instead.",
+                DeprecationWarning, stacklevel=2,
+            )
+            select = value
+            value  = name
+            return self._add_neumann_impl(
+                select=select, value=value, component=component, name=None,
+                time_window=time_window, lagrange=lagrange,
+            )
+        # ── New-style call ────────────────────────────────────────────────
+        select = self._resolve_region(region)
+        return self._add_neumann_impl(
+            select=select, value=value, component=component,
+            name=name, time_window=time_window, lagrange=lagrange,
+        )
+
+    def _add_neumann_impl(self, select, value, component: int = 0,
+                           name: str = None, time_window=None,
+                           lagrange: bool = False) -> 'ProblemWeak':
+        """Internal Neumann-BC registration."""
+        from pinns.terms import TermNeumannBC
         import numpy as np
         domain = self.domain
         node_idx = domain._resolve_node_select(select)
@@ -1195,26 +1391,30 @@ class ProblemWeak:
             )
         )
         edge_normals = None if _is_time_point else domain._infer_edge_outward_normals(edges)
-        bc = MeshNodeBC(
-            node_positions=node_positions,
+        _region = getattr(select, '__name__', 'mesh_region')
+        bc = TermNeumannBC(
+            region=_region,
             value=value,
-            bc_type="neumann",
             component=component,
             name=name,
-            time_window=_tw if domain._t_min is not None else None,
-            t_min=domain._t_min or 0.0,
-            t_max=domain._t_max or 1.0,
-            node_indices=node_idx,
-            edges=edges,
-            edge_lengths=edge_lengths,
-            edge_normals=edge_normals,
         )
+        bc.node_positions = node_positions
+        bc.node_indices = node_idx
+        bc.edges = edges
+        bc.edge_lengths = edge_lengths
+        bc.edge_normals = edge_normals
+        bc.time_window = _tw if domain._t_min is not None else None
+        bc.t_min = domain._t_min or 0.0
+        bc.t_max = domain._t_max or 1.0
         domain._check_bc_time_overlap(bc)
         self.boundary_conditions.append(bc)
+        if lagrange and name is not None and name not in self.lagrange_multipliers:
+            self.lagrange_multipliers.append(name)
         return self
 
     def add_initial_condition(self, value=0.0, component: int = 0,
-                              name: str = 'ic') -> 'ProblemWeak':
+                              name: str = 'ic',
+                              lagrange: bool = False) -> 'ProblemWeak':
         """Add a Dirichlet initial condition: ``u(x, t_min) = value`` on interior nodes."""
         domain = self.domain
         if domain._time_mode == 'stationary':
@@ -1233,12 +1433,14 @@ class ProblemWeak:
             component=component,
             name=name,
             time_window=ic_window,
+            lagrange=lagrange,
         )
 
     def add_periodic(self, select_a, select_b, component=None,
-                     name: str = 'periodic') -> 'ProblemWeak':
+                     name: str = 'periodic',
+                     lagrange: bool = False) -> 'ProblemWeak':
         """Add a periodic BC pairing nodes on two boundaries."""
-        from pinns.boundary import PeriodicBC
+        from pinns.terms import TermPeriodicBC
         import numpy as np
         from scipy.spatial import cKDTree
         domain = self.domain
@@ -1260,20 +1462,73 @@ class ProblemWeak:
                 UserWarning,
             )
         pts_b_matched = pts_b[idx]
-        bc = PeriodicBC(
+        bc = TermPeriodicBC(
             node_positions_a=pts_a.astype(np.float32),
             node_positions_b=pts_b_matched.astype(np.float32),
             component=component,
             name=name,
         )
+        if lagrange and name is not None and name not in self.lagrange_multipliers:
+            self.lagrange_multipliers.append(name)
         self.boundary_conditions.append(bc)
         return self
 
-    def add_bc(self, select, f, name=None) -> 'ProblemWeak':
+    def add_points(
+        self,
+        x,
+        u,
+        name: str,
+        lagrange: bool = False,
+        component: int = 0,
+    ) -> 'ProblemWeak':
+        """Register a **data / observation** term at fixed coordinates.
+
+        The trainer minimises the mean-squared mismatch between the network
+        prediction and the supplied target values ``u`` at the provided
+        coordinates.  Useful for data assimilation and inverse problems.
+
+        Args:
+            x: Array-like of shape ``(n_points, n_dims)`` with the fixed
+                observation coordinates.
+            u: Array-like of shape ``(n_points,)`` or ``(n_points, 1)``
+                with the target (observed) values.
+            name: Unique label used in loss weighting and logging.
+            lagrange: If ``True``, enforce via augmented-Lagrangian
+                multipliers instead of soft penalty weight.
+            component: Which network output component this term applies to
+                (default ``0``).
+
+        Returns:
+            ``self`` for method chaining.
+        """
+        import numpy as np
+        from pinns.terms import TermPoints
+
+        x_arr = np.asarray(x, dtype=np.float32)
+        if x_arr.ndim == 1:
+            x_arr = x_arr[:, None]
+        u_arr = np.asarray(u, dtype=np.float32).ravel()
+        if x_arr.shape[0] != u_arr.shape[0]:
+            raise ValueError(
+                f"x has {x_arr.shape[0]} row(s) but u has {u_arr.shape[0]} element(s)."
+            )
+
+        bc = TermPoints(
+            inputs=x_arr,
+            outputs=u_arr,
+            components=component,
+            name=name,
+        )
+        self.boundary_conditions.append(bc)
+        if lagrange and name not in self.lagrange_multipliers:
+            self.lagrange_multipliers.append(name)
+        return self
+
+    def add_bc(self, select, f, name=None, lagrange: bool = False) -> 'ProblemWeak':
         """Add a custom mesh BC defined by a residual function."""
         import inspect as _inspect_mod
         import numpy as np
-        from pinns.boundary import MeshCustomBC
+        from pinns.terms import TermCustomBC
         domain = self.domain
         edge_indices = domain._resolve_select(select)
         edges = domain._all_edges[edge_indices]
@@ -1318,28 +1573,37 @@ class ProblemWeak:
                         return _wrapper3
                     else:
                         return _wrapper2
-                bc = MeshCustomBC(
-                    node_positions=node_positions,
+                bc = TermCustomBC(
+                    region='__mesh__',
                     f=_make_wrapper(f, idx),
                     name=oname,
                     output_names=[oname],
-                    edges=edges,
-                    edge_lengths=edge_lengths,
-                    is_weak=_is_weak,
-                    weak_fn=_weak_fn,
                 )
+                bc.node_positions = node_positions
+                bc.edges = edges
+                bc.edge_lengths = edge_lengths
+                bc.is_weak = _is_weak
+                bc.weak_fn = _weak_fn
                 self.boundary_conditions.append(bc)
+                if lagrange and oname not in self.lagrange_multipliers:
+                    self.lagrange_multipliers.append(oname)
             return self
-        bc = MeshCustomBC(
-            node_positions=node_positions,
+        bc = TermCustomBC(
+            region='__mesh__',
             f=f,
             name=name,
             output_names=[name] if name is not None else None,
-            edges=edges,
-            edge_lengths=edge_lengths,
-            is_weak=_is_weak,
-            weak_fn=_weak_fn,
         )
+        bc.node_positions = node_positions
+        bc.edges = edges
+        bc.edge_lengths = edge_lengths
+        bc.is_weak = _is_weak
+        bc.weak_fn = _weak_fn
+        if lagrange and name is not None:
+            _names = name if isinstance(name, (list, tuple)) else [name]
+            for _n in _names:
+                if _n not in self.lagrange_multipliers:
+                    self.lagrange_multipliers.append(_n)
         self.boundary_conditions.append(bc)
         return self
 
@@ -1674,18 +1938,44 @@ class ProblemWeak:
         phi_jax        = jnp.asarray(cd['phi'],      dtype=jnp.float32)   # (F, Q, L)
         grad_phi_jax   = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)   # (F, Q, L, 2)
         node_ids_jax   = jnp.asarray(cd['node_ids'], dtype=jnp.int32)     # (F, L)
-        free_nodes_jax        = jnp.asarray(self.free_nodes,         dtype=jnp.int32)
-        inner_free_nodes_jax  = jnp.asarray(self.inner_free_nodes,   dtype=jnp.int32)
-        boundary_free_nodes_jax = jnp.asarray(self.boundary_free_nodes, dtype=jnp.int32)
-        node_norm_jax         = jnp.asarray(self.node_norm,          dtype=jnp.float32)
-        _has_inner    = len(self.inner_free_nodes)    > 0
-        _has_boundary = len(self.boundary_free_nodes) > 0
+        node_norm_jax  = jnp.asarray(self.node_norm, dtype=jnp.float32)
+
+        # ── Recompute true free-node sets at loss-fn build time ───────────────
+        # _init_body runs before add_dirichlet/add_neumann, so inner_free_nodes
+        # was built with an empty boundary_conditions list and contains ALL nodes,
+        # including Dirichlet boundary nodes.  In the Galerkin formulation those
+        # DOFs must be removed from the test space — we exclude them here.
+        from pinns.terms import TermDirichletBC as _TermDirichletBC
+        _dirichlet_node_set: set = set()
+        for _bc in self.boundary_conditions:
+            if isinstance(_bc, _TermDirichletBC):
+                _dirichlet_node_set.update(
+                    int(i) for i in _bc.node_indices
+                )
+        # Recompute non-Dirichlet boundary nodes (Neumann / weak-BC edges)
+        _bnd_node_set: set = set()
+        for _bc in self.boundary_conditions:
+            if getattr(_bc, 'bc_type', 'custom') != 'dirichlet':
+                _edges = getattr(_bc, 'edges', None)
+                if _edges is not None:
+                    for _i0, _i1 in _edges:
+                        _bnd_node_set.add(int(_i0))
+                        _bnd_node_set.add(int(_i1))
+        _all_free = set(self.free_nodes.tolist())
+        _true_inner  = sorted(_all_free - _dirichlet_node_set - _bnd_node_set)
+        _true_bnd    = sorted((_all_free - _dirichlet_node_set) & _bnd_node_set)
+
+        free_nodes_jax          = jnp.asarray(self.free_nodes,                 dtype=jnp.int32)
+        inner_free_nodes_jax    = jnp.asarray(np.array(_true_inner,  dtype=np.int64), dtype=jnp.int32)
+        boundary_free_nodes_jax = jnp.asarray(np.array(_true_bnd,    dtype=np.int64), dtype=jnp.int32)
+        _has_inner    = len(_true_inner) > 0
+        _has_boundary = len(_true_bnd)   > 0
 
         n_dofs  = self.n_dofs
         n_faces = pts_jax.shape[0]
         n_qpts  = pts_jax.shape[1]
         n_local = phi_jax.shape[2]          # (N+1)(N+2)/2
-        volume_fn   = self.volume_fn
+        _inner_terms = list(self._inner_terms) or [{'fn': self.volume_fn, 'name': 'pde'}]
         params_dict = self._build_params()
 
         _bc_weights = bc_weights or {}
@@ -1772,37 +2062,44 @@ class ProblemWeak:
                     phi_bk   = phi_jax[pf, :, pa]          # (B, K, Q)
                     gphi_bk  = grad_phi_jax[pf, :, pa, :]  # (B, K, Q, 2)
                     w_bk     = weights_jax[pf]              # (B, K, Q)
-                    # Per-element scalar integral via vmap
-                    def single_elem(y_q, gu_q, phi_q, gphi_q, w_q, pts_q):
-                        # shapes: (Q,1), (Q,n), (Q,), (Q,2), (Q,), (Q,3)
-                        if _scalar:
-                            def _d(Y, X, comp, order):
-                                dim = order[0] if isinstance(order, (tuple, list)) else order
-                                if Y.ndim == 1: return gphi_q[:, dim]  # derivative(phi,...)
-                                return gu_q[:, dim]
-                        else:
-                            def _d(Y, X, comp, order):
-                                dim = order[0] if isinstance(order, (tuple, list)) else order
-                                if Y.ndim == 1: return gphi_q[:, dim]  # derivative(phi,...)
-                                return gu_q[:, comp, dim]
-                        ig = volume_fn(pts_q, y_q, params_dict, phi_q, _d)
-                        return jnp.sum(w_q * ig)
-                    elem_ints = jax.vmap(single_elem)(
-                        y_bkq,
-                        gu_bkq,
-                        phi_bk.reshape(BK, _Q_val),
-                        gphi_bk.reshape(BK, _Q_val, 2),
-                        w_bk.reshape(BK, _Q_val),
-                        pts_st.reshape(BK, _Q_val, 3),
-                    )  # (BK,)
-                    # Scale by time-interval length (MC weight for unbiased time integral)
-                    elem_ints = (elem_ints * _t_interval_f).reshape(B, _K_val)
-                    # Sum patches per node (masked)
-                    R = jnp.sum(elem_ints * pm, axis=1)   # (B,)
-                    # Normalise by node support volume (same as full _assemble path)
+                    # Per-element scalar integrals — one per inner term, weighted sum
                     norm_b = node_norm_jax[free_nodes_jax[node_idx]]  # (B,)
-                    R_norm = R / norm_b
-                    return jnp.mean(R_norm ** 2)
+                    _total_nb_loss = 0.0
+                    for _nb_term in _inner_terms:
+                        _nb_fn  = _nb_term['fn']
+                        _nb_tw  = float(_bc_weights.get(_nb_term['name'], 1.0))
+
+                        def single_elem(y_q, gu_q, phi_q, gphi_q, w_q, pts_q,
+                                        _tfn=_nb_fn):
+                            # shapes: (Q,1), (Q,n), (Q,), (Q,2), (Q,), (Q,3)
+                            if _scalar:
+                                def _d(Y, X, comp, order):
+                                    dim = order[0] if isinstance(order, (tuple, list)) else order
+                                    if Y.ndim == 1: return gphi_q[:, dim]
+                                    return gu_q[:, dim]
+                            else:
+                                def _d(Y, X, comp, order):
+                                    dim = order[0] if isinstance(order, (tuple, list)) else order
+                                    if Y.ndim == 1: return gphi_q[:, dim]
+                                    return gu_q[:, comp, dim]
+                            ig = _tfn(pts_q, y_q, params_dict, phi_q, _d)
+                            return jnp.sum(w_q * ig)
+
+                        elem_ints_t = jax.vmap(single_elem)(
+                            y_bkq,
+                            gu_bkq,
+                            phi_bk.reshape(BK, _Q_val),
+                            gphi_bk.reshape(BK, _Q_val, 2),
+                            w_bk.reshape(BK, _Q_val),
+                            pts_st.reshape(BK, _Q_val, 3),
+                        )  # (BK,)
+                        # Scale by time-interval length (MC weight for unbiased time integral)
+                        elem_ints_t = (elem_ints_t * _t_interval_f).reshape(B, _K_val)
+                        # Sum patches per node (masked)
+                        R_t = jnp.sum(elem_ints_t * pm, axis=1)   # (B,)
+                        R_norm_t = R_t / norm_b
+                        _total_nb_loss += _nb_tw * jnp.mean(R_norm_t ** 2)
+                    return _total_nb_loss
             else:
                 def loss_fn(params, t_vals):
                     # Dynamically tile spatial cubature with sampled time levels
@@ -1849,13 +2146,15 @@ class ProblemWeak:
                         return jac[:, component, dim]
                     return deriv_fn
 
-            # Assemble global residual(s): loop over n_local local DOFs per element.
-            # volume_fn may return (F*Q,) for a scalar equation or a tuple/list of
-            # n_out arrays each of shape (F*Q,) for a vector equation.  In the
-            # multi-component case each R_k is assembled from the k-th integrand.
-            # The loss is the mean of MSE across all component residual vectors.
+            # Assemble per-term residuals.  Each inner term contributes its own
+            # R vector; boundary traction RHS is subtracted from the FIRST term
+            # only (it belongs to the linear form that pairs with the bilinear
+            # first term, matching the standard Galerkin convention).
+            # Loss = Σ_t  w_t · Σ_k _node_loss(R_t_k) / n_comp.
+
+            # ── Probe first inner term for multi-output detection ──────────────
             _gphi0 = _eff_gphi[:, :, 0, :].reshape(-1, 2)
-            R_sample = volume_fn(
+            R_sample = _inner_terms[0]['fn'](
                 pts_flat, y_flat, params_dict,
                 _eff_phi[:, :, 0].reshape(-1),
                 make_deriv(grad_u_flat, _gphi0),
@@ -1863,98 +2162,18 @@ class ProblemWeak:
             _multi = isinstance(R_sample, (tuple, list))
             _n_comp = len(R_sample) if _multi else 1
 
-            Rs = [jnp.zeros(n_dofs, dtype=jnp.float32) for _ in range(_n_comp)]
-            for a in range(n_local):
-                phi_a  = _eff_phi[:, :, a]                            # (F, Q)
-                gphi_a = _eff_gphi[:, :, a, :]                        # (F, Q, 2)
-                gphi_a_flat = gphi_a.reshape(-1, 2)
-
-                integrand = volume_fn(
-                    pts_flat,
-                    y_flat,
-                    params_dict,
-                    phi_a.reshape(-1),
-                    make_deriv(grad_u_flat, gphi_a_flat),
-                )                                        # (F*Q,) or tuple of (F*Q,)
-
-                if _multi:
-                    for k, ig in enumerate(integrand):
-                        elem_int = jnp.einsum(
-                            'fq,fq->f', _eff_w,
-                            ig.reshape(_eff_nf, _eff_nq))
-                        Rs[k] = Rs[k].at[_eff_nids[:, a]].add(elem_int)
-                else:
-                    elem_int = jnp.einsum(
-                        'fq,fq->f', _eff_w,
-                        integrand.reshape(_eff_nf, _eff_nq))
-                    Rs[0] = Rs[0].at[_eff_nids[:, a]].add(elem_int)
-
-            # ── Subtract boundary traction RHS  ∫_Γ t_k · φ_j ds ──────────────
-            for _bj in _bdata_jax:
-                _bp_ndims   = _bj['pts'].shape[-1]
-                _bpts_flat  = _bj['pts'].reshape(-1, _bp_ndims)   # (E*Q, n_dims)
-                _bw         = _bj['weights']                     # (E, Q)
-                _bphi_mat   = _bj['phi']                         # (E, Q, 2)
-                _beid       = _bj['edge_ids']                    # (E, 2)
-                _bfn        = _bj['fn']
-                _n_bedges   = _bj['pts'].shape[0]
-                _n_bqpts    = _bj['pts'].shape[1]
-
-                # Evaluate network at boundary quadrature points
-                _bu_flat, _bgu_flat = jax.vmap(
-                    lambda xy: u_and_grad_fn(params, xy))(_bpts_flat)
-                if _bu_flat.ndim == 1:
-                    _by_flat = _bu_flat.reshape(-1, 1)
-                    def _make_bderiv(bgu):
-                        def _bderiv(Y, X, component, order):
-                            dim = order[0] if isinstance(order, (list, tuple)) else order
-                            return bgu[:, dim]
-                        return _bderiv
-                    _bderiv = _make_bderiv(_bgu_flat)
-                else:
-                    _by_flat = _bu_flat
-                    def _make_bderiv(bjac):
-                        def _bderiv(Y, X, component, order):
-                            dim = order[0] if isinstance(order, (list, tuple)) else order
-                            return bjac[:, component, dim]
-                        return _bderiv
-                    _bderiv = _make_bderiv(_bgu_flat)
-
-                for _p in range(2):   # 2 endpoint nodes per boundary edge
-                    _bphi_p = _bphi_mat[:, :, _p]               # (E, Q)
-                    _b_intg = _bfn(
-                        _bpts_flat, _by_flat, params_dict,
-                        _bphi_p.reshape(-1), _bderiv,
-                    )
-                    if _multi:
-                        for k, ig in enumerate(_b_intg):
-                            _belem = jnp.einsum(
-                                'eq,eq->e', _bw,
-                                ig.reshape(_n_bedges, _n_bqpts))
-                            Rs[k] = Rs[k].at[_beid[:, _p]].add(-_belem)
-                    else:
-                        _belem = jnp.einsum(
-                            'eq,eq->e', _bw,
-                            _b_intg.reshape(_n_bedges, _n_bqpts))
-                        Rs[0] = Rs[0].at[_beid[:, _p]].add(-_belem)
-
-            # Loss = inner free-node MSE  +  per-BC weighted boundary MSEs.
-            # Each weak-BC entry in _bdata_jax carries its own weight key(s)
-            # so the user can tune each boundary independently via the weights dict.
+            # ── Node-loss helper (shared across terms) ─────────────────────────
             # R is normalised by norm_j = V_j + L_j:
             #   V_j = nodal support volume (2-D, ~ h²)  handles ∫_Ω σ:∇φ dΩ ~ h²
             #   L_j = boundary edge length support (1-D, ~ h) handles ∫_Γ t·φ dS ~ h
-            # Together they keep R̂_j = R_j / norm_j ~ O(σ) for all node types.
             def _node_loss(R, comp_idx):
                 R_norm = R / node_norm_jax   # R̂_j = R_j / (V_j + L_j)
-                # Interior nodes
                 if _has_inner:
                     loss = jnp.mean(R_norm[inner_free_nodes_jax] ** 2)
                 elif not _has_boundary:
                     return jnp.mean(R_norm[free_nodes_jax] ** 2)
                 else:
                     loss = 0.0
-                # Per-BC boundary contributions
                 for _bj in _bdata_jax:
                     if _bj['free_nodes'] is None:
                         continue
@@ -1966,7 +2185,91 @@ class ProblemWeak:
                     w = float(_bc_weights.get(key, 1.0)) if key is not None else 1.0
                     loss = loss + w * jnp.mean(R_norm[_bj['free_nodes']] ** 2)
                 return loss
-            return sum(_node_loss(R, k) for k, R in enumerate(Rs)) / _n_comp
+
+            total_loss = 0.0
+            for _iterm, _term in enumerate(_inner_terms):
+                _tfn   = _term['fn']
+                _tname = _term['name']
+                _tw    = float(_bc_weights.get(_tname, 1.0))
+                Rs = [jnp.zeros(n_dofs, dtype=jnp.float32) for _ in range(_n_comp)]
+
+                for a in range(n_local):
+                    phi_a       = _eff_phi[:, :, a]                    # (F, Q)
+                    gphi_a      = _eff_gphi[:, :, a, :]                # (F, Q, 2)
+                    gphi_a_flat = gphi_a.reshape(-1, 2)
+
+                    integrand = _tfn(
+                        pts_flat,
+                        y_flat,
+                        params_dict,
+                        phi_a.reshape(-1),
+                        make_deriv(grad_u_flat, gphi_a_flat),
+                    )                               # (F*Q,) or tuple of (F*Q,)
+
+                    if _multi:
+                        for k, ig in enumerate(integrand):
+                            elem_int = jnp.einsum(
+                                'fq,fq->f', _eff_w,
+                                ig.reshape(_eff_nf, _eff_nq))
+                            Rs[k] = Rs[k].at[_eff_nids[:, a]].add(elem_int)
+                    else:
+                        elem_int = jnp.einsum(
+                            'fq,fq->f', _eff_w,
+                            integrand.reshape(_eff_nf, _eff_nq))
+                        Rs[0] = Rs[0].at[_eff_nids[:, a]].add(elem_int)
+
+                # ── Subtract boundary traction RHS from the first inner term ────
+                if _iterm == 0:
+                    for _bj in _bdata_jax:
+                        _bp_ndims   = _bj['pts'].shape[-1]
+                        _bpts_flat  = _bj['pts'].reshape(-1, _bp_ndims)
+                        _bw         = _bj['weights']
+                        _bphi_mat   = _bj['phi']
+                        _beid       = _bj['edge_ids']
+                        _bfn        = _bj['fn']
+                        _n_bedges   = _bj['pts'].shape[0]
+                        _n_bqpts    = _bj['pts'].shape[1]
+
+                        _bu_flat, _bgu_flat = jax.vmap(
+                            lambda xy: u_and_grad_fn(params, xy))(_bpts_flat)
+                        if _bu_flat.ndim == 1:
+                            _by_flat = _bu_flat.reshape(-1, 1)
+                            def _make_bderiv(bgu):
+                                def _bderiv(Y, X, component, order):
+                                    dim = order[0] if isinstance(order, (list, tuple)) else order
+                                    return bgu[:, dim]
+                                return _bderiv
+                            _bderiv = _make_bderiv(_bgu_flat)
+                        else:
+                            _by_flat = _bu_flat
+                            def _make_bderiv(bjac):
+                                def _bderiv(Y, X, component, order):
+                                    dim = order[0] if isinstance(order, (list, tuple)) else order
+                                    return bjac[:, component, dim]
+                                return _bderiv
+                            _bderiv = _make_bderiv(_bgu_flat)
+
+                        for _p in range(2):
+                            _bphi_p = _bphi_mat[:, :, _p]
+                            _b_intg = _bfn(
+                                _bpts_flat, _by_flat, params_dict,
+                                _bphi_p.reshape(-1), _bderiv,
+                            )
+                            if _multi:
+                                for k, ig in enumerate(_b_intg):
+                                    _belem = jnp.einsum(
+                                        'eq,eq->e', _bw,
+                                        ig.reshape(_n_bedges, _n_bqpts))
+                                    Rs[k] = Rs[k].at[_beid[:, _p]].add(-_belem)
+                            else:
+                                _belem = jnp.einsum(
+                                    'eq,eq->e', _bw,
+                                    _b_intg.reshape(_n_bedges, _n_bqpts))
+                                Rs[0] = Rs[0].at[_beid[:, _p]].add(-_belem)
+
+                total_loss += _tw * sum(_node_loss(R, k) for k, R in enumerate(Rs)) / _n_comp
+
+            return total_loss
 
         return loss_fn
 
@@ -2158,6 +2461,186 @@ class ProblemWeak:
             return jnp.concatenate([R for R in Rs])
 
         return residual_fn
+
+    def make_residual_vectors_fn(self, u_and_grad_fn):
+        """Like :meth:`make_residual_vector_fn` but returns a **dict** mapping
+        each inner-term name to its per-DOF residual vector.
+
+        This is used by the augmented-Lagrangian trainer so that each term
+        registered via :meth:`add_inner` gets its own independent Lagrange
+        multiplier vector.
+
+        Returns
+        -------
+        residual_fns : callable
+            ``residual_fns(params) -> dict[str, jnp.ndarray]``
+            Each value has shape ``(n_dofs * n_outputs,)`` (components
+            are concatenated, same layout as :meth:`make_residual_vector_fn`).
+        """
+        import jax
+        import jax.numpy as jnp
+
+        cd = self.cubature_data
+        _pts_sp = cd['pts']
+
+        _random_time = getattr(self, '_random_time_sampling', False)
+        if _random_time:
+            import numpy as _np_rvf
+            _t0  = float(getattr(self, '_t_min', 0.0) or 0.0)
+            _t1  = float(getattr(self, '_t_max', 1.0) or 1.0)
+            _n_t = int(getattr(self, '_n_t', 10) or 10)
+            _dt  = (_t1 - _t0) / _n_t
+            _t_vals = _t0 + (_np_rvf.arange(_n_t) + 0.5) * _dt
+            _F_sp, _Q_sp = _pts_sp.shape[:2]
+            _pts_xy4d = _np_rvf.broadcast_to(
+                _pts_sp[None], (_n_t, _F_sp, _Q_sp, 2)).copy()
+            _t_col = _np_rvf.broadcast_to(
+                _t_vals[:, None, None, None], (_n_t, _F_sp, _Q_sp, 1)).copy()
+            _pts_st = _np_rvf.concatenate([_pts_xy4d, _t_col], axis=-1)
+            _pts_st = _pts_st.reshape(_n_t * _F_sp, _Q_sp, 3).astype(_np_rvf.float32)
+            _weights_np = _np_rvf.tile(cd['weights'], (_n_t, 1)) * _dt
+            _phi_np     = _np_rvf.tile(cd['phi'],     (_n_t, 1, 1))
+            _gphi_np    = _np_rvf.tile(cd['grad_phi'],(_n_t, 1, 1, 1))
+            _node_ids_np= _np_rvf.tile(cd['node_ids'],(_n_t, 1))
+            pts_jax      = jnp.asarray(_pts_st,       dtype=jnp.float32)
+            weights_jax  = jnp.asarray(_weights_np,   dtype=jnp.float32)
+            phi_jax      = jnp.asarray(_phi_np,       dtype=jnp.float32)
+            grad_phi_jax = jnp.asarray(_gphi_np,      dtype=jnp.float32)
+            node_ids_jax = jnp.asarray(_node_ids_np,  dtype=jnp.int32)
+        else:
+            pts_jax      = jnp.asarray(_pts_sp,          dtype=jnp.float32)
+            weights_jax  = jnp.asarray(cd['weights'],    dtype=jnp.float32)
+            phi_jax      = jnp.asarray(cd['phi'],        dtype=jnp.float32)
+            grad_phi_jax = jnp.asarray(cd['grad_phi'],   dtype=jnp.float32)
+            node_ids_jax = jnp.asarray(cd['node_ids'],   dtype=jnp.int32)
+
+        n_dofs    = self.n_dofs
+        n_faces   = pts_jax.shape[0]
+        n_qpts    = pts_jax.shape[1]
+        n_local   = phi_jax.shape[2]
+        _terms    = list(self._inner_terms) or [{'fn': self.volume_fn, 'name': 'pde'}]
+        params_dict = self._build_params()
+
+        _bdata_jax = []
+        for _bd in self.boundary_fn_data:
+            _bdata_jax.append({
+                'pts':      jnp.asarray(_bd['pts'],      dtype=jnp.float32),
+                'weights':  jnp.asarray(_bd['weights'],  dtype=jnp.float32),
+                'phi':      jnp.asarray(_bd['phi'],      dtype=jnp.float32),
+                'edge_ids': jnp.asarray(_bd['edge_ids'], dtype=jnp.int32),
+                'fn':       _bd['fn'],
+            })
+
+        _n_pts_dims_r = pts_jax.shape[-1]
+
+        def residual_fns(params):
+            pts_flat = pts_jax.reshape(-1, _n_pts_dims_r)
+            u_flat, grad_u_flat = jax.vmap(
+                lambda xy: u_and_grad_fn(params, xy))(pts_flat)
+
+            if u_flat.ndim == 1:
+                y_flat = u_flat.reshape(-1, 1)
+                def make_deriv(gu, gphi):
+                    def deriv_fn(Y, X, component, order):
+                        dim = order[0] if isinstance(order, (list, tuple)) else order
+                        if Y.ndim == 1: return gphi[:, dim]
+                        return gu[:, dim]
+                    return deriv_fn
+            else:
+                y_flat = u_flat
+                def make_deriv(jac, gphi):
+                    def deriv_fn(Y, X, component, order):
+                        dim = order[0] if isinstance(order, (list, tuple)) else order
+                        if Y.ndim == 1: return gphi[:, dim]
+                        return jac[:, component, dim]
+                    return deriv_fn
+
+            _gphi0 = grad_phi_jax[:, :, 0, :].reshape(-1, 2)
+            R_sample = _terms[0]['fn'](
+                pts_flat, y_flat, params_dict,
+                phi_jax[:, :, 0].reshape(-1),
+                make_deriv(grad_u_flat, _gphi0),
+            )
+            _multi = isinstance(R_sample, (tuple, list))
+            _n_comp = len(R_sample) if _multi else 1
+
+            result = {}
+            for _iterm, _term in enumerate(_terms):
+                _tfn = _term['fn']
+                Rs = [jnp.zeros(n_dofs, dtype=jnp.float32) for _ in range(_n_comp)]
+
+                for a in range(n_local):
+                    phi_a       = phi_jax[:, :, a]
+                    gphi_a_flat = grad_phi_jax[:, :, a, :].reshape(-1, 2)
+                    integrand   = _tfn(
+                        pts_flat, y_flat, params_dict,
+                        phi_a.reshape(-1),
+                        make_deriv(grad_u_flat, gphi_a_flat),
+                    )
+                    if _multi:
+                        for k, ig in enumerate(integrand):
+                            elem_int = jnp.einsum(
+                                'fq,fq->f', weights_jax,
+                                ig.reshape(n_faces, n_qpts))
+                            Rs[k] = Rs[k].at[node_ids_jax[:, a]].add(elem_int)
+                    else:
+                        elem_int = jnp.einsum(
+                            'fq,fq->f', weights_jax,
+                            integrand.reshape(n_faces, n_qpts))
+                        Rs[0] = Rs[0].at[node_ids_jax[:, a]].add(elem_int)
+
+                # Subtract boundary traction RHS from the first inner term only
+                if _iterm == 0:
+                    for _bj in _bdata_jax:
+                        _bp_ndims_r = _bj['pts'].shape[-1]
+                        _bpts_flat  = _bj['pts'].reshape(-1, _bp_ndims_r)
+                        _bw         = _bj['weights']
+                        _bphi_mat   = _bj['phi']
+                        _beid       = _bj['edge_ids']
+                        _bfn        = _bj['fn']
+                        _n_bedges   = _bj['pts'].shape[0]
+                        _n_bqpts    = _bj['pts'].shape[1]
+                        _bu_flat, _bgu_flat = jax.vmap(
+                            lambda xy: u_and_grad_fn(params, xy))(_bpts_flat)
+                        if _bu_flat.ndim == 1:
+                            _by_flat = _bu_flat.reshape(-1, 1)
+                            def _make_bderiv(bgu):
+                                def _bderiv(Y, X, component, order):
+                                    dim = order[0] if isinstance(order, (list, tuple)) else order
+                                    return bgu[:, dim]
+                                return _bderiv
+                            _bderiv = _make_bderiv(_bgu_flat)
+                        else:
+                            _by_flat = _bu_flat
+                            def _make_bderiv(bjac):
+                                def _bderiv(Y, X, component, order):
+                                    dim = order[0] if isinstance(order, (list, tuple)) else order
+                                    return bjac[:, component, dim]
+                                return _bderiv
+                            _bderiv = _make_bderiv(_bgu_flat)
+                        for _p in range(2):
+                            _bphi_p = _bphi_mat[:, :, _p]
+                            _b_intg = _bfn(
+                                _bpts_flat, _by_flat, params_dict,
+                                _bphi_p.reshape(-1), _bderiv,
+                            )
+                            if _multi:
+                                for k, ig in enumerate(_b_intg):
+                                    _belem = jnp.einsum(
+                                        'eq,eq->e', _bw,
+                                        ig.reshape(_n_bedges, _n_bqpts))
+                                    Rs[k] = Rs[k].at[_beid[:, _p]].add(-_belem)
+                            else:
+                                _belem = jnp.einsum(
+                                    'eq,eq->e', _bw,
+                                    _b_intg.reshape(_n_bedges, _n_bqpts))
+                                Rs[0] = Rs[0].at[_beid[:, _p]].add(-_belem)
+
+                result[_term['name']] = jnp.concatenate(Rs)
+
+            return result
+
+        return residual_fns
 
     def make_residual_vector_fn_at_t(self, u_and_grad_fn, t_val: float):
         """Like :meth:`make_residual_vector_fn` but for a fixed time ``t_val``.

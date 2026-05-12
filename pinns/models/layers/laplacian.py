@@ -82,7 +82,7 @@ class LaplacianFeatures:
     a built-in low-pass filter — only smooth (physically motivated) functions
     can be represented.
 
-    Drop-in replacement for :class:`FourierFeatures` — identical callable API.
+    Drop-in replacement for :class:`RandomFourierFeatures` — identical callable API.
 
     **Time handling** — if *domain* carries a ``t_interval``:
 

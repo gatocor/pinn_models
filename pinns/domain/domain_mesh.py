@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union, Literal, Tuple, Lis
 from dataclasses import dataclass
 
 if TYPE_CHECKING:
-    from ..boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC
+    from ..terms import TermDirichletBC, TermNeumannBC, TermRobinBC, TermPoints
 
 class DomainMesh:
     """
@@ -48,7 +48,7 @@ class DomainMesh:
         # Stationary
         domain = DomainMesh(mesh)
 
-        # Continuous time — BCs are MeshNodeBC objects appended to
+        # Continuous time — BCs are TermMeshNodeBC objects appended to
         # domain.boundary_conditions directly or via the Problem class
         domain = DomainMesh(mesh, time=(0.0, 1.0))
 
@@ -930,7 +930,7 @@ class DomainMesh:
         ``(min_v, max_v) -> edge_index`` dict built at construction time).
         This is the most direct way to go from the ``"line"`` cells that Gmsh /
         meshio stores for physical boundaries to the edge arrays expected by
-        :class:`~pinns.boundary.MeshNodeBC` (``edges``, ``edge_lengths``,
+        :class:`~pinns.boundary.TermMeshNodeBC` (``edges``, ``edge_lengths``,
         ``edge_normals`` fields).
 
         Args:
@@ -947,7 +947,7 @@ class DomainMesh:
             line_cells = mesh.cells_dict["line"]  # all boundary segments
             eidx = domain.edge_pairs_to_indices(line_cells)
             edges = domain._all_edges[eidx]
-            # → pass edges to MeshNodeBC(edges=edges, ...)
+            # → pass edges to TermMeshNodeBC(edges=edges, ...)
         """
         indices = []
         for v0, v1 in edge_pairs:
@@ -1066,15 +1066,14 @@ class DomainMesh:
         their **time windows overlap** — meaning the same node would be
         assigned two different conditions at the same time.
         """
-        from pinns.boundary import MeshNodeBC
-        if not isinstance(new_bc, MeshNodeBC):
+        if not hasattr(new_bc, 'node_positions'):
             return
 
         t_min = self._t_min if self._t_min is not None else 0.0
         t_max = self._t_max if self._t_max is not None else 1.0
 
         for existing in self.boundary_conditions:
-            if not isinstance(existing, MeshNodeBC):
+            if not hasattr(existing, 'node_positions'):
                 continue
             if existing.bc_type != new_bc.bc_type:
                 continue
@@ -1247,13 +1246,13 @@ class DomainMesh:
         raise ValueError(f"Invalid region: {region!r}")
 
     def sample_boundary_bc(self, bc, n_points: int, rng=None) -> np.ndarray:
-        """Sample *n_points* from a specific :class:`~pinns.boundary.MeshNodeBC`.
+        """Sample *n_points* from a specific :class:`~pinns.boundary.TermMeshNodeBC`.
 
         This is the **trainer-internal** method called by
         :class:`~pinns.backends.base_trainer.BaseTrainer` during the BC loss
         computation.  It differs from :meth:`sample_boundary` in two key ways:
 
-        1. It accepts a ``MeshNodeBC`` object directly instead of a region name,
+        1. It accepts a ``TermMeshNodeBC`` object directly instead of a region name,
            so the trainer drives sampling from its registered BC list.
         2. It returns a ``(pts, edge_idx)`` *tuple* — the edge indices are
            needed by the trainer to look up per-edge outward normals for Neumann
@@ -1268,7 +1267,7 @@ class DomainMesh:
         A time coordinate is appended according to ``bc.time_window``.
 
         Args:
-            bc: A :class:`~pinns.boundary.MeshNodeBC` that has already been
+            bc: A :class:`~pinns.boundary.TermMeshNodeBC` that has already been
                 appended to ``self.boundary_conditions``.
             n_points: Number of collocation points to draw.
             rng: NumPy random generator.
@@ -1313,6 +1312,14 @@ class DomainMesh:
             t = chosen.reshape(-1, 1)
         return np.hstack([pts_sp, t]), idx
 
+    def get_face_normal_direction(self, region: str):
+        """Mesh boundary normals are always per-point; return ``None``.
+
+        The trainer must use the per-point normals stored in the BC object
+        (``bc._sampled_normals``) for mesh domains.
+        """
+        return None
+
     # ------------------------------------------------------------------ #
     #  Boundary-condition builders                                        #
     # ------------------------------------------------------------------ #
@@ -1331,7 +1338,7 @@ class DomainMesh:
 
     @staticmethod
     def _bc_label(bc, color_idx: int) -> str:
-        """Build a human-readable legend label for one MeshNodeBC."""
+        """Build a human-readable legend label for one TermMeshNodeBC."""
         label = bc.name or f"bc_{color_idx}"
         if bc.bc_type:
             label = f"[{bc.bc_type[0].upper()}] {label}"
@@ -1351,7 +1358,7 @@ class DomainMesh:
 
     def _draw_bc_on_ax(self, ax, bc, color, label,
                        node_size: float, show_normals: bool = False) -> None:
-        """Draw a single MeshNodeBC onto *ax*."""
+        """Draw a single TermMeshNodeBC onto *ax*."""
         v = self._vertices
         if bc.node_indices is not None:
             pts = v[bc.node_indices]
@@ -1448,10 +1455,9 @@ class DomainMesh:
 
         import matplotlib.pyplot as plt
         import matplotlib.collections as mcoll
-        from pinns.boundary import MeshNodeBC
 
         mesh_bcs = [bc for bc in self.boundary_conditions
-                    if isinstance(bc, MeshNodeBC)]
+                    if hasattr(bc, 'node_positions')]
 
         # ── Resolve which inner/boundary regions to highlight ─────────────
         # 'all'  → draw the entire mesh / boundary as one unified colour
@@ -1708,7 +1714,6 @@ class DomainMesh:
         registered boundary conditions are shown as highlighted point clouds.
         """
         import pyvista as pv
-        from pinns.boundary import MeshNodeBC
 
         v = self._vertices          # (N, 2)
         f = self._faces             # (M, 3)  0-indexed triangles
@@ -1733,7 +1738,7 @@ class DomainMesh:
         _colors = ['#e6194b', '#3cb44b', '#4363d8', '#f58231',
                    '#911eb4', '#42d4f4', '#f032e6', '#bfef45']
         mesh_bcs = [bc for bc in self.boundary_conditions
-                    if isinstance(bc, MeshNodeBC)]
+                    if hasattr(bc, 'node_positions')]
         for i, bc in enumerate(mesh_bcs):
             color = _colors[i % len(_colors)]
             if bc.node_indices is not None:

@@ -130,6 +130,32 @@ def _clone_strategy(
         )
 
 
+def _patch_normalize(model: ModelBase, sub_xmin: np.ndarray, sub_xmax: np.ndarray) -> None:
+    """Update the Normalize layer in *model* to use subdomain bounds.
+
+    The template model's Normalize layer was configured with the full domain
+    bounds.  For FB-PINN correctness each sub-network must normalize inputs
+    to [-1, 1] within *its own* subdomain, not the global domain.
+    """
+    from .layers.normalize import Normalize
+    import jax.numpy as _jnp
+    if not len(sub_xmin):  # nothing to patch (no bounds assigned)
+        return
+    sub_xmin_f32 = _jnp.array(sub_xmin, dtype=_jnp.float32)
+    sub_xmax_f32 = _jnp.array(sub_xmax, dtype=_jnp.float32)
+    for layer in getattr(model, '_layers', []):
+        if isinstance(layer, Normalize):
+            # Only update the coordinate dimensions that the subdomain covers.
+            n = min(len(sub_xmin_f32), layer._n_coord)
+            if n == layer._n_coord:
+                layer._coords_min = sub_xmin_f32
+                layer._coords_max = sub_xmax_f32
+            else:
+                # Partial update (subdomain covers fewer dims than normalizer)
+                layer._coords_min = layer._coords_min.at[:n].set(sub_xmin_f32[:n])
+                layer._coords_max = layer._coords_max.at[:n].set(sub_xmax_f32[:n])
+
+
 # ---------------------------------------------------------------------------
 # Public class
 # ---------------------------------------------------------------------------
@@ -167,12 +193,13 @@ class ModelPartitioned:
             spatial_ranges = [[(float(domain.xmin[d]), float(domain.xmax[d]))] for d in range(n_s)]
             n_per_dim = [1] * n_s
         else:
-            # Pure-time domain.
-            spatial_ranges = [[]]
-            n_per_dim = [1]
+            # Pure-time domain: no spatial dimensions, single "empty" spatial combo.
+            spatial_ranges = []
+            n_per_dim = []
 
         # Cartesian product; each element is a tuple of (lo, hi) pairs, one per dim.
-        spatial_combos: List[Tuple] = list(itertools.product(*spatial_ranges))
+        # For pure-time domains (spatial_ranges is empty), product gives one empty tuple.
+        spatial_combos: List[Tuple] = list(itertools.product(*spatial_ranges)) if spatial_ranges else [()]
 
         # ── Temporal subdomain bounds from domain.time_grid_positions ──────── #
         has_time = bool(getattr(domain, 'has_time', False))
@@ -217,8 +244,9 @@ class ModelPartitioned:
                 new_strategy = _clone_strategy(strategy, sub_xmin, sub_xmax)
                 new_strategy.setup(domain)
 
-                # Deep-copy the template model.
+                # Deep-copy the template model and re-normalise to subdomain bounds.
                 m = copy.deepcopy(model)
+                _patch_normalize(m, sub_xmin, sub_xmax)
                 self._models.append(m)
                 self._strategies.append(new_strategy)
 
@@ -237,6 +265,16 @@ class ModelPartitioned:
         self._n_spatial_dims = n_s
         self._n_per_dim = n_per_dim
         self._n_temporal_parts = len(temporal_combos)
+
+        # Pre-stack bounds for fast vmapped apply (shape: n_models × n_dims).
+        self._all_xmin: np.ndarray = np.stack(
+            [s._xmin if s._xmin is not None and len(s._xmin) > 0
+             else np.empty(0) for s in self._strategies]
+        )
+        self._all_xmax: np.ndarray = np.stack(
+            [s._xmax if s._xmax is not None and len(s._xmax) > 0
+             else np.empty(0) for s in self._strategies]
+        )
 
     # ── Public interface ─────────────────────────────────────────────── #
 
@@ -311,11 +349,73 @@ class ModelPartitioned:
         -------
         jnp.ndarray  shape ``(batch, output_dim)``
         """
-        total = None
-        for i, (m, strategy) in enumerate(zip(self._models, self._strategies)):
-            y = strategy.predict(m._sequential_apply, params[f"sub_{i}"], x, params_dict)
-            total = y if total is None else total + y
-        return total  # type: ignore[return-value]
+        n = len(self._models)
+        # All sub-networks share the same architecture; use the first model's
+        # sequential_apply as the vmapped kernel (params differ, structure identical).
+        apply_fn = self._models[0]._sequential_apply
+
+        if isinstance(self._strategy_proto, PartitionFB):
+            # ── FB-PINN: window-weighted sum, fully vmapped ─────────────── #
+            overlap = float(self._strategy_proto.overlap)
+            n_s = self._all_xmin.shape[1]  # spatial+time dims per bound vector
+            all_xmin = jnp.array(self._all_xmin, dtype=x.dtype)  # (K, n_dims)
+            all_xmax = jnp.array(self._all_xmax, dtype=x.dtype)  # (K, n_dims)
+
+            # Stack sub-params along a new leading axis so vmap can iterate.
+            sub_params_list = [params[f"sub_{i}"] for i in range(n)]
+            stacked = jax.tree.map(
+                lambda *arrs: jnp.stack(arrs, axis=0), *sub_params_list
+            )
+
+            def _single(sub_p, xmin_i, xmax_i):
+                """Evaluate one sub-network and apply its window function."""
+                y_i = apply_fn(sub_p, x, params_dict)           # (batch, out)
+                x_s = x[:, :n_s]                                 # spatial dims
+                sigma = jnp.maximum(
+                    overlap * (xmax_i - xmin_i),
+                    jnp.full_like(xmax_i, 1e-8),
+                )
+                w = jnp.prod(
+                    jnp.tanh((x_s - xmin_i) / sigma)
+                    * jnp.tanh((xmax_i - x_s) / sigma),
+                    axis=-1, keepdims=True,
+                )                                               # (batch, 1)
+                return w * y_i                                  # (batch, out)
+
+            # all_out: (K, batch, out_dim) — all sub-networks in one XLA call.
+            all_out = jax.vmap(_single)(stacked, all_xmin, all_xmax)
+            return jnp.sum(all_out, axis=0)
+
+        elif isinstance(self._strategy_proto, PartitionX):
+            # ── X-PINN: hard-masked sum, fully vmapped ─────────────────── #
+            n_s = self._all_xmin.shape[1]
+            all_xmin = jnp.array(self._all_xmin, dtype=x.dtype)
+            all_xmax = jnp.array(self._all_xmax, dtype=x.dtype)
+
+            sub_params_list = [params[f"sub_{i}"] for i in range(n)]
+            stacked = jax.tree.map(
+                lambda *arrs: jnp.stack(arrs, axis=0), *sub_params_list
+            )
+
+            def _single_x(sub_p, xmin_i, xmax_i):
+                y_i = apply_fn(sub_p, x, params_dict)           # (batch, out)
+                x_s = x[:, :n_s]
+                inside = jnp.all(
+                    (x_s >= xmin_i) & (x_s <= xmax_i),
+                    axis=-1, keepdims=True,
+                )                                               # (batch, 1)
+                return jnp.where(inside, y_i, jnp.zeros_like(y_i))
+
+            all_out = jax.vmap(_single_x)(stacked, all_xmin, all_xmax)
+            return jnp.sum(all_out, axis=0)
+
+        else:
+            # ── Fallback: Python loop for unknown strategy types ─────────── #
+            total = None
+            for i, (m, strategy) in enumerate(zip(self._models, self._strategies)):
+                y = strategy.predict(m._sequential_apply, params[f"sub_{i}"], x, params_dict)
+                total = y if total is None else total + y
+            return total  # type: ignore[return-value]
 
     @property
     def n_context(self) -> int:

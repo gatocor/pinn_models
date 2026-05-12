@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import pytest
 
 from pinns.models.layers import (
-    FourierFeatures, GNNFeatures, LaplacianFeatures, AlphaTransform,
+    RandomFourierFeatures, FourierFeatures, GNNFeatures, LaplacianFeatures, AlphaTransform,
     Normalize, Denormalize,
     FNN, WFFNN, ResNet, PirateNet,
 )
@@ -64,180 +64,154 @@ def spacetime_domain():
     return DomainMesh((VERTS, FACES), time=(0.0, 1.0))
 
 
+# ---------------------------------------------------------------------------
+# Helper: configure a RandomFourierFeatures via a minimal ModelBase so that
+# _configure() is called, just as it would be in production code.
+# ---------------------------------------------------------------------------
+def _make_ff(n_features=8, sigma=1.0, seed=0, include_input=False,
+             encode_time=None, spatial_dims=2, has_time=False, n_context=0):
+    from pinns.domain import DomainCubic
+    from pinns.models.model_base import ModelBase
+    space = [[0.0, 1.0]] * spatial_dims
+    domain = DomainCubic(space=space, time=[0.0, 1.0] if has_time else None)
+    net = ModelBase(domain, output_dim=1, n_context=n_context)
+    ff  = RandomFourierFeatures(n_features=n_features, sigma=sigma, seed=seed,
+                          include_input=include_input, encode_time=encode_time)
+    net.add(ff)
+    return ff
+
+
 # ===========================================================================
 # FourierFeatures
 # ===========================================================================
 
-class TestFourierFeatures:
+class TestRandomFourierFeatures:
 
-    def test_output_dim_no_input(self):
-        ff = FourierFeatures(input_dim=3, n_features=16)
+    def test_output_dim_no_include(self):
+        ff = _make_ff(spatial_dims=3, n_features=16)
         assert ff.output_dim == 32
 
-    def test_output_dim_with_input(self):
-        ff = FourierFeatures(input_dim=3, n_features=16, include_input=True)
-        assert ff.output_dim == 35  # 32 + 3
+    def test_output_dim_with_include_input(self):
+        ff = _make_ff(spatial_dims=3, n_features=16, include_input=True)
+        assert ff.output_dim == 35   # 32 + 3
 
     def test_call_shape(self):
-        ff = FourierFeatures(input_dim=3, n_features=16)
-        x = jnp.ones((BATCH, 3))
-        out = ff(x)
+        ff = _make_ff(spatial_dims=3, n_features=16)
+        out = ff(jnp.ones((BATCH, 3)))
         assert out.shape == (BATCH, 32)
 
     def test_call_with_params_dict(self):
         """params_dict argument is ignored — should not raise."""
-        ff = FourierFeatures(input_dim=2, n_features=8)
-        x = jnp.ones((BATCH, 2))
-        out = ff(x, params_dict={"anything": 1})
+        ff  = _make_ff(spatial_dims=2, n_features=8)
+        out = ff(jnp.ones((BATCH, 2)), params_dict={"anything": 1})
         assert out.shape == (BATCH, 16)
 
     def test_transform_alias(self):
-        ff = FourierFeatures(input_dim=2, n_features=8)
-        x = jnp.ones((BATCH, 2))
+        ff = _make_ff(spatial_dims=2, n_features=8)
+        x  = jnp.ones((BATCH, 2))
         assert jnp.allclose(ff(x), ff.transform(x))
 
     def test_deterministic_across_seeds(self):
         """Same seed → same B → identical output."""
-        ff1 = FourierFeatures(input_dim=2, n_features=8, seed=42)
-        ff2 = FourierFeatures(input_dim=2, n_features=8, seed=42)
-        x = jax.random.normal(RNG, (BATCH, 2))
+        ff1 = _make_ff(spatial_dims=2, n_features=8, seed=42)
+        ff2 = _make_ff(spatial_dims=2, n_features=8, seed=42)
+        x   = jax.random.normal(RNG, (BATCH, 2))
         assert jnp.allclose(ff1(x), ff2(x))
 
     def test_different_seeds_differ(self):
-        ff1 = FourierFeatures(input_dim=2, n_features=8, seed=0)
-        ff2 = FourierFeatures(input_dim=2, n_features=8, seed=1)
-        x = jax.random.normal(RNG, (BATCH, 2))
+        ff1 = _make_ff(spatial_dims=2, n_features=8, seed=0)
+        ff2 = _make_ff(spatial_dims=2, n_features=8, seed=1)
+        x   = jax.random.normal(RNG, (BATCH, 2))
         assert not jnp.allclose(ff1(x), ff2(x))
 
     def test_include_input_shape(self):
-        ff = FourierFeatures(input_dim=2, n_features=8, include_input=True)
-        x = jnp.ones((BATCH, 2))
-        out = ff(x)
+        ff  = _make_ff(spatial_dims=2, n_features=8, include_input=True)
+        out = ff(jnp.ones((BATCH, 2)))
         assert out.shape == (BATCH, 18)   # 16 + 2
 
     def test_cos_sin_range(self):
         """All values should lie in [-1, 1] since they are cos/sin."""
-        ff = FourierFeatures(input_dim=3, n_features=32)
-        x = jax.random.normal(RNG, (100, 3))
-        out = ff(x)
+        ff  = _make_ff(spatial_dims=3, n_features=32)
+        out = ff(jax.random.normal(RNG, (100, 3)))
         assert jnp.all(out >= -1.0 - 1e-5)
         assert jnp.all(out <=  1.0 + 1e-5)
 
     def test_repr(self):
-        ff = FourierFeatures(input_dim=2, n_features=8, sigma=5.0)
-        r = repr(ff)
-        assert "FourierFeatures" in r
+        ff = _make_ff(spatial_dims=2, n_features=8, sigma=5.0)
+        r  = repr(ff)
+        assert "RandomFourierFeatures" in r
         assert "n_features=8" in r
         assert "sigma=5.0" in r
 
     def test_compose_with_fnn(self):
-        """FourierFeatures can be used as input to an FNN layer."""
+        """RandomFourierFeatures output feeds correctly into an FNN layer."""
         from pinns.models.layers.fnn import FNNModule
-        ff = FourierFeatures(input_dim=2, n_features=8)
-        module = FNNModule(layer_sizes=(ff.output_dim, 32, 1))
-        features = ff(jnp.ones((BATCH, 2)))
-        params = module.init(RNG, features[:1])
-        y = module.apply(params, features)
+        ff      = _make_ff(spatial_dims=2, n_features=8)
+        module  = FNNModule(layer_sizes=(ff.output_dim, 32, 1))
+        feats   = ff(jnp.ones((BATCH, 2)))
+        params  = module.init(RNG, feats[:1])
+        y       = module.apply(params, feats)
         assert y.shape == (BATCH, 1)
 
     def test_aliased_in_layers_module(self):
         import pinns.models.layers as T
-        assert T.FourierFeatures is FourierFeatures
-
-
-class TestFourierFeaturesFromDomain:
-    """FourierFeatures constructed with a domain object."""
-
-    # --- spatial-only domain (no time) --------------------------------------
-
-    def test_domain_no_time_output_dim(self, simple_domain):
-        ff = FourierFeatures(domain=simple_domain, n_features=8)
-        # 2 * 8 features, spatial_dims=2, no time column
-        assert ff.output_dim == 16
-
-    def test_domain_no_time_call_shape(self, simple_domain, query_spatial):
-        ff = FourierFeatures(domain=simple_domain, n_features=8)
-        out = ff(query_spatial)
-        assert out.shape == (BATCH, 16)
-
-    def test_domain_no_time_encode_time_false_is_ok(self, simple_domain, query_spatial):
-        """encode_time=False is allowed even when there is no time."""
-        ff = FourierFeatures(domain=simple_domain, n_features=8, encode_time=False)
-        out = ff(query_spatial)
-        assert out.shape == (BATCH, 16)
-
-    def test_domain_no_time_include_input(self, simple_domain, query_spatial):
-        ff = FourierFeatures(domain=simple_domain, n_features=8, include_input=True)
-        # 2*8 + 2 (spatial) = 18
-        assert ff.output_dim == 18
-        out = ff(query_spatial)
-        assert out.shape == (BATCH, 18)
+        assert T.RandomFourierFeatures is RandomFourierFeatures
 
     # --- space-time domain, encode_time=False (spatial Fourier + raw t) -----
 
-    def test_domain_time_no_encode_requires_flag(self, spacetime_domain):
+    def test_time_no_encode_requires_flag(self):
         """Must raise if domain has time and encode_time is not set."""
         with pytest.raises(ValueError, match="encode_time"):
-            FourierFeatures(domain=spacetime_domain, n_features=8)
+            _make_ff(spatial_dims=2, n_features=8, has_time=True)  # encode_time=None
 
-    def test_domain_time_encode_false_output_dim(self, spacetime_domain):
-        ff = FourierFeatures(domain=spacetime_domain, n_features=8, encode_time=False)
+    def test_time_encode_false_output_dim(self):
+        ff = _make_ff(spatial_dims=2, n_features=8, has_time=True, encode_time=False)
         # 2*8 (spatial Fourier) + 1 (raw t) = 17
         assert ff.output_dim == 17
 
-    def test_domain_time_encode_false_call_shape(self, spacetime_domain, query_spacetime):
-        ff = FourierFeatures(domain=spacetime_domain, n_features=8, encode_time=False)
+    def test_time_encode_false_call_shape(self, query_spacetime):
+        ff  = _make_ff(spatial_dims=2, n_features=8, has_time=True, encode_time=False)
         out = ff(query_spacetime)
         assert out.shape == (BATCH, 17)
 
-    def test_domain_time_encode_false_t_passthrough(self, spacetime_domain, query_spacetime):
+    def test_time_encode_false_t_passthrough(self, query_spacetime):
         """Last column of output should equal the raw t input."""
-        ff = FourierFeatures(domain=spacetime_domain, n_features=8, encode_time=False)
+        ff  = _make_ff(spatial_dims=2, n_features=8, has_time=True, encode_time=False)
         out = ff(query_spacetime)
-        t_in = query_spacetime[:, 2:3]
-        assert jnp.allclose(out[:, -1:], t_in)
+        assert jnp.allclose(out[:, -1:], query_spacetime[:, 2:3])
 
-    def test_domain_time_encode_false_include_input(self, spacetime_domain, query_spacetime):
-        ff = FourierFeatures(
-            domain=spacetime_domain, n_features=8,
-            encode_time=False, include_input=True,
-        )
+    def test_time_encode_false_include_input(self, query_spacetime):
+        ff = _make_ff(spatial_dims=2, n_features=8, has_time=True,
+                      encode_time=False, include_input=True)
         # 2 (spatial) + 2*8 + 1 (raw t) = 19
         assert ff.output_dim == 19
-        out = ff(query_spacetime)
-        assert out.shape == (BATCH, 19)
+        assert ff(query_spacetime).shape == (BATCH, 19)
 
     # --- space-time domain, encode_time=True (full spacetime Fourier) -------
 
-    def test_domain_time_encode_true_output_dim(self, spacetime_domain):
-        ff = FourierFeatures(domain=spacetime_domain, n_features=8, encode_time=True)
+    def test_time_encode_true_output_dim(self):
+        ff = _make_ff(spatial_dims=2, n_features=8, has_time=True, encode_time=True)
         # Fourier input dim = 3 (x, y, t), output = 2*8 = 16
         assert ff.output_dim == 16
 
-    def test_domain_time_encode_true_call_shape(self, spacetime_domain, query_spacetime):
-        ff = FourierFeatures(domain=spacetime_domain, n_features=8, encode_time=True)
+    def test_time_encode_true_call_shape(self, query_spacetime):
+        ff  = _make_ff(spatial_dims=2, n_features=8, has_time=True, encode_time=True)
         out = ff(query_spacetime)
         assert out.shape == (BATCH, 16)
 
-    def test_domain_time_encode_true_include_input(self, spacetime_domain, query_spacetime):
-        ff = FourierFeatures(
-            domain=spacetime_domain, n_features=8,
-            encode_time=True, include_input=True,
-        )
+    def test_time_encode_true_include_input(self, query_spacetime):
+        ff = _make_ff(spatial_dims=2, n_features=8, has_time=True,
+                      encode_time=True, include_input=True)
         # 3 (x,y,t) + 2*8 = 19
         assert ff.output_dim == 19
-        out = ff(query_spacetime)
-        assert out.shape == (BATCH, 19)
+        assert ff(query_spacetime).shape == (BATCH, 19)
 
-    def test_domain_and_input_dim_mutual_exclusive(self, simple_domain):
-        with pytest.raises(ValueError, match="not both"):
-            FourierFeatures(input_dim=2, domain=simple_domain, n_features=8)
-
-    def test_repr_shows_encode_time(self, spacetime_domain):
-        ff = FourierFeatures(domain=spacetime_domain, n_features=8, encode_time=False)
-        assert "encode_time=False" in repr(ff)
-        ff2 = FourierFeatures(domain=spacetime_domain, n_features=8, encode_time=True)
+    def test_repr_shows_encode_time(self):
+        ff1 = _make_ff(spatial_dims=2, n_features=8, has_time=True, encode_time=False)
+        assert "encode_time=False" in repr(ff1)
+        ff2 = _make_ff(spatial_dims=2, n_features=8, has_time=True, encode_time=True)
         assert "encode_time=True" in repr(ff2)
+
 
 
 # ===========================================================================
@@ -390,38 +364,36 @@ class TestContextFields:
     """n_context > 0: context columns are forwarded / encoded by each transformer."""
 
     # ------------------------------------------------------------------
-    # FourierFeatures
+    # RandomFourierFeatures
     # ------------------------------------------------------------------
 
     def test_fourier_context_output_dim(self):
-        ff = FourierFeatures(input_dim=2, n_features=8, n_context=N_CTX)
+        ff = _make_ff(spatial_dims=2, n_features=8, n_context=N_CTX)
         assert ff.output_dim == 16 + N_CTX
 
     def test_fourier_context_call_shape(self, query_with_context):
-        ff = FourierFeatures(input_dim=2, n_features=8, n_context=N_CTX)
+        ff = _make_ff(spatial_dims=2, n_features=8, n_context=N_CTX)
         out = ff(query_with_context)
         assert out.shape == (BATCH, 16 + N_CTX)
 
     def test_fourier_context_passthrough(self, query_with_context):
         """Context columns appear unchanged at the end of the output."""
-        ff = FourierFeatures(input_dim=2, n_features=8, n_context=N_CTX)
+        ff = _make_ff(spatial_dims=2, n_features=8, n_context=N_CTX)
         out = ff(query_with_context)
         ctx_in  = query_with_context[:, -N_CTX:]
         ctx_out = out[:, -N_CTX:]
         assert jnp.allclose(ctx_in, ctx_out)
 
-    def test_fourier_domain_context_output_dim(self, simple_domain):
-        ff = FourierFeatures(domain=simple_domain, n_features=8, n_context=N_CTX)
+    def test_fourier_domain_context_output_dim(self):
+        ff = _make_ff(spatial_dims=2, n_features=8, n_context=N_CTX)
         assert ff.output_dim == 16 + N_CTX
 
     def test_fourier_domain_time_context_encode_false(
-        self, spacetime_domain, query_spacetime_with_context
+        self, query_spacetime_with_context
     ):
         """spatial Fourier + raw t + N_CTX context columns."""
-        ff = FourierFeatures(
-            domain=spacetime_domain, n_features=8,
-            encode_time=False, n_context=N_CTX,
-        )
+        ff = _make_ff(spatial_dims=2, n_features=8, has_time=True,
+                      encode_time=False, n_context=N_CTX)
         # 2*8 (spatial) + 1 (t) + N_CTX
         assert ff.output_dim == 17 + N_CTX
         out = ff(query_spacetime_with_context)
@@ -430,7 +402,7 @@ class TestContextFields:
         assert jnp.allclose(out[:, -N_CTX:], query_spacetime_with_context[:, -N_CTX:])
 
     def test_fourier_context_repr(self):
-        ff = FourierFeatures(input_dim=2, n_features=8, n_context=N_CTX)
+        ff = _make_ff(spatial_dims=2, n_features=8, n_context=N_CTX)
         assert f"n_context={N_CTX}" in repr(ff)
 
     # ------------------------------------------------------------------
@@ -715,7 +687,7 @@ class TestPirateNetLayer:
 def test_layers_module_exports():
     import pinns.models.layers as L
     for name in [
-        "FourierFeatures", "GNNFeatures", "LaplacianFeatures", "AlphaTransform",
+        "RandomFourierFeatures", "FourierFeatures", "GNNFeatures", "LaplacianFeatures", "AlphaTransform",
         "Normalize", "Denormalize",
         "FNN", "WFFNN", "ResNet", "PirateNet",
     ]:
@@ -725,7 +697,8 @@ def test_layers_module_exports():
 def test_pinns_has_layers_attribute():
     import pinns
     assert hasattr(pinns, "layers")
-    assert hasattr(pinns.models.layers, "FourierFeatures")
+    assert hasattr(pinns.models.layers, "RandomFourierFeatures")
+    assert hasattr(pinns.models.layers, "FourierFeatures")  # backward-compat alias
     assert hasattr(pinns.models.layers, "GNNFeatures")
     assert hasattr(pinns.models.layers, "LaplacianFeatures")
     assert hasattr(pinns.models.layers, "Normalize")

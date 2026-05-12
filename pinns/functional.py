@@ -119,9 +119,10 @@ def _make_derivative_fn_batched(model_apply, params):
                 current_fn = make_next_fn(prev_fn, dim_to_diff)
                 _fn_cache[partial_key] = current_fn
         
-        # Evaluate and return (batch_size,) — one scalar per input point
+        # Evaluate and return (batch_size, 1) — one scalar per input point,
+        # as a column vector so it broadcasts correctly with (N, 1) network outputs.
         result = current_fn(X)
-        return result.reshape(-1)
+        return result.reshape(-1, 1)
     
     return deriv_fn
 

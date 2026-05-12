@@ -32,8 +32,6 @@ except ImportError:
 
 from .schedulers import LRScheduler, ExponentialDecay, ReduceLROnPlateau, is_notebook
 from ..functional import set_context, clear_context, make_derivative_fn
-from ..models.layers import FNN
-
 
 class BaseTrainer(ABC):
     """
@@ -93,10 +91,9 @@ class BaseTrainer(ABC):
         if device is None:
             device = self._auto_detect_device()
         
-        # Initialize network and move to device
-        self.network = network.to(device)
-        self.device = getattr(self.network, 'device', device)
-        self.dtype = getattr(self.network, 'dtype', None)
+        self.network = network
+        self.device = device
+        self.dtype = None
         
         # Set normalization bounds on the network from the problem
         self._setup_network_normalization()
@@ -114,11 +111,8 @@ class BaseTrainer(ABC):
             self.test_samples  = {t.name: 0 for t in problem._terms}
             self.weights       = {t.name: 1.0 for t in problem._terms}
         else:
-            try:
-                from pinns.boundary import PeriodicBC as _PBC2, CubicPeriodicBC as _CPBC2
-                _periodic_types2 = (_PBC2, _CPBC2)
-            except ImportError:
-                _periodic_types2 = ()
+            from pinns.terms import TermPeriodicBC as _PBC2
+            _periodic_types2 = (_PBC2,)
             n_bcs = sum(1 for bc in problem.boundary_conditions
                         if not isinstance(bc, _periodic_types2))
             expected_len = 1 + n_bcs
@@ -198,21 +192,15 @@ class BaseTrainer(ABC):
         pass
     
     def _after_compile_hook(self):
-        """Sample initial training and test data. Override for additional behavior."""
-        resample_each = getattr(self, '_resample_each', 0)
-        pool_size = getattr(self, '_resample_pool_size', 10)
-        
-        if resample_each > 0 and pool_size > 1:
-            # Sample a larger pool for efficient resampling
-            self._sample_pool_data(pool_size)
-            # Select initial training data from pool
-            self._select_from_pool()
-        else:
-            self._sample_train_data()
-        
+        """Sample initial training and test data, then notify schedulers."""
+        self._sample_train_data()
+
         _ts = self.test_samples
         if any(v > 0 for v in (_ts.values() if isinstance(_ts, dict) else _ts)):
             self._sample_test_data()
+
+        for s in getattr(self, '_schedulers', []):
+            s.on_compile(self)
     
     def _sample_pool_data(self, pool_multiplier: int):
         """Sample a large pool for efficient resampling during training."""
@@ -363,9 +351,9 @@ class BaseTrainer(ABC):
         k = self._adaptive_k
         c = self._adaptive_c
         
-        # Sample factor * n_target points from domain (using _sample_interior_np to get params)
         n_candidates = factor * n_target
-        x_candidates = self._sample_interior_np(n_candidates)
+        x_candidates = self.problem.domain.sample_interior(
+            n_candidates, rng=self.rng, params=self._build_params())
         
         # Compute residuals at candidate points
         residuals = self._compute_residuals(x_candidates, batch_size=self._batch_size)
@@ -415,26 +403,10 @@ class BaseTrainer(ABC):
         show_sampling_points=False,
         plot_regions: List[tuple] = None,
         plot_n_points: int = 200,
-        resample_each: int = 0,
-        resample_pool_size: int = 10,
-        pool_refresh_each: int = 0,
-        # Adaptive sampling parameters
-        adaptive_sampling: bool = False,
-        adaptive_each: int = 100,
-        adaptive_ratio: float = 0.5,
-        adaptive_std: float = 0.1,
-        adaptive_mode: str = "replace",
-        adaptive_max_samples: int = None,
-        # RAR (Residual-based Adaptive Resampling) parameters
-        adaptive_k: float = 1.0,
-        adaptive_c: float = 1.0,
-        adaptive_factor: int = 2,
         # Learning rate scheduler
         lr_scheduler: Optional[LRScheduler] = None,
-        # Time/domain curriculum
-        curriculum_t_ends: Optional[List[float]] = None,
-        curriculum_t_epochs: int = 1000,
-        curriculum_t_dim: int = 0,
+        # Training schedulers (resample, adaptive, curriculum, lagrange, …)
+        schedulers: Optional[List] = None,
         # L-BFGS specific parameters
         lbfgs_max_iter: int = 5,
         lbfgs_history_size: int = 50,
@@ -566,8 +538,9 @@ class BaseTrainer(ABC):
         self._soap_params = soap_params if soap_params is not None else {}
         
         from pinns.problems.problem_strong import ProblemStrong as _PScompile
-        if isinstance(self.problem, _PScompile):
-            # ProblemStrong: train_samples/weights/test_samples are plain dicts; no list conversion
+        from pinns.problems.problem_weak import ProblemWeak as _PWcompile
+        if isinstance(self.problem, (_PScompile, _PWcompile)):
+            # ProblemStrong / ProblemWeak: train_samples/weights/test_samples are plain dicts; no list conversion
             if train_samples is not None:
                 self.train_samples = dict(train_samples) if isinstance(train_samples, dict) else train_samples
             if test_samples is not None:
@@ -660,30 +633,8 @@ class BaseTrainer(ABC):
         self._plot_time_points = list(plot_time_points) if plot_time_points is not None else None
         self._plot_n_points = plot_n_points
         self._batch_size = batch_size
-        self._resample_each = resample_each
-        self._resample_pool_size = resample_pool_size
-        self._pool_refresh_each = pool_refresh_each
-        
-        # Adaptive sampling parameters
-        self._adaptive_sampling = adaptive_sampling
-        self._adaptive_each = adaptive_each
-        self._adaptive_ratio = adaptive_ratio
-        self._adaptive_std = adaptive_std
-        self._adaptive_mode = adaptive_mode
-        self._adaptive_max_samples = adaptive_max_samples
-        self._adaptive_k = adaptive_k
-        self._adaptive_c = adaptive_c
-        self._adaptive_factor = adaptive_factor
+        self._schedulers = list(schedulers) if schedulers else []
 
-        # Time/domain curriculum
-        self._curriculum_t_ends = list(curriculum_t_ends) if curriculum_t_ends else None
-        self._curriculum_t_epochs = curriculum_t_epochs
-        self._curriculum_t_dim = curriculum_t_dim
-        self._curriculum_t_stage = -1  # -1 means not yet applied
-        # Save original domain xmax so we can restore after training
-        if self._curriculum_t_ends:
-            self._curriculum_t_original_xmax = float(self.problem.domain.xmax[curriculum_t_dim])
-        
         # Force creation of a new figure on next train() call
         # This ensures a fresh plot in the new cell while keeping history
         self._fig = None
@@ -705,9 +656,7 @@ class BaseTrainer(ABC):
     
     def predict(self, x: np.ndarray, batch_size: Optional[int] = None) -> np.ndarray:
         """
-        Predict output for given input points.
-        
-        Delegates to self.network.predict() which handles numpy ↔ tensor conversion.
+        Predict output for given input points using the JAX network.apply() API.
         
         Args:
             x: Input points as numpy array of shape (n_points, n_inputs)
@@ -720,20 +669,23 @@ class BaseTrainer(ABC):
             batch_size = getattr(self, '_batch_size', None)
         
         params_dict = self._build_params()
-        
+        params = self.network.params
+
+        def _infer_batch(x_batch):
+            out = self.network.apply(params, jnp.asarray(x_batch, dtype=jnp.float32), params_dict)
+            return np.array(out)
+
         if batch_size is None or batch_size >= len(x):
-            return self.network.predict(x, params_dict)
-        else:
-            results = []
-            for start in range(0, len(x), batch_size):
-                end = min(start + batch_size, len(x))
-                y_batch = self.network.predict(x[start:end], params_dict)
-                results.append(y_batch)
-            return np.vstack(results)
+            return _infer_batch(x)
+
+        results = []
+        for start in range(0, len(x), batch_size):
+            results.append(_infer_batch(x[start:start + batch_size]))
+        return np.vstack(results)
     
     @abstractmethod
     def _to_tensor(self, np_array: np.ndarray):
-        """Convert numpy array to backend tensor (jnp.array or torch.Tensor)."""
+        """Convert numpy array to a JAX array (jnp.array)."""
         pass
     
     @abstractmethod
@@ -783,9 +735,9 @@ class BaseTrainer(ABC):
         Returns:
             Target tensor (backend-specific), 1D shape (n_points,)
         """
-        from pinns.boundary import PointsetBC, MeshCustomBC, CubicCustomBC
+        from pinns.terms import TermPoints, TermCustomBC
         
-        if isinstance(bc, (MeshCustomBC, CubicCustomBC, PointsetBC)):
+        if isinstance(bc, (TermCustomBC, TermPoints)):
             # These BCs have no scalar value attribute; loss computed elsewhere
             return None
         
@@ -799,6 +751,12 @@ class BaseTrainer(ABC):
         else:
             return self._to_tensor(np.full((x.shape[0],), bc.value))
     
+    # ==================== Network call helper ====================
+
+    def _call_network(self, x, params_dict):
+        """Call the JAX network via network.apply(params, x, params_dict)."""
+        return self.network.apply(self.network.params, x, params_dict)
+
     # ==================== PDE Loss (Common Implementation) ====================
     
     def _compute_pde_loss(self, x, params_dict: Dict[str, Any], pde_weights=None):
@@ -813,7 +771,7 @@ class BaseTrainer(ABC):
         Returns:
             Tuple of (total_loss, individual_losses_list)
         """
-        y = self.network.forward(x, params_dict)
+        y = self._call_network(x, params_dict)
         residual = self._get_pde_residual_tensor(x, y, params_dict)
         
         if isinstance(residual, (list, tuple)):
@@ -835,93 +793,16 @@ class BaseTrainer(ABC):
     # ==================== BC Loss (Common Implementation) ====================
     
     def _compute_bc_loss(self, bc, x, params_dict: Dict[str, Any]):
+        """Compute BC loss by delegating to ``bc.compute_loss_dict``.
+
+        Returns the sum of all sub-losses (unweighted — the caller weights).
         """
-        Compute boundary condition loss - common logic, backend-specific gradient.
-        
-        Args:
-            bc: Boundary condition object
-            x: Input tensor (backend-specific)
-            params_dict: Parameters dict from _build_params()
-            
-        Returns:
-            Loss tensor (backend-specific scalar)
-        """
-        from pinns.boundary import DirichletBC, NeumannBC, RobinBC, PointsetBC, MeshNodeBC, MeshCustomBC, InitialConditionBC, CubicCustomBC
-
-        y = self.network.forward(x, params_dict)
-
-        if isinstance(bc, (MeshCustomBC, CubicCustomBC)):
-            return self._compute_custom_bc_loss(bc, x, y, params_dict)
-
-        if isinstance(bc, MeshNodeBC):
-            if bc.bc_type == "dirichlet":
-                target = self._to_tensor(bc.get_value(x))
-                diff = y[:, bc.component] - target
-                return self._mean_squared(diff)
-            elif bc.bc_type == "neumann":
-                if bc.t_mode in ("t_min", "t_max"):
-                    # Normal is along the time axis
-                    t_dim = self.problem.domain._spatial_dims
-                    sign = -1 if bc.t_mode == "t_min" else 1
-                    du_dt = self._compute_directional_derivative(
-                        x, bc.component, t_dim, params_dict)
-                    target = self._to_tensor(bc.get_value(x))
-                    return self._mean_squared(sign * du_dt - target)
-                elif bc.edge_normals is not None:
-                    # Edge-based Neumann: normals stashed per sample by _sample_boundary_np
-                    n_pts = x.shape[0]
-                    if getattr(bc, '_sampled_normals', None) is not None and len(bc._sampled_normals) == n_pts:
-                        normals_np = bc._sampled_normals
-                    else:
-                        # _sampled_normals size mismatch (e.g. batched eval) — wrap around edge_normals
-                        n_edge = len(bc.edge_normals)
-                        normals_np = bc.edge_normals[np.arange(n_pts) % n_edge]
-                    normals_t = self._to_tensor(normals_np)
-                    spatial_dims = bc.node_positions.shape[1]
-                    du_dn = None
-                    for i in range(spatial_dims):
-                        dui = self._compute_directional_derivative(
-                            x, bc.component, i, params_dict)
-                        contrib = dui * normals_t[:, i]
-                        du_dn = contrib if du_dn is None else du_dn + contrib
-                    target = self._to_tensor(bc.get_value(x))
-                    return self._mean_squared(du_dn - target)
-                else:
-                    raise ValueError(
-                        "MeshNodeBC Neumann on a spatial surface requires edge_normals. "
-                        "Use time_window=[t_min, t_min] or [t_max, t_max] for time-face boundaries."
-                    )
-            else:
-                raise ValueError(f"Unknown bc_type: {bc.bc_type!r}")
-
-        if isinstance(bc, DirichletBC) or isinstance(bc, InitialConditionBC):
-            target = self._get_bc_target(bc, x)
-            diff = y[:, bc.component] - target
-            return self._mean_squared(diff)
-        
-        elif isinstance(bc, NeumannBC):
-            normal_dim, normal_sign = bc.get_normal_direction()
-            du_dn = self._compute_directional_derivative(x, bc.component, normal_dim, params_dict)
-            target = self._get_bc_target(bc, x)
-            diff = normal_sign * du_dn - target
-            return self._mean_squared(diff)
-        
-        elif isinstance(bc, RobinBC):
-            normal_dim, normal_sign = bc.get_normal_direction()
-            du_dn = self._compute_directional_derivative(x, bc.component, normal_dim, params_dict)
-            alpha, beta, gamma = bc.get_coefficients(x)
-            residual = alpha * y[:, bc.component] + beta * normal_sign * du_dn - gamma
-            return self._mean_squared(residual)
-        
-        elif isinstance(bc, PointsetBC):
-            per = self._compute_pointset_bc_losses_dict(bc, x, y)
-            return sum(per.values())
-        
-        else:
-            raise ValueError(f"Unknown BC type: {type(bc)}")
+        y = self._call_network(x, params_dict)
+        ops = self._make_bc_ops(params_dict)
+        return sum(bc.compute_loss_dict(x, y, ops).values())
 
     def _compute_custom_bc_losses_dict(self, bc, x, y, params_dict, weights_dict=None):
-        """Return a {output_name: weighted_scalar_loss} dict for a MeshCustomBC.
+        """Return a {output_name: weighted_scalar_loss} dict for a TermMeshCustomBC.
 
         Each output in ``bc.output_names`` gets its own entry so the plotter can
         show per-component losses.
@@ -950,7 +831,7 @@ class BaseTrainer(ABC):
         }
 
     def _compute_custom_bc_loss(self, bc, x, y, params_dict, weights_dict=None):
-        """Evaluate a MeshCustomBC residual and return the MSE loss.
+        """Evaluate a TermMeshCustomBC residual and return the MSE loss.
 
         Override in backend subclasses to supply real autodiff derivatives.
         The base implementation calls ``f`` with ``derivative=None``.
@@ -982,14 +863,14 @@ class BaseTrainer(ABC):
         return default_w * self._mean_squared(residual)
 
     def _compute_pointset_bc_losses_dict(self, bc, x, y, weights_dict=None):
-        """Return a ``{sub_name: weighted_scalar_loss}`` dict for a :class:`PointsetBC`.
+        """Return a ``{sub_name: weighted_scalar_loss}`` dict for a :class:`TermPoints`.
 
         One sub-loss is produced per column of ``bc.outputs`` / element of
         ``bc.components``.  Sub-loss names come from ``bc.get_input_names()``
         (auto-generated as ``name_0``, ``name_1``, … or via ``output_names``).
 
         Args:
-            bc: A :class:`~pinns.boundary.PointsetBC` instance.
+            bc: A :class:`~pinns.boundary.TermPoints` instance.
             x:  Input tensor (already the bc points, passed for device/dtype ref).
             y:  Network output tensor ``(N, n_outputs)``.
             weights_dict: Optional weight dict; keys may be the base ``bc.name``
@@ -998,7 +879,7 @@ class BaseTrainer(ABC):
         Returns:
             ``{sub_name: weighted_scalar_loss}``
         """
-        from pinns.boundary import PointsetBC
+        from pinns.terms import TermPoints
         device = y.device if hasattr(y, 'device') else 'cpu'
         dtype  = y.dtype  if hasattr(y, 'dtype')  else None
         if dtype is not None:
@@ -1013,6 +894,21 @@ class BaseTrainer(ABC):
             w = (weights_dict or {}).get(oname, base_w)
             result[oname] = w * self._mean_squared(diff)
         return result
+
+    def _make_bc_ops(self, params_dict):
+        """Build a :class:`~pinns.boundary.TermOps` bundle for this training step.
+
+        Wraps the backend-specific tensor helpers into an object that BC classes
+        can use to compute losses without importing any backend.
+        """
+        from pinns.terms import TermOps
+        return TermOps(
+            to_tensor=self._to_tensor,
+            mean_sq=self._mean_squared,
+            directional_derivative=lambda x, comp, dim:
+                self._compute_directional_derivative(x, comp, dim, params_dict),
+            params_dict=params_dict,
+        )
 
     def _compute_total_loss(self, data: Dict, params_dict: Dict[str, Any], weights_dict: Dict):
         """
@@ -1049,15 +945,13 @@ class BaseTrainer(ABC):
             losses['pde_individual'] = pde_individual
             total_loss = pde_loss
         
-        # BC losses
-        try:
-            from pinns.boundary import PeriodicBC as _PBC3, CubicPeriodicBC as _CPBC3
-            _periodic_types3 = (_PBC3, _CPBC3)
-        except ImportError:
-            _periodic_types3 = ()
+        # BC losses — delegate sampling and loss to each BC object
+        from pinns.terms import TermPeriodicBC as _PBC3
+        _periodic_types3 = (_PBC3,)
         bc_names = self._get_bc_names()
         losses['bcs'] = []
         name_idx = 0
+        ops = self._make_bc_ops(params_dict)
         for i, bc in enumerate(self.problem.boundary_conditions):
             if _periodic_types3 and isinstance(bc, _periodic_types3):
                 continue   # handled by the JIT train step, not here
@@ -1065,41 +959,20 @@ class BaseTrainer(ABC):
             name_idx += 1
             if name in data:
                 x_bc = data[name]
-                from pinns.boundary import MeshCustomBC as _MeshCustomBC, CubicCustomBC as _CubicCustomBC, PointsetBC as _PointsetBC
-                if isinstance(bc, _PointsetBC):
-                    per_output = self._compute_pointset_bc_losses_dict(
-                        bc,
-                        x_bc,
-                        self.network.forward(x_bc, params_dict),
-                        weights_dict)
-                    weighted_bc_loss = sum(per_output.values())
-                    for oname, oloss in per_output.items():
-                        losses[oname] = oloss
+                y_bc = self._call_network(x_bc, params_dict)
+                per_output = bc.compute_loss_dict(x_bc, y_bc, ops)
+                weighted_bc_loss = None
+                for oname, oloss in per_output.items():
+                    w = weights_dict.get(oname, weights_dict.get(name, 1.0))
+                    weighted = w * oloss
+                    losses[oname] = weighted
+                    weighted_bc_loss = (weighted if weighted_bc_loss is None
+                                        else weighted_bc_loss + weighted)
+                if weighted_bc_loss is not None:
                     losses['bcs'].append(weighted_bc_loss)
-                    if total_loss is None:
-                        total_loss = weighted_bc_loss
-                    else:
-                        total_loss = total_loss + weighted_bc_loss
-                    continue
-                elif isinstance(bc, (_MeshCustomBC, _CubicCustomBC)):
-                    per_output = self._compute_custom_bc_losses_dict(
-                        bc, x_bc,
-                        self.network.forward(x_bc, params_dict),
-                        params_dict, weights_dict)
-                    weighted_bc_loss = sum(per_output.values())
-                    for oname, oloss in per_output.items():
-                        losses[oname] = oloss
-                else:
-                    bc_loss = self._compute_bc_loss(bc, x_bc, params_dict)
-                    weighted_bc_loss = weights_dict.get(name, 1.0) * bc_loss
-                    losses[name] = weighted_bc_loss
-                losses['bcs'].append(weighted_bc_loss)
-                
-                if total_loss is None:
-                    total_loss = weighted_bc_loss
-                else:
-                    total_loss = total_loss + weighted_bc_loss
-        
+                    total_loss = (weighted_bc_loss if total_loss is None
+                                  else total_loss + weighted_bc_loss)
+
         return total_loss, losses
 
     def _compute_strong_total_loss(self, data: Dict, params_dict: Dict[str, Any], weights_dict: Dict):
@@ -1121,7 +994,11 @@ class BaseTrainer(ABC):
             if term.name not in data:
                 continue
             x = data[term.name]
-            y = self.network.forward(x, params_dict)
+            # PyTorch networks expose .forward(); JAX ModelBase uses .apply(params, x).
+            if hasattr(self.network, 'forward'):
+                y = self.network.forward(x, params_dict)
+            else:
+                y = self.network.apply(self.network.params, x, params_dict)
 
             if term.kind == 'points':
                 # Data-fitting term: minimise ||u_pred - u_data||^2
@@ -1134,9 +1011,7 @@ class BaseTrainer(ABC):
                 residual = term.fn(x, y, params_dict, derivative_fn)
                 # Multi-equation functions: pick the relevant column
                 if term.eq_idx is not None:
-                    has_dim = hasattr(residual, 'dim')  # torch tensor
-                    has_ndim = hasattr(residual, 'ndim')  # numpy / jax
-                    if (has_dim and residual.dim() == 2) or (has_ndim and residual.ndim == 2):
+                    if hasattr(residual, 'ndim') and residual.ndim == 2:
                         residual = residual[:, term.eq_idx]
 
             elif term.fn is not None:
@@ -1173,9 +1048,7 @@ class BaseTrainer(ABC):
             rhs = term.rhs
             if callable(rhs):
                 target = rhs(x, params_dict)
-                if hasattr(target, 'dim') and target.dim() == 2:
-                    target = target[:, 0:1]
-                elif hasattr(target, 'ndim') and target.ndim == 2:
+                if hasattr(target, 'ndim') and target.ndim == 2:
                     target = target[:, 0:1]
             else:
                 target = float(rhs)
@@ -1292,7 +1165,7 @@ class BaseTrainer(ABC):
         if batch_size is None or batch_size >= len(x_np):
             x = self._to_tensor(x_np)
             params_dict = self._build_params()
-            y = self.network.forward(x, params_dict)
+            y = self._call_network(x, params_dict)
             residual = self._get_pde_residual_tensor(x, y, params_dict)
             
             if isinstance(residual, (list, tuple)):
@@ -1307,7 +1180,7 @@ class BaseTrainer(ABC):
         for start in range(0, len(x_np), batch_size):
             end = min(start + batch_size, len(x_np))
             x_batch = self._to_tensor(x_np[start:end])
-            y_batch = self.network.forward(x_batch, params_dict)
+            y_batch = self._call_network(x_batch, params_dict)
             residual_batch = self._get_pde_residual_tensor(x_batch, y_batch, params_dict)
             
             if isinstance(residual_batch, (list, tuple)):
@@ -1347,7 +1220,7 @@ class BaseTrainer(ABC):
             return {}
         x = self._to_tensor(x_np)
         params_dict = self._build_params()
-        y = self.network.forward(x, params_dict)
+        y = self._call_network(x, params_dict)
         try:
             sig = _inspect.signature(obs_fn)
             n_params = len(sig.parameters)
@@ -1381,119 +1254,114 @@ class BaseTrainer(ABC):
                 return bc
         return None
     
-    def _sample_interior_np(self, n_points: int) -> np.ndarray:
-        """Sample interior points and return as numpy array."""
-        from pinns.boundary import PointsetBC
-        params = self._build_params()
-        return self.problem.domain.sample_interior(n_points, rng=self.rng, params=params)
-    
-    def _sample_boundary_np(self, bc, n_points: int) -> np.ndarray:
-        """Sample boundary points for a specific boundary condition."""
-        from pinns.boundary import PointsetBC, MeshNodeBC, MeshCustomBC, CubicCustomBC
+    def _sample_points_np(self, name: str, n_samples: int) -> np.ndarray:
+        """Sample collocation points for any named loss term.
 
-        if isinstance(bc, PointsetBC):
-            import numpy as np
-            pts = bc.inputs
-            if hasattr(pts, 'detach'):
-                return pts.detach().cpu().numpy()
-            return np.asarray(pts)
-
-        if isinstance(bc, (MeshNodeBC, MeshCustomBC)):
-            pts, sampled_idx = self.problem.domain.sample_boundary_bc(bc, n_points, rng=self.rng)
-            # stash per-sample normals for MeshNodeBC Neumann
-            if isinstance(bc, MeshNodeBC) and bc.edge_normals is not None:
-                bc._sampled_normals = bc.edge_normals[sampled_idx]
-            elif isinstance(bc, MeshNodeBC):
-                bc._sampled_normals = None
-            return pts
-
-        boundary = bc.boundary
+        Handles all three problem types (old Problem API, ProblemStrong) and
+        all BC variants via duck-typing on the BC object's attributes.  This
+        is the single sampling entry point — no sub-methods needed.
+        """
+        from pinns.problems.problem_strong import ProblemStrong as _PSsp
         domain = self.problem.domain
         params = self._build_params()
-        
-        method = getattr(bc, 'sampling_method', 'uniform')
-        transform = getattr(bc, 'sampling_transform', None)
-        
-        for dim, side in enumerate(boundary):
+        rng = self.rng
+
+        # ── ProblemStrong: each term carries kind + region ─────────────────
+        if isinstance(self.problem, _PSsp):
+            term = next((t for t in self.problem._terms if t.name == name), None)
+            if term is None:
+                raise ValueError(f"Unknown ProblemStrong term: '{name}'")
+            if term.kind == 'points':
+                return np.asarray(term.x_data)
+            region = None if term.region == 'all' else term.region
+            if term.kind == 'inner':
+                return domain.sample_interior(n_samples, region=region, rng=rng, params=params)
+            if term.kind == 'initial':
+                pts = domain.sample_interior(n_samples, rng=rng, params=params)
+                t_dim = getattr(domain, '_spatial_dims', 0)
+                if t_dim < pts.shape[1]:
+                    pts[:, t_dim] = domain.xmin[t_dim]
+                return pts
+            # boundary / dirichlet / neumann / robin / periodic
+            return domain.sample_boundary(n_samples, region=region, rng=rng, params=params)
+
+        # ── Old Problem API: 'pde' = interior, everything else = BC ─────────
+        if name == 'pde':
+            return domain.sample_interior(n_samples, rng=rng, params=params)
+
+        bc = self._get_bc_by_name(name)
+        if bc is None:
+            raise ValueError(f"Unknown loss term: {name!r}")
+        return self._sample_bc_np(bc, n_samples)
+
+    def _sample_bc_np(self, bc, n_samples: int) -> np.ndarray:
+        """Sample *n_samples* points for a single BC object.
+
+        All domain knowledge stays on the domain; this method only reads
+        BC attributes to decide which domain primitive to call.
+        """
+        domain = self.problem.domain
+        rng = self.rng
+
+        # Fixed-coordinate BCs — ignore domain / n_samples
+        if hasattr(bc, 'inputs'):                      # TermPoints
+            return np.asarray(bc.inputs, dtype=np.float32)
+        if getattr(bc, 'bc_type', None) == 'points':  # TermMeshPointsBC
+            return np.asarray(bc.node_positions, dtype=np.float32)
+
+        # Mesh BCs — delegate to domain.sample_boundary_bc
+        if hasattr(bc, 'node_positions'):
+            pts, idx = domain.sample_boundary_bc(bc, n_samples, rng=rng)
+            if hasattr(bc, 'edge_normals'):
+                bc._sampled_normals = (
+                    bc.edge_normals[idx] if bc.edge_normals is not None else None)
+            return pts
+
+        # New-style region-based BCs (TermDirichletBC, TermNeumannBC, etc.)
+        if hasattr(bc, 'region'):
+            return domain.sample_boundary(
+                n_samples, region=bc.region, rng=rng,
+                method=getattr(bc, 'sampling_method', 'uniform'),
+            )
+
+        # Cubic face BCs — boundary tuple + optional subspace
+        for dim, side in enumerate(bc.boundary):
             if side is not None:
-                points = domain.sample_boundary(
-                    n_points, dim, side, rng=self.rng,
-                    method=method, transform=transform, params=params
+                pts = domain.sample_boundary(
+                    n_samples, dim, side, rng=rng,
+                    method=getattr(bc, 'sampling_method', 'uniform'),
+                    transform=getattr(bc, 'sampling_transform', None),
                 )
-                
-                # subspace: list of (lo, hi) tuples, one per free dimension
-                # (free dims = those where boundary[d] is None), in order
                 subspace = getattr(bc, 'subspace', None)
                 if subspace is not None:
-                    free_dims = [d for d in range(len(boundary)) if boundary[d] is None]
+                    free_dims = [d for d in range(len(bc.boundary))
+                                 if bc.boundary[d] is None]
                     for i, (lo, hi) in enumerate(subspace):
                         if i >= len(free_dims):
                             break
                         d = free_dims[i]
-                        orig_lo = domain.xmin[d]
-                        orig_hi = domain.xmax[d]
-                        orig_extent = orig_hi - orig_lo
-                        if orig_extent > 0:
-                            points[:, d] = orig_lo + (
-                                (points[:, d] - orig_lo) / orig_extent
-                            ) * (hi - lo) + (lo - orig_lo)
-
-                # time_subspace: (t_lo, t_hi) restricts the time dimension
+                        orig_lo, orig_hi = domain.xmin[d], domain.xmax[d]
+                        extent = orig_hi - orig_lo
+                        if extent > 0:
+                            pts[:, d] = (orig_lo
+                                         + (pts[:, d] - orig_lo) / extent
+                                         * (hi - lo)
+                                         + (lo - orig_lo))
                 time_subspace = getattr(bc, 'time_subspace', None)
                 if time_subspace is not None:
                     t_dim = domain._spatial_dims
-                    if t_dim < points.shape[1]:
+                    if t_dim < pts.shape[1]:
                         t_lo, t_hi = time_subspace
                         t_orig_lo = domain.xmin[t_dim]
                         t_orig_hi = domain.xmax[t_dim]
-                        t_orig_extent = t_orig_hi - t_orig_lo
-                        if t_orig_extent > 0:
-                            points[:, t_dim] = t_orig_lo + (
-                                (points[:, t_dim] - t_orig_lo) / t_orig_extent
-                            ) * (t_hi - t_lo) + (t_lo - t_orig_lo)
-
-                return points
-        
-        raise ValueError(f"Invalid boundary specification: {boundary}")
-    
-    def _sample_points_np(self, name: str, n_samples: int) -> np.ndarray:
-        """Sample points for a given loss term (returns numpy)."""
-        from pinns.problems.problem_strong import ProblemStrong as _PSsp
-        if isinstance(self.problem, _PSsp):
-            return self._sample_strong_term_np(name, n_samples)
-        if name == 'pde':
-            return self._sample_interior_np(n_samples)
-        else:
-            bc = self._get_bc_by_name(name)
-            if bc is not None:
-                return self._sample_boundary_np(bc, n_samples)
-            else:
-                raise ValueError(f"Unknown loss term: {name}")
-
-    def _sample_strong_term_np(self, name: str, n_samples: int) -> np.ndarray:
-        """Sample points for a ProblemStrong residual term."""
-        term = next((t for t in self.problem._terms if t.name == name), None)
-        if term is None:
-            raise ValueError(f"Unknown ProblemStrong term: '{name}'")
-        if term.kind == 'points':
-            # Fixed observation points — return stored coordinates
-            return np.asarray(term.x_data)
-        params = self._build_params()
-        domain = self.problem.domain
-        region = None if term.region == 'all' else term.region
-        if term.kind == 'inner':
-            return domain.sample_interior(n_samples, region=region, rng=self.rng, params=params)
-        elif term.kind == 'initial':
-            # Sample full spatial domain at t = t_min
-            pts = domain.sample_interior(n_samples, rng=self.rng, params=params)
-            t_dim = getattr(domain, '_spatial_dims', 0)
-            if t_dim < pts.shape[1]:
-                pts[:, t_dim] = domain.xmin[t_dim]
-            return pts
-        elif term.kind in ('boundary', 'dirichlet', 'neumann', 'robin', 'periodic'):
-            return domain.sample_boundary(n_samples, region=region, rng=self.rng, params=params)
-        else:
-            raise ValueError(f"Unknown term kind: '{term.kind}' for term '{name}'")
+                        t_extent = t_orig_hi - t_orig_lo
+                        if t_extent > 0:
+                            pts[:, t_dim] = (t_orig_lo
+                                             + (pts[:, t_dim] - t_orig_lo)
+                                             / t_extent * (t_hi - t_lo)
+                                             + (t_lo - t_orig_lo))
+                return pts
+        raise ValueError(f"BC {bc!r}: no fixed dimension in boundary tuple")
     
     def _list_to_dict_samples(self, samples_list) -> Dict[str, int]:
         """Convert list format samples to dict format. Dict input is returned as-is."""
@@ -1574,7 +1442,7 @@ class BaseTrainer(ABC):
                         if hasattr(target_np, 'squeeze'):
                             target_np = target_np.squeeze(-1) if target_np.ndim > 1 else target_np
                         self._train_targets[name] = self._to_tensor(target_np)
-                    # Store matched normals (set by _sample_boundary_np for MeshNodeBC)
+                    # Store matched normals (set by _sample_boundary_np for TermMeshNodeBC)
                     if bc is not None and getattr(bc, '_sampled_normals', None) is not None:
                         self._train_data[f'{name}__normals'] = self._to_tensor(
                             bc._sampled_normals.astype(np.float32))
@@ -1600,7 +1468,7 @@ class BaseTrainer(ABC):
                         if hasattr(target_np, 'squeeze'):
                             target_np = target_np.squeeze(-1) if target_np.ndim > 1 else target_np
                         self._test_targets[name] = self._to_tensor(target_np)
-                    # Store matched normals (set by _sample_boundary_np for MeshNodeBC)
+                    # Store matched normals (set by _sample_boundary_np for TermMeshNodeBC)
                     if bc is not None and getattr(bc, '_sampled_normals', None) is not None:
                         self._test_data[f'{name}__normals'] = self._to_tensor(
                             bc._sampled_normals.astype(np.float32))
@@ -1637,11 +1505,8 @@ class BaseTrainer(ABC):
         from pinns.problems.problem_strong import ProblemStrong as _PSbc
         if isinstance(self.problem, _PSbc):
             return [t.name for t in self.problem._terms]
-        try:
-            from pinns.boundary import PeriodicBC as _PBC, CubicPeriodicBC as _CPBC
-            _periodic_types = (_PBC, _CPBC)
-        except ImportError:
-            _periodic_types = ()
+        from pinns.terms import TermPeriodicBC as _PBC
+        _periodic_types = (_PBC,)
         names = []
         for i, bc in enumerate(self.problem.boundary_conditions):
             if _periodic_types and isinstance(bc, _periodic_types):
@@ -1696,15 +1561,19 @@ class BaseTrainer(ABC):
             bc_names = self._get_bc_names()
             result = []
             
-            # First element is 'pde'
+            # First element is 'pde' (or the user-supplied inner-term name for ProblemWeak)
             from pinns.problems.problem_weak import ProblemWeak as _ProblemWeak
             _default_pde = 0 if isinstance(self.problem, _ProblemWeak) else None
-            if 'pde' not in data:
+            _volume_name = getattr(self.problem, '_volume_name', 'pde')
+            if 'pde' in data:
+                result.append(data['pde'])
+            elif _volume_name in data:
+                # User passed the inner-term name (e.g. "coco") instead of "pde"
+                result.append(data[_volume_name])
+            else:
                 if _default_pde is None:
                     raise ValueError(f"{param_name} dict must contain 'pde' key")
                 result.append(_default_pde)
-            else:
-                result.append(data['pde'])
             
             # Collect hard-constrained BC names (weight is irrelevant for these)
             _hard_names: set = set()
@@ -2745,7 +2614,7 @@ class BaseTrainer(ABC):
         else:
             res = np.zeros(n_points)
         
-        ax.plot(x_np, res, 'm-', linewidth=2)
+        ax.plot(x_np.flatten(), res, 'm-', linewidth=2)
         
         output_name = self._get_output_name(output_idx)
         input_name = self._get_input_name(0)
@@ -2770,7 +2639,12 @@ class BaseTrainer(ABC):
             ax.set_title('Weak Residual')
             return
 
-        R = np.array(weak_res_fn(self.network.params))   # (n_dofs,)
+        R_raw = weak_res_fn(self.network.params)
+        # make_residual_vectors_fn returns a dict {name: array}; flatten to 1-D
+        if isinstance(R_raw, dict):
+            import jax.numpy as _jnp
+            R_raw = _jnp.concatenate(list(R_raw.values()))
+        R = np.array(R_raw)   # (n_dofs,) or (n_dofs * n_terms,)
 
         dom        = self.problem.domain
         verts_xy   = dom._vertices                        # (n_verts, 2)
@@ -3059,9 +2933,8 @@ class BaseTrainer(ABC):
                         y_min = np.array(self.network.output_range_min[output_idx])
                         y_max = np.array(self.network.output_range_max[output_idx])
                         # Handle tensor conversion if needed
-                        if hasattr(y_min, 'cpu'):
-                            y_min = y_min.cpu().numpy()
-                            y_max = y_max.cpu().numpy()
+                        y_min = np.asarray(y_min)
+                        y_max = np.asarray(y_max)
                         pred_i = (pred_i + 1.0) / 2.0 * (y_max - y_min) + y_min
                 
                 window_i = windows[:, i]
@@ -3082,13 +2955,9 @@ class BaseTrainer(ABC):
             for i in range(n_subdomains):
                 lb = lower_bounds[i]
                 ub = upper_bounds[i]
-                # Convert tensors to numpy if needed
-                if hasattr(lb, 'cpu'):
-                    lb = lb.cpu().numpy()
-                    ub = ub.cpu().numpy()
-                elif hasattr(lb, '__array__'):
-                    lb = np.asarray(lb)
-                    ub = np.asarray(ub)
+                # Convert to numpy
+                lb = np.asarray(lb)
+                ub = np.asarray(ub)
                 width = ub[0] - lb[0]
                 height = ub[1] - lb[1]
                 rect = Rectangle((lb[0], lb[1]), width, height,
@@ -3106,7 +2975,8 @@ class BaseTrainer(ABC):
         y_range = y_max - y_min
         
         if self.train_samples[0] > 0:
-            x_train = self._sample_interior_np(self.train_samples[0])
+            x_train = self.problem.domain.sample_interior(
+                self.train_samples[0], rng=self.rng)
             n_train = len(x_train)
             train_size = max(5, min(50, 1000 / n_train))
             y_train = np.full(n_train, y_min + 0.02 * y_range)
@@ -3119,7 +2989,8 @@ class BaseTrainer(ABC):
         bc_color = '#15B01A'
         
         if self.train_samples[0] > 0:
-            x_train = self._sample_interior_np(self.train_samples[0])
+            x_train = self.problem.domain.sample_interior(
+                self.train_samples[0], rng=self.rng)
             n_train = len(x_train)
             train_size = max(1, min(20, 500 / n_train))
             ax.scatter(x_train[:, 0], x_train[:, 1], s=train_size, c=train_color,
@@ -3127,7 +2998,7 @@ class BaseTrainer(ABC):
         
         for i, bc in enumerate(self.problem.boundary_conditions):
             if self.train_samples[i + 1] > 0:
-                x_bc = self._sample_boundary_np(bc, self.train_samples[i + 1])
+                x_bc = self._sample_bc_np(bc, self.train_samples[i + 1])
                 n_bc = len(x_bc)
                 bc_size = max(2, min(30, 300 / n_bc))
                 ax.scatter(x_bc[:, 0], x_bc[:, 1], s=bc_size, c=bc_color,
@@ -3222,15 +3093,9 @@ class Trainer(BaseTrainer):
         # Initialize base class (handles network.to(), normalization, defaults)
         super().__init__(problem, network, device)
 
-        # Single-class AL state
-        self._is_lagrangian_mode = False
-        self.lagrange_multipliers = {}
+        # Rollout AL mode (BPTT) — minimal state needed
         self.lagrange_lr = 1.0
-        self._lagrange_max = 1e6
-        self._lagrange_constraints = None
-        self._lagrange_optimizer = None
-        self._lagrange_opt_states = {}
-        self._lagrange_optimizer_name = 'adam'
+        self._lagrange_lr_ratio = 1.0
 
     def _problem_uses_lagrange(self) -> bool:
         lagrange = getattr(self.problem, 'lagrange_multipliers', None)
@@ -3241,7 +3106,8 @@ class Trainer(BaseTrainer):
         lagrange = getattr(self.problem, 'lagrange_multipliers', None)
         if not lagrange:
             return None
-        # For ProblemWeak the list is already in the right format
+        # For ProblemWeak the list already contains the correct term / BC names.
+        # No remapping to 'pde' is needed — each add_inner() term keeps its own name.
         if isinstance(self.problem, _ProblemWeak):
             return list(lagrange)
         if not lagrange:
@@ -3280,20 +3146,14 @@ class Trainer(BaseTrainer):
     def compile(
         self,
         *args,
-        auto_lagrangian: bool = True,
-        lagrange_constraints: list = None,
-        lagrange_lr: float = 1.0,
-        lagrange_max: float = 1e6,
-        lagrange_optimizer: str = "adam",
         train_samples: dict = None,
         test_samples=None,
         step_weight_exp: float = 0.0,
+        schedulers: Optional[List] = None,
         **kwargs,
     ):
         """
-        Compile trainer in a single-class setup.
-
-        Standard or AL mode is selected within this class (no delegation).
+        Compile trainer.
 
         Parameters
         ----------
@@ -3307,6 +3167,8 @@ class Trainer(BaseTrainer):
             key is accepted and silently ignored — test metrics always evaluate
             the full-domain weak loss for stability.  Other BC keys are forwarded
             to the base class as usual.
+        schedulers : list, optional
+            List of Scheduler instances to use during training.
         """
         # For ProblemWeak: strip 'pde' from test_samples before base class sees it.
         # The base class would try to create collocation test points, which makes no
@@ -3324,7 +3186,7 @@ class Trainer(BaseTrainer):
         self._rts_n_nodes_test = _rts_n_nodes_test
         self._step_weight_exp = float(step_weight_exp)
 
-        super().compile(*args, test_samples=test_samples, **kwargs)
+        super().compile(*args, test_samples=test_samples, schedulers=schedulers, **kwargs)
         # Weak-form test PDE loss: evaluates the weak residual on a DIFFERENT random
         # batch of nodes than the training batch, giving a true held-out PDE metric.
         # Only active when the user passes test_samples={'pde': N}.
@@ -3342,51 +3204,6 @@ class Trainer(BaseTrainer):
 
         self._train_samples = train_samples or {}
 
-        resolved_constraints = lagrange_constraints
-        if resolved_constraints is None:
-            resolved_constraints = self._resolve_problem_lagrange_constraints()
-
-        has_al_request = (
-            resolved_constraints is not None
-            or self._problem_uses_lagrange()
-        )
-        self._is_lagrangian_mode = bool(auto_lagrangian and has_al_request)
-
-        # ── Rollout (BPTT) mode override ─────────────────────────────────
-        # ProblemWeak with n_time_steps set uses make_rollout_loss_fn, not the
-        # Lagrangian (AL) path.  Force Lagrangian mode OFF here so that
-        # _initialize_lagrange_multipliers_impl is never called — it would
-        # invoke make_residual_vector_fn which is not valid in rollout mode.
-        from pinns.problems.problem_weak import ProblemWeak as _PW_early
-        if (self._is_lagrangian_mode
-                and isinstance(self.problem, _PW_early)
-                and getattr(self.problem, 'n_time_steps', None) is not None):
-            self._is_lagrangian_mode = False
-
-        self.lagrange_lr = lagrange_lr
-        _lr_scalar = (self.learning_rate(0) if callable(self.learning_rate)
-                      else self.learning_rate)
-        self._lagrange_lr_ratio = lagrange_lr / max(float(_lr_scalar), 1e-12)
-        self._lagrange_max = lagrange_max
-        self._lagrange_optimizer_name = lagrange_optimizer
-
-        prev_constraints = self._lagrange_constraints
-        self._lagrange_constraints = resolved_constraints
-
-        if self._is_lagrangian_mode:
-            constraints_changed = (resolved_constraints != prev_constraints)
-            first_time = not bool(self.lagrange_multipliers)
-            if first_time or constraints_changed:
-                _initialize_lagrange_multipliers_impl(self)
-            else:
-                # Lagrange lr may have changed — rebuild optimizer but keep λ values
-                if self._lagrange_optimizer_name == 'adam':
-                    self._lagrange_optimizer = optax.inject_hyperparams(optax.adam)(learning_rate=self.lagrange_lr)
-                elif self._lagrange_optimizer_name == 'sgd':
-                    self._lagrange_optimizer = optax.inject_hyperparams(optax.sgd)(learning_rate=self.lagrange_lr)
-                else:
-                    self._lagrange_optimizer = None
-
     def _constraint_uses_quadratic(self, constraint_name: str) -> bool:
         """Return True if a constraint keeps its quadratic penalty term."""
         no_quadratic = getattr(self.problem, 'no_quadratic', None)
@@ -3403,27 +3220,6 @@ class Trainer(BaseTrainer):
 
         return constraint_name not in no_quadratic
 
-    def _initialize_lagrange_multipliers(self):
-        return _initialize_lagrange_multipliers_impl(self)
-
-    def _reinitialize_lagrange_if_needed(self):
-        return _reinitialize_lagrange_if_needed_impl(self)
-
-    def _make_al_loss_fn(self, params_dict):
-        return _make_al_loss_fn_impl(self, params_dict)
-
-    def _update_lagrange_multipliers(self, residuals):
-        return _update_lagrange_multipliers_impl(self, residuals)
-
-    def get_lagrange_statistics(self) -> Dict[str, Dict[str, float]]:
-        return _get_lagrange_statistics_impl(self)
-
-    def reset_lagrange_multipliers(self):
-        return _reset_lagrange_multipliers_impl(self)
-
-    def reset_betas(self, betas: dict = None):
-        return _reset_betas_impl(self, betas)
-    
     # ==================== Device Detection ====================
     
     def _auto_detect_device(self) -> str:
@@ -3485,6 +3281,17 @@ class Trainer(BaseTrainer):
     
     def _init_optimizer_state(self):
         """Initialize optax optimizer state."""
+        # ModelBase and ModelPartitioned (JAX) use a lazy-init pattern: params
+        # are returned by network.init(rng) and not stored automatically.
+        # Initialise here so the optimizer can inspect parameter shapes.
+        from ..models.model_base import ModelBase as _ModelBase
+        from ..models.model_partitioned import ModelPartitioned as _ModelPartitioned
+        _jax_model_types = (_ModelBase, _ModelPartitioned)
+        if isinstance(self.network, _jax_model_types):
+            if not hasattr(self.network, 'params') or self.network.params is None:
+                rng = jax.random.PRNGKey(0)
+                self.network.params = self.network.init(rng)
+
         if self.optimizer_name == "lbfgs":
             # L-BFGS state is managed by jaxopt solver
             self.opt_state = None
@@ -3502,7 +3309,8 @@ class Trainer(BaseTrainer):
         resample_each = getattr(self, '_resample_each', 0)
         use_resampling = resample_each > 0
         
-        if self._use_sparse_fbpinn and isinstance(self.network, FBPINN) and not use_batching and not use_resampling:
+        from ..models.model_partitioned import ModelPartitioned as _MP
+        if self._use_sparse_fbpinn and isinstance(self.network, _MP) and not use_batching and not use_resampling:
             self._precompute_sparse_data()
         elif use_batching or use_resampling:
             # Clear any precomputed sparse data when batching or resampling
@@ -3510,7 +3318,14 @@ class Trainer(BaseTrainer):
             self._precomputed_bcs = {}
     
     def _precompute_sparse_data(self):
-        """Precompute sparse training data for FBPINN."""
+        """Precompute sparse training data for FBPINN (old PyTorch FBPINN only).
+
+        New JAX ``ModelPartitioned`` models do not expose the precomputation API;
+        this method is a no-op for those models.
+        """
+        if not hasattr(self.network, 'precompute_sparse_indices_jit'):
+            return
+
         params_dict = self._build_params()
         
         # Precompute for PDE data - use sparse indices (supports derivatives)
@@ -3546,10 +3361,29 @@ class Trainer(BaseTrainer):
     # ==================== Residual (Abstract Implementation) ====================
     
     def _get_pde_residual_tensor(self, x, y, params_dict):
-        """Compute PDE residual using JAX autodiff - supports both 3-arg and 4-arg PDEs."""
+        """Compute PDE residual using JAX autodiff - supports both 3-arg and 4-arg PDEs,
+        and ProblemStrong (which uses _terms instead of pde_fn)."""
+        from pinns.problems.problem_strong import ProblemStrong as _PSResidual
         model_apply = lambda p, xin: self.network.apply(p, xin, params_dict)
-        
-        # Check if PDE accepts derivative function (4-arg signature)
+
+        if isinstance(self.problem, _PSResidual):
+            # ProblemStrong: evaluate the first 'inner' term as the PDE residual
+            inner_terms = [t for t in self.problem._terms if t.kind == 'inner']
+            if not inner_terms:
+                return jnp.zeros((x.shape[0], 1))
+            deriv_fn = make_derivative_fn(model_apply, self.network.params)
+            residuals = []
+            for term in inner_terms:
+                if term.fn is not None and callable(term.fn):
+                    r = term.fn(x, y, params_dict, deriv_fn)
+                    n = x.shape[0]
+                    r = r.reshape(n, -1)[:, :1]   # normalise to (N, 1)
+                    residuals.append(r)
+            if not residuals:
+                return jnp.zeros((x.shape[0], 1))
+            return residuals[0] if len(residuals) == 1 else jnp.concatenate(residuals, axis=-1)
+
+        # Generic path: problem.pde_fn
         sig = inspect.signature(self.problem.pde_fn)
         if len(sig.parameters) >= 4:
             # 4-arg PDE: pass derivative function directly (JIT-compatible)
@@ -3589,7 +3423,7 @@ class Trainer(BaseTrainer):
         }
 
     def _compute_custom_bc_loss(self, bc, x, y, params_dict, weights_dict=None):
-        """Evaluate a MeshCustomBC residual with full JAX autodiff."""
+        """Evaluate a TermMeshCustomBC residual with full JAX autodiff."""
         if getattr(bc, 'is_weak', False):
             return 0.0
         model_apply = lambda p, xin: self.network.apply(p, xin, params_dict)
@@ -3684,42 +3518,36 @@ class Trainer(BaseTrainer):
     
     def _make_jit_train_step(self, weights, params_dict):
         """Create a JIT-compiled training step function."""
-        from pinns.boundary import NeumannBC, MeshNodeBC, MeshCustomBC, PeriodicBC, CubicPeriodicBC
+        from pinns.terms import TermNeumannBC, TermCustomBC, TermPeriodicBC, TermPoints as _TermPoints_jax
 
         # Pre-extract BC info as static data
         bc_info = []
         dirichlet_bcs = []
         neumann_bcs = []
-        mesh_neumann_bcs = []   # MeshNodeBC with bc_type="neumann"
-        custom_bc_list = []     # MeshCustomBC entries
-        periodic_bcs  = []      # PeriodicBC entries (fixed precomputed points)
+        mesh_neumann_bcs = []   # TermMeshNodeBC with bc_type="neumann"
+        custom_bc_list = []     # TermMeshCustomBC entries
+        periodic_bcs  = []      # TermPeriodicBC entries (fixed precomputed points)
         
         # Get precomputed targets for callable BCs
         train_targets = getattr(self, '_train_targets', {})
 
-        # ── Precompute PeriodicBC point arrays as JAX constants ──────────────
-        # Periodic BCs use fixed mesh nodes — no sampling, no train_data lookup.
+        # ── Precompute TermPeriodicBC point arrays as JAX constants ──────────────
         _domain_bcs = getattr(getattr(self.problem, 'domain', None), 'boundary_conditions', [])
-        for bc in _domain_bcs:
-            if isinstance(bc, PeriodicBC):
-                periodic_bcs.append({
-                    'name':          bc.name,
-                    'x_a':           jnp.asarray(bc.node_positions_a, dtype=jnp.float32),
-                    'x_b':           jnp.asarray(bc.node_positions_b, dtype=jnp.float32),
-                    'component':     bc.component,
-                    'weight':        weights.get(bc.name, 1.0),
-                    'match_x_deriv': getattr(bc, 'match_x_derivative', False),
-                    'x_deriv_dim':   1,
-                })
-
-        # ── CubicPeriodicBC — sample pairs from domain at compile time ────────
         _n_out = len(self.problem.output_names) if (hasattr(self.problem, 'output_names') and self.problem.output_names) else getattr(self.problem, 'n_outputs', 1)
         for bc in _domain_bcs:
-            if isinstance(bc, CubicPeriodicBC):
-                _rng = np.random.default_rng()
-                _pts_a = self.problem.domain.sample_boundary(bc.n_pairs, bc.dim, 0, rng=_rng)
-                _pts_b = _pts_a.copy()
-                _pts_b[:, bc.dim] = self.problem.domain.xmax[bc.dim]
+            if isinstance(bc, TermPeriodicBC):
+                _rng_p = np.random.default_rng()
+                _n_p = bc.n_pairs or 200
+                if hasattr(bc, 'node_positions_a'):
+                    # Legacy mesh-style: pre-computed node arrays
+                    _pts_a = np.asarray(bc.node_positions_a)
+                    _pts_b = np.asarray(bc.node_positions_b)
+                    _dim_p = 1
+                else:
+                    # New-style: region strings → sample from domain
+                    _pts_a = self.problem.domain.sample_boundary(_n_p, region=bc.region_a, rng=_rng_p)
+                    _pts_b = self.problem.domain.sample_boundary(_n_p, region=bc.region_b, rng=_rng_p)
+                    _dim_p = 1
                 _comps = [bc.component] if bc.component is not None else list(range(_n_out))
                 for _i in _comps:
                     _sub_name = bc.name if bc.component is not None else f'{bc.name}_{_i}'
@@ -3729,8 +3557,8 @@ class Trainer(BaseTrainer):
                         'x_b':           jnp.asarray(_pts_b, dtype=jnp.float32),
                         'component':     _i,
                         'weight':        weights.get(_sub_name, weights.get(bc.name, 1.0)),
-                        'match_x_deriv': bc.match_x_derivative,
-                        'x_deriv_dim':   bc.dim,
+                        'match_x_deriv': getattr(bc, 'match_x_derivative', False),
+                        'x_deriv_dim':   _dim_p,
                     })
 
         from pinns.problems.problem_weak import ProblemWeak as _ProblemWeak
@@ -3750,39 +3578,19 @@ class Trainer(BaseTrainer):
                 continue
             bc = self._get_bc_by_name(name)
             if bc is not None:
-                if isinstance(bc, MeshNodeBC):
-                    if bc.bc_type == "dirichlet":
-                        bc_data = {
-                            'name': name,
-                            'component': bc.component,
-                            'is_neumann': False,
-                            'normal_dim': 0,
-                            'normal_sign': 1,
-                            'const_value': bc.value if not callable(bc.value) else None,
-                            'has_callable_value': callable(bc.value),
-                            'weight': weights.get(name, 1.0),
-                        }
-                        dirichlet_bcs.append(bc_data)
-                    else:  # neumann
-                        bc_data = {
-                            'name': name,
-                            'component': bc.component,
-                            'const_value': bc.value if not callable(bc.value) else None,
-                            'has_callable_value': callable(bc.value),
-                            'weight': weights.get(name, 1.0),
-                        }
-                        mesh_neumann_bcs.append(bc_data)
-                    continue
-
-                # MeshCustomBC: captured for the custom-BC loss block below
-                if isinstance(bc, MeshCustomBC):
+                # TermCustomBC: captured for the custom-BC loss block below
+                if isinstance(bc, TermCustomBC):
                     import inspect as _insp
                     _n = len(_insp.signature(bc.f).parameters)
                     custom_bc_list.append((bc, name, weights.get(name, 1.0), _n))
                     continue
 
-                is_neumann = isinstance(bc, NeumannBC)
-                normal_info = bc.get_normal_direction() if is_neumann else (0, 1)
+                is_neumann = isinstance(bc, TermNeumannBC)
+                if is_neumann:
+                    normal_info = self.problem.domain.get_face_normal_direction(
+                        getattr(bc, 'region', '')) or (0, 1)
+                else:
+                    normal_info = (0, 1)
                 bc_data = {
                     'name': name,
                     'component': bc.component,
@@ -3810,7 +3618,7 @@ class Trainer(BaseTrainer):
             _weights_s = weights
             _optim_s = self.optimizer
             # Capture any network-level extra losses (e.g. X-PINN interface terms).
-            _net_losses = list(self.network.network_losses)
+            _net_losses = list(getattr(self.network, 'network_losses', []))
 
             def _model_apply_s(params, x):
                 return self.network.apply(params, x, _params_dict_s)
@@ -3835,6 +3643,16 @@ class Trainer(BaseTrainer):
                     elif term.fn is not None:
                         output_col = term.output_idx if term.output_idx is not None else 0
                         residual = u[:, output_col:output_col + 1] - float(term.fn)
+                    elif term.kind in ('dirichlet', 'neumann', 'robin', 'initial') and hasattr(term, 'rhs'):
+                        # Structural BC: add_dirichlet / add_neumann / add_robin store
+                        # the prescribed value in term.rhs (not term.fn).
+                        output_col = term.output_idx if term.output_idx is not None else 0
+                        rhs = term.rhs
+                        if callable(rhs):
+                            target = rhs(x, _params_dict_s)
+                        else:
+                            target = float(rhs)
+                        residual = u[:, output_col:output_col + 1] - target
                     else:
                         continue
                     loss = jnp.mean(residual ** 2)
@@ -3865,6 +3683,9 @@ class Trainer(BaseTrainer):
 
         # ── Weak-form: pre-build and JIT the FEM assembler loss ──────────
         if _is_weak:
+            # Per-term weights are already embedded inside make_loss_fn (bc_weights=weights),
+            # so the outer pde_weight factor must be 1.0 to avoid double-weighting.
+            pde_weight = 1.0
             _network = self.network
             _n_out = self.problem.n_outputs
 
@@ -3973,8 +3794,8 @@ class Trainer(BaseTrainer):
                 self._u_and_grad_fn = _u_and_grad
                 _is_random_time = getattr(self.problem, '_random_time_sampling', False)
                 if _is_random_time:
-                    _rts_t_min = float(getattr(self.problem, '_t_min', 0.0))
-                    _rts_t_max = float(getattr(self.problem, '_t_max', 1.0))
+                    _rts_t_min = float(getattr(self.problem, '_t_min', None) or 0.0)
+                    _rts_t_max = float(getattr(self.problem, '_t_max', None) or 1.0)
                     _rts_n_t   = int(getattr(self.problem, '_n_t', 10))
                     _rts_n_t   = int(getattr(self, '_train_samples', {}).get('time', _rts_n_t))
                     _rts_method = getattr(self.problem, '_t_sampling_method', 'uniform')
@@ -4016,13 +3837,17 @@ class Trainer(BaseTrainer):
             return self.network.apply(params, x, params_dict)
         
         # Check if we should use sparse FBPINN
+        try:
+            from pinns.models import FBPINN as _FBPINN
+        except ImportError:
+            _FBPINN = type(None)
         use_sparse = (self._use_sparse_fbpinn and 
-                      isinstance(self.network, FBPINN) and 
+                      isinstance(self.network, _FBPINN) and 
                       self._precomputed_bcs)
         
         # Check if we have sparse PDE indices for differentiable sparse forward
         use_sparse_pde = (self._use_sparse_fbpinn and 
-                          isinstance(self.network, FBPINN) and 
+                          isinstance(self.network, _FBPINN) and 
                           self._precomputed_pde is not None)
         
         # Store precomputed data references for closure
@@ -4115,8 +3940,10 @@ class Trainer(BaseTrainer):
                     x_bc = train_data[bc_name]
                     y_bc = model_apply_with_params(params, x_bc)
                 
-                # Get target: const_value for scalar BCs, precomputed targets for callable BCs
-                if bc_data['const_value'] is not None:
+                # Get target
+                if bc_data.get('is_points'):
+                    target = jnp.array(bc_data['u_data'], dtype=jnp.float32)
+                elif bc_data['const_value'] is not None:
                     target = bc_data['const_value']
                 elif bc_name in targets_dict:
                     target = targets_dict[bc_name]
@@ -4184,7 +4011,7 @@ class Trainer(BaseTrainer):
 
                 total_loss = total_loss + bc_data['weight'] * bc_loss
 
-            # ===== Custom Residual BC Loss (MeshCustomBC) =====
+            # ===== Custom Residual BC Loss (TermMeshCustomBC) =====
             if custom_bc_list:
                 _deriv_fn = make_derivative_fn(model_apply_with_params, params)
                 for _bc, _bc_name, _bc_weight, _n in custom_bc_list:
@@ -4459,27 +4286,19 @@ class Trainer(BaseTrainer):
     # ==================== Loss Computation (weak-form override) ====================
 
     def _compute_total_loss(self, data, params_dict, weights_dict):
-        """Override to include weak-form PDE residual in metrics for ProblemWeak."""
+        """Override for ProblemWeak: strip 'pde' key and delegate to base class.
+
+        The actual weak-form PDE loss is added by ``_compute_total_loss_batched``.
+        This override only ensures the 'pde' collocation key (absent for weak
+        problems) never reaches the base-class logic that would crash on it.
+        Do NOT add PDE here — that would double-count it when called indirectly
+        from the parent ``_compute_total_loss_batched`` → ``self._compute_total_loss``.
+        """
         from pinns.problems.problem_weak import ProblemWeak as _ProblemWeak
         if isinstance(self.problem, _ProblemWeak) and hasattr(self, '_weak_loss_fn'):
-            # Strip 'pde' from soft BC data
-            _hard = set()
-            bc_data = {k: v for k, v in data.items() if k != 'pde' and k not in _hard}
-            total_loss, losses = super()._compute_total_loss(bc_data, params_dict, weights_dict)
-            # Add weak PDE residual — always use full-batch loss fn for metrics
-            pde_weight = weights_dict.get('pde', 1.0)
-            if getattr(self, '_rts_t_min', None) is not None:
-                import numpy as _np
-                _t_vals = jnp.array(
-                    _np.linspace(self._rts_t_min, self._rts_t_max, self._rts_n_t)
-                )
-                weak_pde_loss = float(self._weak_loss_fn(self.network.params, _t_vals))
-            else:
-                weak_pde_loss = float(self._weak_loss_fn(self.network.params))
-            losses['pde'] = pde_weight * weak_pde_loss
-            extra = pde_weight * weak_pde_loss
-            total_loss = extra if total_loss is None else total_loss + extra
-            return total_loss, losses
+            _inner_names_ct = {t['name'] for t in getattr(self.problem, '_inner_terms', []) or []} | {'pde'}
+            bc_data = {k: v for k, v in data.items() if k not in _inner_names_ct}
+            return super()._compute_total_loss(bc_data, params_dict, weights_dict)
         return super()._compute_total_loss(data, params_dict, weights_dict)
 
     def _compute_total_loss_batched(self, data, params_dict, weights_dict, batch_size=1000):
@@ -4487,10 +4306,11 @@ class Trainer(BaseTrainer):
         import numpy as _np
         from pinns.problems.problem_weak import ProblemWeak as _ProblemWeak
         if isinstance(self.problem, _ProblemWeak) and hasattr(self, '_weak_loss_fn'):
-            # Strip 'pde', and internal '_'-prefixed keys.
-            _hard = set()
+            # Strip inner-term keys (handled by weak assembler) and internal '_'-prefixed keys.
+            _inner_names_ctb = ({t['name'] for t in getattr(self.problem, '_inner_terms', []) or []}
+                                | {'pde'})
             bc_data = {k: v for k, v in data.items()
-                       if k != 'pde' and k not in _hard and not k.startswith('_')}
+                       if k not in _inner_names_ctb and not k.startswith('_')}
             if bc_data:
                 total_loss, losses = super()._compute_total_loss_batched(
                     bc_data, params_dict, weights_dict, batch_size)
@@ -4498,6 +4318,12 @@ class Trainer(BaseTrainer):
                 total_loss, losses = 0.0, {}
             _is_train_data = data is getattr(self, '_train_data', None)
             pde_weight = weights_dict.get('pde', 1.0)
+            # Per-term weights are already embedded inside make_loss_fn
+            # (bc_weights=weights_dict), so the outer pde_weight factor must be 1.0
+            # to avoid double-weighting.
+            from pinns.problems.problem_weak import ProblemWeak as _PW_wl
+            if isinstance(self.problem, _PW_wl):
+                pde_weight = 1.0
             if _is_train_data:
                 # Training: use precomputed _t_vals / _node_idx from train_data
                 if getattr(self, '_rts_t_min', None) is not None:
@@ -4563,8 +4389,10 @@ class Trainer(BaseTrainer):
                 u_x = derivative(U, X, 0, (0,))
                 ...
         """
-        if self._is_lagrangian_mode:
-            _train_lagrangian_mode_impl(self)
+        from .schedulers.scheduler_lagrange import SchedulerLagrange as _SLag
+        _lag = next((s for s in getattr(self, '_schedulers', []) if isinstance(s, _SLag)), None)
+        if _lag is not None:
+            _lag.run_training(self)
             return
 
         # ── Time-step curriculum (BPTT rollout mode only) ────────────────
@@ -4710,17 +4538,7 @@ class Trainer(BaseTrainer):
         
         # Initialize RNG key for shuffling
         shuffle_key = jax.random.PRNGKey(self.rng.integers(0, 2**31))
-        
-        # Get resample interval and check if using pool
-        resample_each = getattr(self, '_resample_each', 0)
-        pool_refresh_each = getattr(self, '_pool_refresh_each', 0)
-        has_pool = hasattr(self, '_train_pool') and self._train_pool is not None
-        pool_size = getattr(self, '_resample_pool_size', 10)
-        
-        # Adaptive sampling parameters
-        adaptive_sampling = getattr(self, '_adaptive_sampling', False)
-        adaptive_each = getattr(self, '_adaptive_each', 100)
-        
+
         # Learning rate scheduler
         lr_scheduler = getattr(self, '_lr_scheduler', None)
         
@@ -4779,49 +4597,18 @@ class Trainer(BaseTrainer):
             epoch_start = time.time()
             global_epoch = start_epoch + epoch
 
-            # Time-domain curriculum: expand sampling window if stage changed
-            self._curriculum_step(global_epoch)
+            # Scheduler on_epoch_start hooks (resample, adaptive, curriculum, etc.)
+            for _s in getattr(self, '_schedulers', []):
+                _s.on_epoch_start(self, epoch)
 
             # Update learning rate if scheduler is provided
             # Skip for SOAP (has its own LR handling) and L-BFGS
             if lr_scheduler is not None and self.optimizer_name not in ("lbfgs", "soap"):
                 new_lr = lr_scheduler.lr(self.learning_rate, global_epoch)
-                # Update the hyperparameter in opt_state (inject_hyperparams stores it there)
-                # InjectHyperparamsState is immutable, so we need to create a new state
                 if hasattr(self.opt_state, 'hyperparams'):
                     new_hyperparams = dict(self.opt_state.hyperparams)
                     new_hyperparams['learning_rate'] = new_lr
                     self.opt_state = self.opt_state._replace(hyperparams=new_hyperparams)
-                # Scale lagrange_lr by the same ratio
-                self.lagrange_lr = self._lagrange_lr_ratio * new_lr
-                if self._lagrange_optimizer is not None:
-                    for k in self._lagrange_opt_states:
-                        if hasattr(self._lagrange_opt_states[k], 'hyperparams'):
-                            hp = dict(self._lagrange_opt_states[k].hyperparams)
-                            hp['learning_rate'] = self.lagrange_lr
-                            self._lagrange_opt_states[k] = self._lagrange_opt_states[k]._replace(hyperparams=hp)
-            
-            # Refresh pool with fresh samples if interval reached
-            if pool_refresh_each > 0 and has_pool and epoch > 0 and epoch % pool_refresh_each == 0:
-                self._sample_pool_data(pool_size)
-            
-            # Resample collocation points if interval reached
-            if resample_each > 0 and epoch > 0 and epoch % resample_each == 0:
-                if has_pool:
-                    # Fast: select from pre-sampled pool
-                    self._select_from_pool()
-                else:
-                    # Slow: full resampling
-                    self._sample_train_data()
-                    if any(v > 0 for v in (self.test_samples.values() if isinstance(self.test_samples, dict) else self.test_samples)):
-                        self._sample_test_data()
-            
-            # Adaptive resampling based on residuals
-            if adaptive_sampling and epoch > 0 and epoch % adaptive_each == 0:
-                self._adaptive_resample(params_dict)
-                # Recalculate n_batches if dataset size changed (adaptive_mode="add")
-                if use_batching and getattr(self, '_adaptive_mode', 'replace') == 'add':
-                    n_batches = self._get_n_batches()
             
             # ── Rollout face mini-batching: sample fresh indices each epoch ──────────
             _rfb = getattr(self, '_rollout_face_batch', None)
@@ -5018,6 +4805,8 @@ class Trainer(BaseTrainer):
         self._global_epoch += epochs
         if not getattr(self, '_curriculum_running', False):
             print(f"Training complete in {time.time() - start_time:.1f}s")
+            for _s in getattr(self, '_schedulers', []):
+                _s.on_training_end(self)
         self._curriculum_restore()
         
         # Close figure to prevent duplicate display in notebooks
@@ -5235,7 +5024,7 @@ class Trainer(BaseTrainer):
         # Pre-extract BC info
         dirichlet_bcs = []
         neumann_bcs = []
-        mesh_neumann_bcs = []   # MeshNodeBC with bc_type="neumann"
+        mesh_neumann_bcs = []   # TermMeshNodeBC with bc_type="neumann"
         bc_names = self._get_soft_bc_names()
 
         from pinns.problems.problem_weak import ProblemWeak as _ProblemWeak
@@ -5244,14 +5033,11 @@ class Trainer(BaseTrainer):
         # Get precomputed targets for callable BCs
         train_targets = getattr(self, '_train_targets', {})
         
-        try:
-            from pinns.boundary import PeriodicBC as _PBC5, CubicPeriodicBC as _CPBC5
-            _periodic_types5 = (_PBC5, _CPBC5)
-        except ImportError:
-            _periodic_types5 = ()
+        from pinns.terms import TermPeriodicBC as _PBC5
+        _periodic_types5 = (_PBC5,)
         _bc_name_idx5 = 0
         for i, bc in enumerate(getattr(self.problem, 'boundary_conditions', [])):
-            from pinns.boundary import DirichletBC, NeumannBC, RobinBC, MeshNodeBC
+            from pinns.terms import TermDirichletBC, TermNeumannBC, TermRobinBC
             if _periodic_types5 and isinstance(bc, _periodic_types5):
                 continue
             name = bc_names[_bc_name_idx5]
@@ -5261,40 +5047,23 @@ class Trainer(BaseTrainer):
             if name in _hard_bc_names_lbfgs:
                 continue
 
-            if isinstance(bc, MeshNodeBC):
-                if bc.bc_type == "dirichlet":
-                    dirichlet_bcs.append({
-                        'name': name,
-                        'component': bc.component,
-                        'weight': weights.get(name, 1.0),
-                        'const_value': bc.value if not callable(bc.value) else None,
-                        'has_callable_value': callable(bc.value),
-                    })
-                else:  # neumann
-                    mesh_neumann_bcs.append({
-                        'name': name,
-                        'component': bc.component,
-                        'weight': weights.get(name, 1.0),
-                        'const_value': bc.value if not callable(bc.value) else None,
-                        'has_callable_value': callable(bc.value),
-                    })
-                continue
-
-            is_neumann = isinstance(bc, (NeumannBC, RobinBC))
-            
+            is_neumann = isinstance(bc, (TermNeumannBC, TermRobinBC))
+            if is_neumann:
+                _ninfo = self.problem.domain.get_face_normal_direction(
+                    getattr(bc, 'region', '')) or (0, 1)
+            else:
+                _ninfo = (0, 1)
             bc_data = {
                 'name': name,
                 'component': bc.component,
                 'weight': weights.get(name, 1.0),
                 'const_value': bc.value if not callable(bc.value) else None,
                 'has_callable_value': callable(bc.value),
-                'dim': bc.boundary.index(1) if 1 in bc.boundary else bc.boundary.index(0),
+                'dim': _ninfo[0],
             }
-            
             if is_neumann:
-                normal_sign = 1.0 if 1 in bc.boundary else -1.0
-                bc_data['normal_sign'] = normal_sign
-                if isinstance(bc, NeumannBC):
+                bc_data['normal_sign'] = float(_ninfo[1])
+                if isinstance(bc, TermNeumannBC):
                     neumann_bcs.append(bc_data)
             else:
                 dirichlet_bcs.append(bc_data)
@@ -5341,18 +5110,12 @@ class Trainer(BaseTrainer):
         pde_fn = self.problem.pde_fn
         pde_weight = weights.get('pde', 1.0)
         
-        # Check if sparse FBPINN
-        use_sparse_pde = (self._use_sparse_fbpinn and 
-                          isinstance(self.network, FBPINN) and 
-                          self._precomputed_pde is not None)
-        use_sparse = (self._use_sparse_fbpinn and 
-                      isinstance(self.network, FBPINN) and 
-                      self._precomputed_bcs)
-        
-        precomputed_bcs = self._precomputed_bcs if use_sparse else {}
-        precomputed_pde = self._precomputed_pde if use_sparse_pde else None
+        use_sparse = False
+        use_sparse_pde = False
+        precomputed_bcs = {}
+        precomputed_pde = None
         network = self.network
-        
+
         sig = inspect.signature(pde_fn)
         pde_accepts_derivative = len(sig.parameters) >= 4
         
@@ -5408,8 +5171,10 @@ class Trainer(BaseTrainer):
                     x_bc = train_data[bc_name]
                     y_bc = model_apply_with_params(params, x_bc)
                 
-                # Get target: const_value for scalar BCs, precomputed targets for callable BCs
-                if bc_data['const_value'] is not None:
+                # Get target
+                if bc_data.get('is_points'):
+                    target = jnp.array(bc_data['u_data'], dtype=jnp.float32)
+                elif bc_data['const_value'] is not None:
                     target = bc_data['const_value']
                 elif bc_name in train_targets:
                     target = train_targets[bc_name]
@@ -5496,15 +5261,21 @@ def _initialize_lagrange_multipliers_impl(self):
         if self._lagrange_optimizer is not None:
             self._lagrange_opt_states['pde'] = self._lagrange_optimizer.init(self.lagrange_multipliers['pde'])
 
-    # For ProblemWeak the PDE residual has size n_free_nodes * n_outputs
-    # (all component residuals are concatenated: [R1_free; R2_free; ...])
+    # For ProblemWeak the PDE residual has one vector per inner term,
+    # each of size n_free_nodes * n_outputs.
     from pinns.problems.problem_weak import ProblemWeak as _ProblemWeak
     if isinstance(self.problem, _ProblemWeak):
-        if ((self._lagrange_constraints is None) or ('pde' in self._lagrange_constraints)):
-            n = self.problem.n_free_nodes * self.problem.n_outputs
-            self.lagrange_multipliers['pde'] = jnp.zeros(n)
-            if self._lagrange_optimizer is not None:
-                self._lagrange_opt_states['pde'] = self._lagrange_optimizer.init(self.lagrange_multipliers['pde'])
+        _n_free_comp = self.problem.n_free_nodes * self.problem.n_outputs
+        _weak_terms = (getattr(self.problem, '_inner_terms', None)
+                       or [{'fn': None, 'name': 'pde'}])
+        for _wt in _weak_terms:
+            _wname = _wt['name']
+            if ((self._lagrange_constraints is None)
+                    or (_wname in self._lagrange_constraints)):
+                self.lagrange_multipliers[_wname] = jnp.zeros(_n_free_comp)
+                if self._lagrange_optimizer is not None:
+                    self._lagrange_opt_states[_wname] = self._lagrange_optimizer.init(
+                        self.lagrange_multipliers[_wname])
 
     for name in self._get_bc_names():
         if name in self._train_data and ((self._lagrange_constraints is None) or (name in self._lagrange_constraints)):
@@ -5513,12 +5284,9 @@ def _initialize_lagrange_multipliers_impl(self):
             if self._lagrange_optimizer is not None:
                 self._lagrange_opt_states[name] = self._lagrange_optimizer.init(self.lagrange_multipliers[name])
 
-    # Initialize Lagrange multipliers for CubicPeriodicBC / PeriodicBC entries
-    try:
-        from pinns.boundary import PeriodicBC as _PBC_L, CubicPeriodicBC as _CPBC_L
-        _periodic_types_L = (_PBC_L, _CPBC_L)
-    except ImportError:
-        _periodic_types_L = ()
+    # Initialize Lagrange multipliers for TermPeriodicBC entries
+    from pinns.terms import TermPeriodicBC as _PBC_L
+    _periodic_types_L = (_PBC_L,)
     _n_out_L = len(self.problem.output_names) if (hasattr(self.problem, 'output_names') and self.problem.output_names) else getattr(self.problem, 'n_outputs', 1)
     for bc in getattr(getattr(self.problem, 'domain', None), 'boundary_conditions', []):
         if not (_periodic_types_L and isinstance(bc, _periodic_types_L)):
@@ -5543,7 +5311,7 @@ def _reinitialize_lagrange_if_needed_impl(self):
 
 
 def _make_al_loss_fn_impl(self, params_dict):
-    from pinns.boundary import NeumannBC, RobinBC, MeshNodeBC
+    from pinns.terms import TermNeumannBC, TermRobinBC
     from pinns.problems.problem_weak import ProblemWeak as _ProblemWeak
     _is_weak = isinstance(self.problem, _ProblemWeak)
 
@@ -5565,7 +5333,7 @@ def _make_al_loss_fn_impl(self, params_dict):
                 jac = jax.jacobian(_u_vec)(xy)  # (n_out, n_dims)
                 return u, jac
 
-        _weak_res_fn = jax.jit(self.problem.make_residual_vector_fn(_u_and_grad))
+        _weak_res_fn = jax.jit(self.problem.make_residual_vectors_fn(_u_and_grad))
         # Store for the residual plot
         self._weak_residual_fn = _weak_res_fn
         self._u_and_grad_fn = _u_and_grad
@@ -5573,6 +5341,8 @@ def _make_al_loss_fn_impl(self, params_dict):
         _n_comp  = self.problem.n_outputs
         # For multi-component: residual vector is [R1; R2; ...] of length n_dofs*n_comp
         # Free indices span all components
+        # Collect inner term names for distinguishing PDE vs BC residuals
+        _inner_term_names = set(t['name'] for t in getattr(self.problem, '_inner_terms', []) or [{'name': 'pde'}])
         _free_base = jnp.array(self.problem.free_nodes, dtype=jnp.int32)
         _free_nodes_jax = jnp.concatenate(
             [_free_base + k * _n_dofs for k in range(_n_comp)]
@@ -5582,23 +5352,20 @@ def _make_al_loss_fn_impl(self, params_dict):
             return network.apply(p, x)
 
         train_targets = getattr(self, '_train_targets', {})
+        _volume_name_weak = getattr(self.problem, '_volume_name', 'pde')
         bc_names = self._get_bc_names()
 
         # Collect Dirichlet BC info (same as strong form)
         _bc_point_info = []
-        try:
-            from pinns.boundary import PeriodicBC as _PBC6, CubicPeriodicBC as _CPBC6
-            _periodic_types6 = (_PBC6, _CPBC6)
-        except ImportError:
-            _periodic_types6 = ()
+        from pinns.terms import TermPeriodicBC as _PBC6
+        _periodic_types6 = (_PBC6,)
         _bc_name_idx6 = 0
         for i, bc in enumerate(self.problem.boundary_conditions):
             if _periodic_types6 and isinstance(bc, _periodic_types6):
                 continue
             name = bc_names[_bc_name_idx6]
             _bc_name_idx6 += 1
-            if isinstance(bc, MeshNodeBC) and bc.bc_type == 'dirichlet':
-                _bc_point_info.append({
+            _bc_point_info.append({
                     'name': name,
                     'component': bc.component,
                     'const_value': bc.value if not callable(bc.value) else None,
@@ -5607,9 +5374,10 @@ def _make_al_loss_fn_impl(self, params_dict):
         def compute_residuals_weak(params, train_data, targets_dict=None):
             targets_dict = {} if targets_dict is None else targets_dict
             residuals = {}
-            # PDE: weak-form R_free (shape n_free_nodes)
-            R_full = _weak_res_fn(params)
-            residuals['pde'] = R_full[_free_nodes_jax]
+            # PDE: weak-form R_free per inner term (each shape n_free_nodes * n_comp)
+            R_dict = _weak_res_fn(params)
+            for _tname, R_full in R_dict.items():
+                residuals[_tname] = R_full[_free_nodes_jax]
             # BCs: point evaluation  u(x_k) − g
             for info in _bc_point_info:
                 bname = info['name']
@@ -5618,8 +5386,11 @@ def _make_al_loss_fn_impl(self, params_dict):
                 x_bc = train_data[bname]
                 y_bc = _model_apply(params, x_bc)
                 comp   = info['component']
-                target = (info['const_value'] if info['const_value'] is not None
-                          else targets_dict.get(bname, 0.0))
+                if info.get('is_points'):
+                    target = info['u_data']
+                else:
+                    target = (info['const_value'] if info['const_value'] is not None
+                              else targets_dict.get(bname, 0.0))
                 residuals[bname] = (y_bc[:, comp] - target).flatten()
             return residuals
 
@@ -5642,7 +5413,7 @@ def _make_al_loss_fn_impl(self, params_dict):
                 losses[f'{name}_penalty']        = penalty
                 losses[f'{name}_lagrangian']     = lagrangian
                 losses[f'{name}_residual_mean']  = jnp.mean(jnp.abs(g))
-                if name != 'pde':
+                if name not in _inner_term_names:
                     losses['bcs'].append(constraint_loss)
                 total_loss = total_loss + constraint_loss
             return total_loss, (losses, residuals)
@@ -5651,31 +5422,26 @@ def _make_al_loss_fn_impl(self, params_dict):
 
     bc_info = {}
     bc_names = self._get_bc_names()
-    try:
-        from pinns.boundary import PeriodicBC as _PBC4, CubicPeriodicBC as _CPBC4
-        _periodic_types4 = (_PBC4, _CPBC4)
-    except ImportError:
-        _periodic_types4 = ()
+    from pinns.terms import TermPeriodicBC as _PBC4
+    _periodic_types4 = (_PBC4,)
 
-    # ── Pre-sample CubicPeriodicBC pairs for use in compute_residuals ──────
+    # ── Pre-sample TermCubicTermPeriodicBC pairs for use in compute_residuals ──────
     _periodic_al_entries = []  # list of dicts with x_a, x_b, name, component, dim, match_deriv
     _n_out_al = len(self.problem.output_names) if (hasattr(self.problem, 'output_names') and self.problem.output_names) else getattr(self.problem, 'n_outputs', 1)
     import numpy as _np_al
     for bc in getattr(getattr(self.problem, 'domain', None), 'boundary_conditions', []):
         if not (_periodic_types4 and isinstance(bc, _periodic_types4)):
             continue
-        if hasattr(bc, 'n_pairs'):  # CubicPeriodicBC
-            _rng_al = _np_al.random.default_rng()
-            _pts_a_al = self.problem.domain.sample_boundary(bc.n_pairs, bc.dim, 0, rng=_rng_al)
-            _pts_b_al = _pts_a_al.copy()
-            _pts_b_al[:, bc.dim] = self.problem.domain.xmax[bc.dim]
-            _x_a_al = jnp.asarray(_pts_a_al, dtype=jnp.float32)
-            _x_b_al = jnp.asarray(_pts_b_al, dtype=jnp.float32)
-            _dim_al = bc.dim
-        else:  # PeriodicBC (pre-computed arrays)
+        # New-style TermPeriodicBC: sample from region strings
+        if hasattr(bc, 'node_positions_a'):
             _x_a_al = jnp.asarray(bc.node_positions_a, dtype=jnp.float32)
             _x_b_al = jnp.asarray(bc.node_positions_b, dtype=jnp.float32)
-            _dim_al = 1
+        else:
+            _rng_al = _np_al.random.default_rng()
+            _n_al = bc.n_pairs or 200
+            _x_a_al = jnp.asarray(self.problem.domain.sample_boundary(_n_al, region=bc.region_a, rng=_rng_al), dtype=jnp.float32)
+            _x_b_al = jnp.asarray(self.problem.domain.sample_boundary(_n_al, region=bc.region_b, rng=_rng_al), dtype=jnp.float32)
+        _dim_al = 1
         _comps_al = [bc.component] if bc.component is not None else list(range(_n_out_al))
         for _i_al in _comps_al:
             _sub_name_al = bc.name if bc.component is not None else f'{bc.name}_{_i_al}'
@@ -5693,39 +5459,79 @@ def _make_al_loss_fn_impl(self, params_dict):
             continue
         name = bc_names[name_idx]
         name_idx += 1
-        if isinstance(bc, MeshNodeBC):
-            is_mesh_neumann = (bc.bc_type == "neumann") and (bc.edge_normals is not None)
-            is_mesh_time_neumann = (bc.bc_type == "neumann") and (bc.t_mode in ("t_min", "t_max"))
-            bc_info[name] = {
-                'component': bc.component,
-                'is_neumann': False,
-                'is_mesh_neumann': is_mesh_neumann,
-                'is_mesh_time_neumann': is_mesh_time_neumann,
-                'const_value': bc.value if not callable(bc.value) else None,
-                'normal_dim': self.problem.domain._spatial_dims if is_mesh_time_neumann else 0,
-                'normal_sign': (-1 if bc.t_mode == "t_min" else 1) if is_mesh_time_neumann else 1,
-            }
-        else:
-            is_neumann = isinstance(bc, (NeumannBC, RobinBC))
-            bc_info[name] = {
-                'component': bc.component,
-                'is_neumann': is_neumann,
-                'is_mesh_neumann': False,
-                'is_mesh_time_neumann': False,
-                'const_value': bc.value if not callable(bc.value) else None,
-            }
-            if is_neumann:
-                normal_dim, normal_sign = bc.get_normal_direction()
-                bc_info[name]['normal_dim'] = normal_dim
-                bc_info[name]['normal_sign'] = normal_sign
+        is_neumann = isinstance(bc, (TermNeumannBC, TermRobinBC))
+        bc_info[name] = {
+            'component': bc.component,
+            'is_neumann': is_neumann,
+            'is_mesh_neumann': False,
+            'is_mesh_time_neumann': False,
+            'const_value': bc.value if not callable(bc.value) else None,
+            'normal_dim': 0,
+            'normal_sign': 1,
+        }
+        if is_neumann:
+            _ninfo = self.problem.domain.get_face_normal_direction(
+                getattr(bc, 'region', '')) or (0, 1)
+            bc_info[name]['normal_dim'] = _ninfo[0]
+            bc_info[name]['normal_sign'] = _ninfo[1]
 
-    # ── ProblemStrong: AL mode not supported; raise clear error ───────────
+    # ── ProblemStrong: AL mode implemented directly from _terms ──────────
     from pinns.problems.problem_strong import ProblemStrong as _ProblemStrongAL
     if isinstance(self.problem, _ProblemStrongAL):
-        raise NotImplementedError(
-            "Lagrangian/AL training mode is not supported for ProblemStrong. "
-            "Use standard Adam / L-BFGS training instead."
-        )
+        network = self.network
+        _terms_al = list(self.problem._terms)
+
+        def _model_apply_al(params, x):
+            return network.apply(params, x, params_dict)
+
+        def compute_residuals_strong_al(params, train_data, targets_dict=None):
+            deriv_fn = make_derivative_fn(_model_apply_al, params)
+            residuals = {}
+            for term in _terms_al:
+                if term.name not in train_data:
+                    continue
+                x = train_data[term.name]
+                u = _model_apply_al(params, x)
+                if term.kind == 'points':
+                    output_col = term.output_idx if term.output_idx is not None else 0
+                    target = jnp.array(term.u_data, dtype=jnp.float32).flatten()
+                    r = (u[:, output_col] - target).flatten()
+                elif term.fn is not None and callable(term.fn):
+                    r_raw = term.fn(x, u, params_dict, deriv_fn)
+                    if term.eq_idx is not None and hasattr(r_raw, 'ndim') and r_raw.ndim == 2:
+                        r_raw = r_raw[:, term.eq_idx:term.eq_idx + 1]
+                    r = r_raw.flatten()
+                elif term.fn is not None:
+                    output_col = term.output_idx if term.output_idx is not None else 0
+                    r = (u[:, output_col:output_col + 1] - float(term.fn)).flatten()
+                else:
+                    continue
+                residuals[term.name] = r
+            return residuals
+
+        def compute_al_loss_strong(params, train_data, lagrange_dict,
+                                   weights_dict, targets_dict=None):
+            residuals = compute_residuals_strong_al(params, train_data, targets_dict)
+            total_loss = jnp.array(0.0)
+            losses = {'bcs': []}
+            lc = self._lagrange_constraints
+            for name, g in residuals.items():
+                lam = lagrange_dict.get(name, jnp.zeros_like(g))
+                if len(lam) != len(g):
+                    lam = jnp.zeros_like(g)
+                use_quad   = self._constraint_uses_quadratic(name)
+                use_lambda = (lc is None) or (name in lc)
+                penalty    = weights_dict.get(name, 1.0) * jnp.mean(g ** 2) if use_quad else 0.0
+                lagrangian = jnp.mean(jax.lax.stop_gradient(lam) * g) if use_lambda else 0.0
+                constraint_loss = penalty + lagrangian
+                losses[name] = constraint_loss
+                losses[f'{name}_penalty']       = penalty
+                losses[f'{name}_lagrangian']    = lagrangian
+                losses[f'{name}_residual_mean'] = jnp.mean(jnp.abs(g))
+                total_loss = total_loss + constraint_loss
+            return total_loss, (losses, residuals)
+
+        return compute_al_loss_strong, compute_residuals_strong_al
 
     pde_fn = self.problem.pde_fn
     network = self.network
@@ -6009,7 +5815,6 @@ def _get_lagrange_statistics_impl(self) -> Dict[str, Dict[str, float]]:
         }
         for name, lam in self.lagrange_multipliers.items()
     }
-
 
 def _reset_lagrange_multipliers_impl(self):
     for name in self.lagrange_multipliers:

@@ -35,8 +35,11 @@ class FNN:
     """
     Fully-connected layer for use inside :class:`~pinns.modelbase.ModelBase`.
 
-    Users specify only the *hidden* widths; ``input_dim`` and ``output_dim``
-    are injected by the ModelBase when ``net.add(FNN([...]))`` is called.
+    Users specify only the *hidden* widths; ``input_dim`` is injected by
+    ``ModelBase`` when ``net.add(FNN([...]))`` is called.  The output width
+    defaults to ``network.output_dim`` (the final network output), but can be
+    overridden via ``output_dim`` to use this layer as an intermediate feature
+    extractor.
 
     Parameters
     ----------
@@ -46,6 +49,14 @@ class FNN:
         Hidden-layer activation (default ``'tanh'``).
     output_activation : str, optional
         Optional final activation name.
+    output_dim : int or None, optional
+        Output width.  When ``None`` (default) the ModelBase's ``output_dim``
+        is used, which is the correct choice for the **last** layer.  Pass an
+        explicit ``int`` to override (e.g. when using this as an intermediate
+        feature extractor that should not project down to the final output size)::
+
+            net.add(FNN([64, 64, 64], output_dim=64))  # intermediate → 64
+            net.add(FNN([64, 64, 64]))                  # final → network.output_dim
     """
 
     def __init__(
@@ -53,15 +64,17 @@ class FNN:
         hidden_dims: Sequence[int],
         activation: str = "tanh",
         output_activation: Optional[str] = None,
+        output_dim: Optional[int] = None,
     ):
         self.hidden_dims      = list(hidden_dims)
         self.activation       = activation
         self.output_activation = output_activation
+        self._output_dim_override = output_dim
         self._module: Optional[FNNModule] = None
         self._layer_sizes: Optional[List[int]] = None
 
     def _configure(self, network, input_dim: int) -> int:
-        output_dim = network.output_dim
+        output_dim = self._output_dim_override if self._output_dim_override is not None else network.output_dim
         self._layer_sizes = [input_dim] + self.hidden_dims + [output_dim]
         self._module = FNNModule(
             layer_sizes=self._layer_sizes,

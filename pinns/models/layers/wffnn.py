@@ -47,6 +47,9 @@ class WFFNN:
         Hidden-layer activation (default ``'tanh'``).
     rwf_mu, rwf_sigma : float
         Parameters for random weight factorisation initialisation.
+    output_dim : int or None, optional
+        Output width.  When ``None`` (default) the ModelBase's ``output_dim``
+        is used.  Pass an explicit ``int`` to override.
     """
 
     def __init__(
@@ -56,17 +59,19 @@ class WFFNN:
         output_activation: Optional[str] = None,
         rwf_mu: float = 0.5,
         rwf_sigma: float = 0.1,
+        output_dim: Optional[int] = None,
     ):
         self.hidden_dims       = list(hidden_dims)
         self.activation        = activation
         self.output_activation = output_activation
         self.rwf_mu            = rwf_mu
         self.rwf_sigma         = rwf_sigma
+        self._output_dim_override = output_dim
         self._module: Optional[WFFNNModule] = None
         self._layer_sizes: Optional[List[int]] = None
 
     def _configure(self, network, input_dim: int) -> int:
-        output_dim = network.output_dim
+        output_dim = self._output_dim_override if self._output_dim_override is not None else network.output_dim
         self._layer_sizes = [input_dim] + self.hidden_dims + [output_dim]
         self._module = WFFNNModule(
             layer_sizes=tuple(self._layer_sizes),

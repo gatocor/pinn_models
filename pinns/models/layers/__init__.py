@@ -3,7 +3,7 @@ pinns.models.layers — All composable ModelBase layers.
 
 Includes:
   - Normalisation:   Normalize, Denormalize
-  - Feature encoders: FourierFeatures, GNNFeatures, LaplacianFeatures, AlphaTransform
+  - Feature encoders: RandomFourierFeatures, GNNFeatures, LaplacianFeatures, AlphaTransform
   - ModelBase models:  FNN, WFFNN, ResNet, PirateNet
 """
 
@@ -15,7 +15,7 @@ from .wffnn    import WFFNN
 from .resnet   import ResNet
 from .piratenet import PirateNet
 
-from .fourier   import FourierFeatures
+from .fourier   import RandomFourierFeatures, FourierFeatures
 from .gnn       import GNNFeatures
 from .laplacian import LaplacianFeatures, AlphaTransform
 
@@ -33,6 +33,7 @@ __all__ = [
     "ResNet",
     "PirateNet",
     # feature encoders
+    "RandomFourierFeatures",
     "FourierFeatures",
     "GNNFeatures",
     "LaplacianFeatures",
