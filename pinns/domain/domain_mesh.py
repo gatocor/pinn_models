@@ -577,6 +577,11 @@ class DomainMesh:
                 f"time range [{self._t_min}, {self._t_max}].")
         return (t_lo, t_hi)
 
+    @property
+    def interior_node_mask(self) -> np.ndarray:
+        """Boolean mask of shape ``(n_nodes,)`` — ``True`` for interior nodes."""
+        return ~self._boundary_node_mask
+
     def add_inner(self, select, name: str, time=None, strict: bool = True) -> None:
         """Register a named **interior** sampling region.
 
@@ -1413,8 +1418,17 @@ class DomainMesh:
             )
 
         tw = getattr(bc, 'time_window', None)
-        if self._t_min is None or tw is None:
+        if self._t_min is None:
             return pts_sp, idx
+        if tw is None:
+            # BC has no explicit time_window: infer from term kind.
+            # Initial-condition terms are sampled at t_min only; all other
+            # BCs (dirichlet, neumann, …) are sampled over the full time range.
+            kind = getattr(bc, 'kind', None)
+            if kind == 'initial':
+                tw = [self._t_min, self._t_min]
+            else:
+                tw = [self._t_min, self._t_max]
         pts_tw = [float(v) for v in tw]
         if len(pts_tw) == 0:
             return pts_sp, idx

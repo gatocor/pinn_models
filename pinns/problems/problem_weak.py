@@ -1034,13 +1034,53 @@ class ProblemWeak(BaseProblem):
                 return u, jac
 
         cd            = self.cubature_data
-        pts_jax       = jnp.asarray(cd['pts'],      dtype=jnp.float32)
-        weights_jax   = jnp.asarray(cd['weights'],  dtype=jnp.float32)
-        phi_jax       = jnp.asarray(cd['phi'],      dtype=jnp.float32)
-        grad_phi_jax  = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)
-        node_ids_jax  = jnp.asarray(cd['node_ids'], dtype=jnp.int32)
         node_norm_jax = jnp.asarray(self.node_norm, dtype=jnp.float32)
         dof_coords_jax = jnp.asarray(cd['dof_coords'], dtype=jnp.float32)
+
+        # ── Space-time cubature for transient problems ─────────────────────
+        # For continuous (non-rollout) transient problems the spatial cubature
+        # points must include a time column so that ∂u/∂t can be computed via
+        # autodiff.  We tile the spatial cubature over n_t_coll uniformly-
+        # spaced time samples, producing (n_t * n_faces, n_qpts, 3) arrays.
+        # The quadrature weights are normalised by n_t so the accumulated
+        # residual is the time-averaged Galerkin residual.
+        _t_min_dom = getattr(self.domain, '_t_min', None)
+        _t_max_dom = getattr(self.domain, '_t_max', None)
+
+        if _t_min_dom is not None:
+            _n_t_coll  = getattr(self, 'n_time_collocation', 20)
+            _t_pts_np  = _np.linspace(_t_min_dom, _t_max_dom, _n_t_coll,
+                                      dtype=_np.float32)
+            _pts_np    = cd['pts']       # (n_faces, n_qpts, 2)
+            _wts_np    = cd['weights']   # (n_faces, n_qpts)
+            _phi_np    = cd['phi']       # (n_faces, n_qpts, n_local)
+            _gphi_np   = cd['grad_phi']  # (n_faces, n_qpts, n_local, n_dim)
+            _nids_np   = cd['node_ids']  # (n_faces, n_local)
+            _nf, _nq   = _pts_np.shape[:2]
+
+            # Tile spatial arrays along the face dimension for each time point
+            _pts_tiled  = _np.tile(_pts_np,  (_n_t_coll, 1, 1))   # (nt*nf, nq, 2)
+            _wts_tiled  = _np.tile(_wts_np,  (_n_t_coll, 1))       # (nt*nf, nq)
+            _phi_tiled  = _np.tile(_phi_np,  (_n_t_coll, 1, 1))    # (nt*nf, nq, nl)
+            _gphi_tiled = _np.tile(_gphi_np, (_n_t_coll, 1, 1, 1)) # (nt*nf, nq, nl, nd)
+            _nids_tiled = _np.tile(_nids_np, (_n_t_coll, 1))        # (nt*nf, nl)
+
+            # Append time column: block s → all faces at time _t_pts_np[s]
+            _t_col_np = (_np.repeat(_t_pts_np, _nf)[:, None, None]
+                         * _np.ones((1, _nq, 1), dtype=_np.float32))
+            _pts_xt = _np.concatenate([_pts_tiled, _t_col_np], axis=-1)
+
+            pts_jax      = jnp.asarray(_pts_xt,     dtype=jnp.float32)
+            weights_jax  = jnp.asarray(_wts_tiled / _n_t_coll, dtype=jnp.float32)
+            phi_jax      = jnp.asarray(_phi_tiled,  dtype=jnp.float32)
+            grad_phi_jax = jnp.asarray(_gphi_tiled, dtype=jnp.float32)
+            node_ids_jax = jnp.asarray(_nids_tiled, dtype=jnp.int32)
+        else:
+            pts_jax       = jnp.asarray(cd['pts'],      dtype=jnp.float32)
+            weights_jax   = jnp.asarray(cd['weights'],  dtype=jnp.float32)
+            phi_jax       = jnp.asarray(cd['phi'],      dtype=jnp.float32)
+            grad_phi_jax  = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)
+            node_ids_jax  = jnp.asarray(cd['node_ids'], dtype=jnp.int32)
 
         # True free nodes: exclude Dirichlet-constrained DOFs from the test space
         _dirichlet_set: set = set()

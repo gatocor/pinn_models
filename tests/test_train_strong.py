@@ -158,11 +158,11 @@ class TestCompile:
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
         trainer = Trainer(problem, network)
         trainer.compile(
-            train_samples={"ode": 50, "Ix": 1, "Ivx": 1},
-            test_samples={"ode": 50},
-            weights={"ode": 1.0, "Ix": 1.0, "Ivx": 1.0},
-            optimizer="adam",
-            learning_rate=1e-3,
+            problem={
+                "ode": {"train": 50, "test": 50, "weight": 1.0},
+                "Ix":  {"train": 1,  "weight": 1.0},
+                "Ivx": {"train": 1,  "weight": 1.0},
+            },
             epochs=_FAST_EPOCHS,
             print_each=_PRINT_EACH,
         )
@@ -180,9 +180,10 @@ class TestCompile:
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
         trainer = Trainer(problem, network)
         trainer.compile(
-            train_samples={"pde": 30, "bc": 5},
-            test_samples={"pde": 30},
-            weights={"pde": 1.0, "bc": 1.0},
+            problem={
+                "pde": {"train": 30, "test": 30, "weight": 1.0},
+                "bc":  {"train": 5,  "weight": 1.0},
+            },
             epochs=_FAST_EPOCHS,
             print_each=_PRINT_EACH,
         )
@@ -199,13 +200,10 @@ class TestTrainSmoke:
     def _run(self, problem, network, term_names, n_train=30, n_test=30):
         trainer = Trainer(problem, network)
         trainer.compile(
-            train_samples={k: n_train for k in term_names},
-            test_samples={k: n_test for k in term_names},
-            weights={k: 1.0 for k in term_names},
-            optimizer="adam",
-            learning_rate=1e-3,
+            problem={k: {"train": n_train, "test": n_test, "weight": 1.0} for k in term_names},
             epochs=_FAST_EPOCHS,
             print_each=_PRINT_EACH,
+            show=None,
         )
         trainer.train()
         return trainer
@@ -245,11 +243,14 @@ class TestHistory:
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
         trainer = Trainer(problem, network)
         trainer.compile(
-            train_samples={"ode": 50, "Ix": 1, "Ivx": 1},
-            test_samples={"ode": 50},
-            weights={"ode": 1.0, "Ix": 1.0, "Ivx": 1.0},
+            problem={
+                "ode": {"train": 50, "test": 50, "weight": 1.0},
+                "Ix":  {"train": 1,  "weight": 1.0},
+                "Ivx": {"train": 1,  "weight": 1.0},
+            },
             epochs=_FAST_EPOCHS,
             print_each=_PRINT_EACH,
+            show=None,
         )
         trainer.train()
         return trainer
@@ -289,9 +290,14 @@ class TestPredict:
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
         trainer = Trainer(problem, network)
         trainer.compile(
-            train_samples={"ode": 50, "Ix": 1, "Ivx": 1},
+            problem={
+                "ode": {"train": 50},
+                "Ix":  {"train": 1},
+                "Ivx": {"train": 1},
+            },
             epochs=_FAST_EPOCHS,
             print_each=_PRINT_EACH,
+            show=None,
         )
         trainer.train()
         return trainer
@@ -322,10 +328,15 @@ class TestALMode:
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
         trainer = Trainer(problem, network)
         trainer.compile(
-            train_samples={"ode": 50, "Ix": 1, "Ivx": 1},
+            problem={
+                "ode": {"train": 50},
+                "Ix":  {"train": 1},
+                "Ivx": {"train": 1},
+            },
             epochs=_FAST_EPOCHS,
             print_each=_PRINT_EACH,
             schedulers=[SchedulerLagrange(constraints=["Ix", "Ivx"])],
+            show=None,
         )
         trainer.train()   # must not raise
         assert len(trainer.history["epoch"]) >= 1
@@ -336,9 +347,14 @@ class TestALMode:
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
         trainer = Trainer(problem, network)
         trainer.compile(
-            train_samples={"ode": 50, "Ix": 1, "Ivx": 1},
+            problem={
+                "ode": {"train": 50},
+                "Ix":  {"train": 1},
+                "Ivx": {"train": 1},
+            },
             epochs=_FAST_EPOCHS,
             print_each=_PRINT_EACH,
+            show=None,
         )
         trainer.train()  # must not raise
 
@@ -353,9 +369,14 @@ class TestRetrain:
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
         trainer = Trainer(problem, network)
         trainer.compile(
-            train_samples={"ode": 50, "Ix": 1, "Ivx": 1},
+            problem={
+                "ode": {"train": 50},
+                "Ix":  {"train": 1},
+                "Ivx": {"train": 1},
+            },
             epochs=_FAST_EPOCHS,
             print_each=_PRINT_EACH,
+            show=None,
         )
         trainer.train()
         n_after_first = len(trainer.history["epoch"])

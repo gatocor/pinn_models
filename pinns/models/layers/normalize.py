@@ -69,9 +69,15 @@ class Normalize:
         return input_dim  # Normalize is shape-preserving
 
     def _transform_coords(self, coords: np.ndarray) -> np.ndarray:
-        """Numpy-level transform for mesh vertices (used by lazy mesh layers)."""
-        mn = np.array(self._coords_min)
-        mx = np.array(self._coords_max)
+        """Numpy-level transform for mesh vertices (used by lazy mesh layers).
+
+        Slices min/max to match the number of columns in ``coords`` so that
+        purely-spatial arrays (shape ``(N, 2)``) work correctly even when the
+        normalisation was configured for space+time inputs (shape ``(N, 3)``).
+        """
+        n_cols = coords.shape[1]
+        mn = np.array(self._coords_min)[:n_cols]
+        mx = np.array(self._coords_max)[:n_cols]
         return 2.0 * (coords - mn) / (mx - mn + 1e-8) - 1.0
 
     def init(self, rng) -> Dict:

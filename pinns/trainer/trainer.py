@@ -23,17 +23,12 @@ try:
 except ImportError:
     HAS_JAXOPT = False
 
-try:
-    from soap_jax import soap as soap_optimizer
-    HAS_SOAP = True
-except ImportError:
-    HAS_SOAP = False
-
-from .schedulers import LRScheduler, ExponentialDecay, ReduceLROnPlateau, is_notebook
+from .optimizers import build_optimizer, BaseOptimizer, AdamOptimizer
+from .schedulers import Scheduler, is_notebook, SchedulerExponentialDecay, SchedulerReduceLROnPlateau
+from ._plotting import TrainPlotter
 from ..functional import set_context, clear_context, make_derivative_fn
-from ._plotting import _PlottingMixin
 
-class Trainer(_PlottingMixin):
+class Trainer:
     """
     JAX-based PINN Trainer.
     
@@ -86,12 +81,6 @@ class Trainer(_PlottingMixin):
         # Global epoch counter (accumulated across train() calls)
         self._global_epoch = 0
         
-        # Figure for persistent plotting
-        self._fig = None
-        self._axes = None
-        self._display_handle = None
-        self._colorbars = []
-        
         # Random number generator
         self.rng = np.random.default_rng()
         
@@ -130,8 +119,8 @@ class Trainer(_PlottingMixin):
             for _dt in dataset._data_terms:
                 self.weights[_dt.name] = 1.0
 
-        self.learning_rate = 1e-3
-        self.optimizer_name = "adam"
+        self._optimizer_obj = AdamOptimizer()
+        self.optimizer_name = self._optimizer_obj.name
         self.optimizer = None
         self.opt_state = None
         
@@ -148,17 +137,9 @@ class Trainer(_PlottingMixin):
         # Training configuration (set by compile)
         self._epochs = 1000
         self._print_each = 100
-        self._show_plots = False
-        self._plot_callback = None
-        self._save_plots = None
-        self._show_subdomains = {'solution': False, 'residuals': False, 'zoom': False}
-        self._show_sampling_points = {'solution': False, 'residuals': False, 'zoom': False}
-        self._plot_regions = []
-        self._plot_n_points = 200
+        self._plotter: Optional['TrainPlotter'] = None
         self._batch_size = None
         self._compiled = False
-        self._plot_kwargs = {}
-        self._plot_style = {}
 
         # Rollout AL mode (BPTT) — minimal state needed
         self.lagrange_lr = 1.0
@@ -189,50 +170,29 @@ class Trainer(_PlottingMixin):
                     self.network.set_output_range(ymin, ymax)
     
     # ==================== Abstract Methods ====================
-    
+
+    @property
+    def learning_rate(self) -> float:
+        """Current learning rate, read from the active optimizer instance."""
+        return self._optimizer_obj.learning_rate
+
     # ==================== Compile ====================
     
     def _compile_base(
         self,
-        train_samples: Union[List[int], Dict[str, int]] = None,
-        test_samples: Union[List[int], Dict[str, int]] = None,
-        weights: Union[List[float], Dict[str, float]] = None,
-        optimizer: str = None,
-        learning_rate: float = None,
+        problem: Optional[Dict[str, Dict]] = None,
+        optimizer: Optional[BaseOptimizer] = None,
         epochs: int = 1000,
         batch_size: int = None,
         print_each: int = 100,
-        show_plots: bool = False,
-        save_plots: str = None,
-        show_subdomains=False,
-        show_sampling_points=False,
-        plot_regions: List[tuple] = None,
-        plot_n_points: int = 200,
-        # Learning rate scheduler
-        lr_scheduler: Optional[LRScheduler] = None,
-        # Training schedulers (resample, adaptive, curriculum, lagrange, …)
+        # Training schedulers (resample, adaptive, curriculum, lagrange, lr, …)
         schedulers: Optional[List] = None,
-        # L-BFGS specific parameters
-        lbfgs_max_iter: int = 5,
-        lbfgs_history_size: int = 50,
-        lbfgs_tolerance: float = 1e-9,
-        lbfgs_line_search: str = "strong_wolfe",
-        # SOAP specific parameters
-        soap_params: Optional[Dict[str, Any]] = None,
-        # Plot keyword arguments
-        plot_kwargs: Optional[Dict[str, Any]] = None,
-        # Plot style
-        plot_style: Optional[Dict[str, Any]] = None,
-        # Periodic callback: called as plot_callback(epoch, trainer) every print_each steps
-        plot_callback: Optional[callable] = None,
+        # Plotting: pass TrainPlotter() to enable; None disables all plots.
+        show: Optional[TrainPlotter] = TrainPlotter(),
         # Time-step curriculum for BPTT rollout mode
         # Train epochs_by_time_step epochs with 1 step, then 2 steps, …, up to n_time_steps.
         # Each stage runs epochs_by_time_step epochs.  Set to None to disable.
         epochs_by_time_step: Optional[int] = None,
-        # Snapshot time points for transient mesh solutions.
-        # When set, plot_progress shows one row of panels (predicted, true?, residual, error?)
-        # per time value.  E.g. plot_time_points=[0.0, 0.25, 0.5, 1.0].
-        plot_time_points: Optional[List[float]] = None,
         # Gradient clipping: clip global gradient norm to this value. Useful for BPTT.
         # Set to None (default) to disable.
         grad_clip: Optional[float] = None,
@@ -244,112 +204,72 @@ class Trainer(_PlottingMixin):
     ):
         """
         Configure training parameters.
-        
+
         Args:
-            train_samples: Number of samples for each loss term (list or dict).
-            test_samples: Number of test samples for each loss term.
-            weights: Weights for each loss term.
-            optimizer: Optimizer name ('adam', 'sgd', 'lbfgs').
-            learning_rate: Learning rate.
+            problem: Per-term configuration dict. Each key is a loss term name,
+                each value is a dict with optional keys ``train`` (int),
+                ``test`` (int), and ``weight`` (float or array).  Example::
+
+                    problem={
+                        "pde":    {"train": 1000, "test": 500,  "weight": 1.0},
+                        "bottom": {"train": 100,  "test": 50,   "weight": 100.0},
+                    }
+
+            optimizer: Optimizer instance (e.g. ``AdamOptimizer(1e-3)``,
             epochs: Number of training epochs.
             batch_size: Batch size (if applicable).
             print_each: Print progress every N epochs.
-            show_plots: Show plots during training.
-            save_plots: Path prefix for saving plots.
-            show_subdomains: Show subdomain boundaries in plots.
-            show_sampling_points: Show sampling points in plots.
-            plot_regions: List of zoom regions for additional plots.
-            plot_n_points: Number of points for plotting.
-            lr_scheduler: Learning rate scheduler (e.g., ExponentialDecay). If None, constant learning rate.
-            epochs_by_time_step: Time-step curriculum for BPTT rollout mode.  When set to an
-                integer N, ``train()`` runs N epochs with 1 rollout step, then N epochs
-                with 2 rollout steps, …, up to ``domain.n_steps`` rollout steps.
-                Each stage re-JITs the scan for the new length.  Set to ``None`` (default)
-                to train on the full rollout from the start.
-            schedulers: List of Scheduler instances (SchedulerResample, SchedulerAdaptiveResample,
-                SchedulerCurriculum, SchedulerLagrange, etc.) to control training behaviour.
-            lbfgs_max_iter: Max iterations per L-BFGS step (default: 5).
-            lbfgs_history_size: History size for L-BFGS (default: 50).
-            lbfgs_tolerance: Tolerance for gradient convergence (default: 1e-9).
-            lbfgs_line_search: Line search method - 'strong_wolfe' or None (default: 'strong_wolfe').
-            soap_params: SOAP optimizer parameters (JAX only). Dict with keys:
-                - b1: Adam's beta1 (default: 0.95)
-                - b2: Adam's beta2 (default: 0.95)
-                - shampoo_beta: Beta for preconditioner (-1 uses b2)
-                - eps: Numerical stability (default: 1e-8)
-                - weight_decay: Weight decay (default: 0.0)
-                - precondition_frequency: How often to update preconditioner (default: 10)
-                - max_precond_dim: Max preconditioner dimension (default: 10000)
-                - precondition_1d: Whether to precondition 1D params (default: False)
-            plot_kwargs: Optional dict of kwargs to customise individual plot panels.
-                Keys select the panel; values are dicts passed to ``ax.set()``.
-                Supported keys:
-                  - ``"losses"``      – weighted-loss panel
-                  - ``"mse_losses"``  – MSE-loss panel
-                  - ``"solution"``    – all solution panels
-                  - ``"residuals"``   – all residual panels
-                  - ``"error"``       – all error panels
-                Common matplotlib ``set()`` kwargs: ``yscale``, ``xscale``,
-                ``ylim``, ``xlim``, ``title``, ``xlabel``, ``ylabel``.
-                Example::
-
-                    plot_kwargs={
-                        "losses":   {"yscale": "log"},
-                        "solution": {"ylim": (-1.5, 1.5)},
-                    }
-            plot_style: Optional dict to control the overall figure appearance.
-                Keys:
-                  - ``"theme"``      – ``"dark"`` or ``"light"`` (default). Applies
-                    matplotlib\'s ``dark_background`` / default style.
-                  - ``"bg_color"``   – axes background color (any matplotlib color,
-                    e.g. ``"#1e1e2e"``, ``"white"``, ``"#0d0d0d"``).
-                  - ``"fig_color"``  – figure (outer) background color.
-                  - ``"text_color"`` – color for labels, titles and tick labels.
-                  - ``"grid_color"`` – gridline color (default: auto from theme).
-                Example::
-
-                    plot_style={
-                        "theme": "dark",
-                        "bg_color": "#1e1e2e",
-                        "fig_color": "#13131f",
-                        "text_color": "white",
-                    }
+            schedulers: List of Scheduler instances (SchedulerResample,
+                SchedulerAdaptiveResample, SchedulerCurriculum, SchedulerLagrange,
+                ExponentialDecay, ReduceLROnPlateau, etc.) to control training
+                behaviour.  Pass ``Scheduler`` subclass instances here to
+                schedule the learning rate.
+            show: A :class:`~pinns.TrainPlotter` instance controlling all plot
+                behaviour.  Pass ``TrainPlotter()`` to display with defaults, or
+                ``TrainPlotter(save="./out", style={"theme": "dark"}, ...)`` for
+                custom plots.  ``None`` (default) disables all plotting.
+            epochs_by_time_step: Time-step curriculum for BPTT rollout mode.
+                When set to an integer N, ``train()`` runs N epochs with 1 rollout
+                step, then N epochs with 2 rollout steps, …, up to
+                ``domain.n_steps`` rollout steps.  Each stage re-JITs the scan
+                for the new length.  Set to ``None`` (default) to train on the
+                full rollout from the start.
+            grad_clip: Clip global gradient norm to this value.  ``None``
+                (default) disables clipping.
+            face_batch_size: Mini-batch over test functions (faces) for BPTT
+                rollout.  ``None`` (default) uses all faces.
         """
-        # Store L-BFGS parameters
-        self._lbfgs_max_iter = lbfgs_max_iter
-        self._lbfgs_history_size = lbfgs_history_size
-        self._lbfgs_tolerance = lbfgs_tolerance
-        self._lbfgs_line_search = lbfgs_line_search
-        
-        # Store SOAP parameters
-        old_soap_params = getattr(self, '_soap_params', None)
-        self._soap_params = soap_params if soap_params is not None else {}
-        
-        if train_samples is not None:
-            self.train_samples.update(train_samples)
-        if test_samples is not None:
-            self.test_samples.update(test_samples)
-        if weights is not None:
-            self.weights.update(weights)
+        if problem is not None:
+            for _term, _cfg in problem.items():
+                if not isinstance(_cfg, dict):
+                    raise ValueError(
+                        f"compile(problem={{...}}) values must be dicts, "
+                        f"got {type(_cfg).__name__!r} for term {_term!r}. "
+                        "Expected e.g. {'train': 1000, 'test': 500, 'weight': 1.0}"
+                    )
+                if 'train' in _cfg:
+                    self.train_samples[_term] = _cfg['train']
+                if 'test' in _cfg:
+                    self.test_samples[_term] = _cfg['test']
+                if 'weight' in _cfg:
+                    self.weights[_term] = _cfg['weight']
+
+        # Update schedulers list FIRST so _create_optimizer can inspect it
+        new_schedulers = list(schedulers) if schedulers else []
 
         optimizer_changed = False
-        if optimizer is not None and optimizer.lower() != self.optimizer_name:
-            self.optimizer_name = optimizer.lower()
+        if optimizer is not None:
+            self._optimizer_obj = optimizer
+            self.optimizer_name = optimizer.name
             optimizer_changed = True
-        
-        if learning_rate is not None and learning_rate != self.learning_rate:
-            self.learning_rate = learning_rate
+
+        # Detect if an lr-aware scheduler presence changed (affects inject_hyperparams)
+        old_has_lr_sched = any(hasattr(s, 'lr') for s in getattr(self, '_schedulers', []))
+        new_has_lr_sched = any(hasattr(s, 'lr') for s in new_schedulers)
+        if old_has_lr_sched != new_has_lr_sched:
             optimizer_changed = True
-        
-        # Set lr_scheduler BEFORE creating optimizer (affects inject_hyperparams)
-        old_scheduler = getattr(self, '_lr_scheduler', None)
-        self._lr_scheduler = lr_scheduler
-        if (lr_scheduler is not None) != (old_scheduler is not None):
-            optimizer_changed = True  # Scheduler presence changed, rebuild optimizer
-        
-        # Check if SOAP params changed
-        if soap_params is not None and soap_params != old_soap_params:
-            optimizer_changed = True
+
+        self._schedulers = new_schedulers
 
         # Check if grad_clip changed
         old_grad_clip = getattr(self, '_grad_clip', None)
@@ -368,37 +288,18 @@ class Trainer(_PlottingMixin):
         
         self._epochs = epochs
         self._print_each = print_each
-        self._show_plots = show_plots
-        self._save_plots = save_plots
-        self._plot_callback = plot_callback
         self._epochs_by_time_step = epochs_by_time_step
-        self._plot_kwargs = plot_kwargs if plot_kwargs is not None else {}
-        self._plot_style = plot_style if plot_style is not None else {}
-        
-        if isinstance(show_subdomains, bool):
-            self._show_subdomains = {'solution': show_subdomains, 'residuals': show_subdomains, 'zoom': show_subdomains}
-        else:
-            self._show_subdomains = {'solution': False, 'residuals': False, 'zoom': False}
-            self._show_subdomains.update(show_subdomains)
-        
-        if isinstance(show_sampling_points, bool):
-            self._show_sampling_points = {'solution': show_sampling_points, 'residuals': show_sampling_points, 'zoom': show_sampling_points}
-        else:
-            self._show_sampling_points = {'solution': False, 'residuals': False, 'zoom': False}
-            self._show_sampling_points.update(show_sampling_points)
-        
-        self._plot_regions = plot_regions if plot_regions is not None else []
-        self._plot_time_points = list(plot_time_points) if plot_time_points is not None else None
-        self._plot_n_points = plot_n_points
         self._batch_size = batch_size
-        self._schedulers = list(schedulers) if schedulers else []
 
-        # Force creation of a new figure on next train() call
-        # This ensures a fresh plot in the new cell while keeping history
-        self._fig = None
-        self._axes = None
-        self._display_handle = None
-        self._colorbars = []
+        # ── Plot configuration ────────────────────────────────────────────
+        if show is not None:
+            if not isinstance(show, TrainPlotter):
+                raise TypeError(
+                    f"'show' must be a TrainPlotter instance or None, got {type(show).__name__!r}. "
+                    "Example: compile(show=TrainPlotter())"
+                )
+            show._activate(self)
+        self._plotter = show
         
         # Backend-specific hook (e.g., presampling in JAX)
         self._after_compile_hook()
@@ -1159,17 +1060,26 @@ class Trainer(_PlottingMixin):
             'epoch_times': [],
         }
         self._global_epoch = 0
-        self._fig = None
-        self._axes = None
-        self._display_handle = None
-        self._colorbars = []
+        if self._plotter is not None:
+            self._plotter._fig = None
+            self._plotter._axes = None
+            self._plotter._display_handle = None
+            self._plotter._colorbars = []
         self._compiled = False
     
     # ==================== Plotting Methods ====================
-    # (see pinns/trainer/_plotting.py — _PlottingMixin)
+    # (see pinns/trainer/_plotting.py — TrainPlotter)
 
     
     # ==================== Solution Error Computation ====================
+
+    def _is_mesh_domain(self):
+        """Return True when the problem domain is a DomainMesh."""
+        try:
+            from pinns.domain import DomainMesh as _DomainMesh
+            return isinstance(self.problem.domain, _DomainMesh)
+        except ImportError:
+            return False
 
     def _call_solution(self, x: np.ndarray) -> np.ndarray:
         """Call problem.solution with either 1-arg or 2-arg signature."""
@@ -1260,8 +1170,6 @@ class Trainer(_PlottingMixin):
     def compile(
         self,
         *args,
-        train_samples: dict = None,
-        test_samples=None,
         step_weight_exp: float = 0.0,
         schedulers: Optional[List] = None,
         **kwargs,
@@ -1271,16 +1179,14 @@ class Trainer(_PlottingMixin):
 
         Parameters
         ----------
-        train_samples : dict, optional
-            Per-component sample counts.  Currently supports:
-            ``{'time': N}`` — override the number of random time points sampled
-            per epoch when ``problem.random_time_sampling=True``.
-            ``{'pde': N}`` — mini-batch N free nodes per epoch (unbiased estimator).
-        test_samples : dict or list, optional
-            Same format as ``train_samples``.  For ``ProblemWeak``, the ``pde``
-            key is accepted and silently ignored — test metrics always evaluate
-            the full-domain weak loss for stability.  Other BC keys are forwarded
-            to the base class as usual.
+        problem : dict, optional
+            Per-term config. Keys are loss term names; values are dicts with
+            ``train`` (int), ``test`` (int), and/or ``weight`` (float/array)::
+
+                problem={
+                    "pde":    {"train": 1000, "test": 500, "weight": 1.0},
+                    "bottom": {"train": 100,  "test": 50,  "weight": 100.0},
+                }
         schedulers : list, optional
             List of Scheduler instances to use during training.
         """
@@ -1289,10 +1195,9 @@ class Trainer(_PlottingMixin):
         # sense for ProblemWeak — node batching is handled separately below.
         from pinns.problems.problem_weak import ProblemWeak as _PW
         _is_weak = isinstance(self.problem, _PW)
-        _user_wants_test = test_samples is not None
         self._step_weight_exp = float(step_weight_exp)
 
-        self._compile_base(*args, test_samples=test_samples, schedulers=schedulers, **kwargs)
+        self._compile_base(*args, schedulers=schedulers, **kwargs)
 
         # For ProblemWeak: rollout IC BCs are handled separately — no soft loss removal needed here.
         if _is_weak:
@@ -1315,7 +1220,7 @@ class Trainer(_PlottingMixin):
                     self._test_data.pop(_k, None)
                     self._test_targets.pop(_k, None)
 
-        self._train_samples = train_samples or {}
+        self._train_samples = {}
 
     def _constraint_uses_quadratic(self, constraint_name: str) -> bool:
         """Return True if a constraint keeps its quadratic penalty term."""
@@ -1342,55 +1247,12 @@ class Trainer(_PlottingMixin):
     # ==================== Optimizer ====================
     
     def _create_optimizer(self):
-        """Create the optimizer with injectable hyperparameters for LR scheduling."""
-        lr_scheduler = getattr(self, '_lr_scheduler', None)
-        grad_clip    = getattr(self, '_grad_clip', None)
-
-        def _wrap(opt):
-            """Optionally prepend gradient clipping."""
-            if grad_clip is not None:
-                return optax.chain(optax.clip_by_global_norm(grad_clip), opt)
-            return opt
-
-        if self.optimizer_name == "adam":
-            if lr_scheduler is not None:
-                return _wrap(optax.inject_hyperparams(optax.adam)(learning_rate=self.learning_rate))
-            return _wrap(optax.adam(self.learning_rate))
-        elif self.optimizer_name == "sgd":
-            if lr_scheduler is not None:
-                return _wrap(optax.inject_hyperparams(optax.sgd)(learning_rate=self.learning_rate))
-            return _wrap(optax.sgd(self.learning_rate))
-        elif self.optimizer_name == "rmsprop":
-            if lr_scheduler is not None:
-                return _wrap(optax.inject_hyperparams(optax.rmsprop)(learning_rate=self.learning_rate))
-            return _wrap(optax.rmsprop(self.learning_rate))
-        elif self.optimizer_name == "lbfgs":
-            if not HAS_JAXOPT:
-                raise ImportError(
-                    "L-BFGS requires jaxopt. Install with: pip install jaxopt"
-                )
-            # Return None - L-BFGS solver is created per training run
-            return None
-        elif self.optimizer_name == "soap":
-            if not HAS_SOAP:
-                raise ImportError(
-                    "SOAP requires soap_jax. Install with: pip install git+https://github.com/haydn-jones/SOAP_JAX"
-                )
-            # Get SOAP-specific parameters with defaults
-            soap_params = getattr(self, '_soap_params', {})
-            return soap_optimizer(
-                learning_rate=self.learning_rate,
-                b1=soap_params.get('b1', 0.95),
-                b2=soap_params.get('b2', 0.95),
-                shampoo_beta=soap_params.get('shampoo_beta', -1),
-                eps=soap_params.get('eps', 1e-8),
-                weight_decay=soap_params.get('weight_decay', 0.0),
-                precondition_frequency=soap_params.get('precondition_frequency', 10),
-                max_precond_dim=soap_params.get('max_precond_dim', 10000),
-                precondition_1d=soap_params.get('precondition_1d', False),
-            )
-        else:
-            raise ValueError(f"Unknown optimizer: {self.optimizer_name}")
+        """Create the underlying optimizer from the stored BaseOptimizer instance."""
+        has_lr_sched = any(hasattr(s, 'lr') for s in getattr(self, '_schedulers', []))
+        return self._optimizer_obj.build(
+            grad_clip=getattr(self, '_grad_clip', None),
+            lr_scheduler=has_lr_sched,
+        )
     
     def _init_optimizer_state(self):
         """Initialize optax optimizer state."""
@@ -1622,14 +1484,19 @@ class Trainer(_PlottingMixin):
 
     # ==================== JIT Training Step ====================
     
-    def _make_compute_loss_fn(self, weights, params_dict):
-        """Build ``compute_loss(params, train_data, targets_dict)`` closure.
+    def _make_compute_loss_fn(self, weights, params_dict, schedulers=None):
+        """Build ``compute_loss(params, train_data, targets_dict, scheduler_states)`` closure.
 
         Both ``ProblemStrong`` and ``ProblemWeak`` expose the same interface:
         ``make_residual_fn(network)`` → ``fn(params, data)``.  A single unified
         branch handles both; the only problem-type-specific side-effect is
         storing ``_weak_loss_fn`` / ``_weak_residual_fn`` on ``self`` so that
         ``_compute_total_loss_batched`` can use them for logging.
+
+        The optional ``scheduler_states`` argument is a dict ``{idx: state}``
+        produced by ``Scheduler.get_jit_state()`` for each scheduler.  It must
+        be passed as an explicit JIT argument (not captured) so that per-epoch
+        updates to arrays like Lagrange multipliers are picked up correctly.
 
         Returns ``(compute_loss, pde_accepts_derivative=True)``.
         """
@@ -1639,8 +1506,9 @@ class Trainer(_PlottingMixin):
         _net_losses = list(getattr(self.network, 'network_losses', []))
         _residual_fn = self.problem.make_residual_fn(self.network)
         self._residual_fn = _residual_fn
+        _schedulers = list(schedulers) if schedulers else []
 
-        def compute_loss(params, train_data, targets_dict):
+        def compute_loss(params, train_data, targets_dict, scheduler_states=None):
             residuals  = _residual_fn(params, train_data)
             total_loss = jnp.array(0.0)
             for name, R in residuals.items():
@@ -1651,6 +1519,12 @@ class Trainer(_PlottingMixin):
                     total_loss = (total_loss
                                   + _weights.get(nloss.name, nloss.weight)
                                   * nloss.fn(params, x_nl))
+            # Scheduler extra-loss contributions (e.g. Lagrange terms λᵀr)
+            if scheduler_states:
+                for idx, s in enumerate(_schedulers):
+                    s_state = scheduler_states.get(idx, {})
+                    if s_state:
+                        total_loss = total_loss + s.extra_loss(residuals, s_state)
             return total_loss
 
         return compute_loss, True
@@ -1658,19 +1532,28 @@ class Trainer(_PlottingMixin):
     # ==================== Solution error (rollout override) ====================
 
     def _make_jit_train_step(self, weights, params_dict):
-        """Create JIT-compiled Adam training step, built on the shared compute_loss core."""
-        compute_loss, pde_accepts_derivative = self._make_compute_loss_fn(weights, params_dict)
+        """Create JIT-compiled Adam training step, built on the shared compute_loss core.
+
+        The compiled ``train_step`` accepts ``scheduler_states`` as an explicit
+        argument so that per-epoch JAX-array updates (e.g. Lagrange multipliers)
+        are reflected without recompilation.
+        """
+        _schedulers = list(getattr(self, '_schedulers', []))
+        compute_loss, pde_accepts_derivative = self._make_compute_loss_fn(
+            weights, params_dict, schedulers=_schedulers)
         optim = self.optimizer
         if pde_accepts_derivative:
             @jax.jit
-            def train_step(params, opt_state, train_data, targets_dict):
-                loss, grads = jax.value_and_grad(compute_loss)(params, train_data, targets_dict)
+            def train_step(params, opt_state, train_data, targets_dict, scheduler_states):
+                loss, grads = jax.value_and_grad(compute_loss)(
+                    params, train_data, targets_dict, scheduler_states)
                 updates, new_opt_state = optim.update(grads, opt_state, params)
                 new_params = optax.apply_updates(params, updates)
                 return new_params, new_opt_state, loss
             return train_step, True, False
         else:
-            grad_fn = jax.value_and_grad(compute_loss)
+            grad_fn = jax.value_and_grad(
+                lambda p, td, tgt, ss: compute_loss(p, td, tgt, ss))
             @jax.jit
             def apply_updates(params, grads, opt_state):
                 updates, new_opt_state = optim.update(grads, opt_state, params)
@@ -1787,18 +1670,19 @@ class Trainer(_PlottingMixin):
                 next_num = 0
             auto_save_path = f'./pinn_progress_{next_num}.png'
 
-        if show_plots:
-            n_zoom_regions = len(getattr(self, '_plot_regions', []))
-            needs_recreation = self._fig is None
-            if not needs_recreation and self._axes is not None and n_zoom_regions > 0:
-                if 'zoom_0_0' not in self._axes:
+        if show_plots and self._plotter is not None:
+            p = self._plotter
+            n_zoom_regions = len(p.regions)
+            needs_recreation = p._fig is None
+            if not needs_recreation and p._axes is not None and n_zoom_regions > 0:
+                if 'zoom_0_0' not in p._axes:
                     needs_recreation = True
             if needs_recreation:
-                self._fig, self._axes = self._create_figure()
-            _, _, self._display_handle = self.plot_progress(
-                save_path=None, n_points=self._plot_n_points,
-                fig=self._fig, axes=self._axes,
-                display_handle=self._display_handle
+                p._fig, p._axes = p._create_figure()
+            _, _, p._display_handle = p.plot_progress(
+                save_path=None, n_points=p.n_points,
+                fig=p._fig, axes=p._axes,
+                display_handle=p._display_handle
             )
         return auto_save_path
 
@@ -1878,11 +1762,213 @@ class Trainer(_PlottingMixin):
                 plot_path = auto_save_path
             else:
                 plot_path = None
-            _, _, self._display_handle = self.plot_progress(
-                save_path=plot_path, n_points=self._plot_n_points,
-                fig=self._fig, axes=self._axes,
-                display_handle=self._display_handle
+            if self._plotter is not None:
+                _, _, self._plotter._display_handle = self._plotter.plot_progress(
+                    save_path=plot_path, n_points=self._plotter.n_points,
+                    fig=self._plotter._fig, axes=self._plotter._axes,
+                    display_handle=self._plotter._display_handle
+                )
+
+    # ==================== Public Scheduler / User API ====================
+
+    def resample(self, term: Optional[str] = None, kind: str = "train", n: Optional[int] = None):
+        """Resample training or test points.
+
+        Parameters
+        ----------
+        term : str or None
+            Name of the loss term to resample.  ``None`` resamples all terms.
+        kind : ``"train"`` | ``"test"``
+            Which data split to resample.
+        n : int or None
+            Number of points.  ``None`` keeps the current count.
+        """
+        kind = kind.lower()
+        if kind not in ("train", "test"):
+            raise ValueError(f"kind must be 'train' or 'test', got {kind!r}")
+
+        data_dict    = self._train_data    if kind == "train" else self._test_data
+        target_dict  = self._train_targets if kind == "train" else self._test_targets
+        samples_dict = self.train_samples  if kind == "train" else self.test_samples
+
+        def _resample_one(name):
+            current_n = samples_dict.get(name, 0)
+            new_n = n if n is not None else current_n
+            if new_n <= 0:
+                return
+            new_n = int(new_n)
+            samples_dict[name] = new_n
+            np_data = self._sample_points_np(name, new_n)
+            data_dict[name] = self._to_tensor(np_data)
+            # Recompute targets for BCs with callable values
+            bc = self._get_bc_by_name(name)
+            if bc is not None and callable(getattr(bc, 'value', None)):
+                params = self._build_params()
+                target_np = bc.value(np_data, params)
+                target_dict[name] = self._to_tensor(np.atleast_2d(target_np).T
+                                                    if target_np.ndim == 1
+                                                    else target_np)
+
+        if term is None:
+            for name in list(samples_dict.keys()):
+                _resample_one(name)
+        else:
+            _resample_one(term)
+
+    def add_samples(self, term: str, points: np.ndarray, targets=None, kind: str = "train"):
+        """Append extra points to an existing term's data tensors.
+
+        Parameters
+        ----------
+        term : str
+            Name of the loss term.
+        points : np.ndarray
+            New collocation points, shape ``(N, n_inputs)``.
+        targets : np.ndarray or None
+            Corresponding target values (for supervised BCs).
+        kind : ``"train"`` | ``"test"``
+        """
+        kind = kind.lower()
+        data_dict   = self._train_data    if kind == "train" else self._test_data
+        target_dict = self._train_targets if kind == "train" else self._test_targets
+
+        new_tensor = self._to_tensor(np.asarray(points, dtype=np.float32))
+        if term in data_dict:
+            import jax.numpy as _jnp
+            data_dict[term] = _jnp.concatenate([data_dict[term], new_tensor], axis=0)
+        else:
+            data_dict[term] = new_tensor
+
+        if targets is not None:
+            t_arr = np.asarray(targets, dtype=np.float32)
+            new_t = self._to_tensor(t_arr)
+            if term in target_dict:
+                import jax.numpy as _jnp
+                target_dict[term] = _jnp.concatenate([target_dict[term], new_t], axis=0)
+            else:
+                target_dict[term] = new_t
+
+        # Keep sample count in sync
+        samples = self.train_samples if kind == "train" else self.test_samples
+        samples[term] = int(len(data_dict[term]))
+
+    def eval_residuals(self, points: np.ndarray) -> np.ndarray:
+        """Evaluate the PDE residual magnitude at given points.
+
+        Parameters
+        ----------
+        points : np.ndarray, shape ``(N, n_inputs)``
+
+        Returns
+        -------
+        np.ndarray, shape ``(N,)`` — mean absolute residual across outputs.
+        """
+        residuals = self._compute_residuals(np.asarray(points, dtype=np.float32))
+        # residuals is a list of arrays (one per output) or a single array
+        if isinstance(residuals, (list, tuple)):
+            return np.mean(np.stack([np.abs(r).flatten() for r in residuals], axis=1), axis=1)
+        return np.abs(np.asarray(residuals)).mean(axis=-1).flatten()
+
+    def eval_term_residuals(self, term: str) -> np.ndarray:
+        """Return the raw residual vector for *term* at current training points.
+
+        Uses the same ``_residual_fn`` closure built by ``_make_compute_loss_fn``
+        so the result is consistent with what enters the JIT training step.
+
+        Parameters
+        ----------
+        term : str
+            Loss-term name (e.g. ``'pde'``, ``'boundary_up'``).
+
+        Returns
+        -------
+        np.ndarray, shape ``(N,)`` – signed residual values ``r_k``.
+        """
+        if not hasattr(self, '_residual_fn') or self._residual_fn is None:
+            raise RuntimeError(
+                "eval_term_residuals() called before compile(). "
+                "Call trainer.compile() first."
             )
+        residuals_dict = self._residual_fn(self.network.params, self._train_data)
+        if term not in residuals_dict:
+            raise KeyError(
+                f"Term {term!r} not found in residuals. "
+                f"Available: {list(residuals_dict.keys())}"
+            )
+        return np.asarray(residuals_dict[term]).flatten()
+
+    def set_weights(self, weights: Dict[str, float]):
+        """Update loss weights for one or more terms.
+
+        Parameters
+        ----------
+        weights : dict[str, float]
+            Mapping of term name → new weight.  Unspecified terms are unchanged.
+        """
+        self.weights.update(weights)
+
+    def set_learning_rate(self, lr: float):
+        """Update the optimizer learning rate in-place.
+
+        Parameters
+        ----------
+        lr : float
+            New learning rate.
+        """
+        self._optimizer_obj.learning_rate = float(lr)
+        if hasattr(self.opt_state, 'hyperparams') and 'learning_rate' in self.opt_state.hyperparams:
+            new_hp = dict(self.opt_state.hyperparams)
+            new_hp['learning_rate'] = float(lr)
+            self.opt_state = self.opt_state._replace(hyperparams=new_hp)
+
+    # ── Getters ───────────────────────────────────────────────────────────
+
+    def get_epoch(self) -> int:
+        """Return the number of epochs completed in the current ``train()`` call.
+
+        Returns 0 when called outside of training.
+        """
+        return getattr(self, '_current_epoch', 0)
+
+    def get_global_epoch(self) -> int:
+        """Return total epochs trained across all ``train()`` calls."""
+        return self._global_epoch
+
+    def get_time(self) -> float:
+        """Return total wall-clock training time in seconds (sum of epoch times)."""
+        times = self.history.get('epoch_times', [])
+        return float(sum(times))
+
+    def get_samples(self, term: str, kind: str = "train") -> np.ndarray:
+        """Return current collocation points for a term as a NumPy array.
+
+        Parameters
+        ----------
+        term : str
+        kind : ``"train"`` | ``"test"``
+        """
+        kind = kind.lower()
+        data_dict = self._train_data if kind == "train" else self._test_data
+        if term not in data_dict:
+            raise KeyError(f"No {kind!r} data for term {term!r}. "
+                           f"Available: {list(data_dict.keys())}")
+        return self._to_numpy(data_dict[term])
+
+    def get_optimizer(self):
+        """Return the current :class:`~pinns.BaseOptimizer` instance."""
+        return self._optimizer_obj
+
+    def get_learning_rate(self) -> float:
+        """Return the current learning rate."""
+        return self._optimizer_obj.learning_rate
+
+    def get_loss_history(self) -> Dict:
+        """Return the full training history dict.
+
+        Keys include ``'epoch'``, ``'loss'``, ``'train_loss'``, ``'test_loss'``,
+        ``'loss_pde'``, ``'loss_bcs'``, ``'solution_error'``, ``'epoch_times'``.
+        """
+        return dict(self.history)
 
     # ==================== Training ====================
 
@@ -1895,12 +1981,6 @@ class Trainer(_PlottingMixin):
                 u_x = derivative(U, X, 0, (0,))
                 ...
         """
-        from .schedulers.scheduler_lagrange import SchedulerLagrange as _SLag
-        _lag = next((s for s in getattr(self, '_schedulers', []) if isinstance(s, _SLag)), None)
-        if _lag is not None:
-            _lag.run_training(self)
-            return
-
         # ── Time-step curriculum (BPTT rollout mode only) ────────────────
         # If epochs_by_time_step is set, run progressive stages:
         #   stage 1 → unroll 1 step  for epochs_by_time_step epochs
@@ -1971,8 +2051,8 @@ class Trainer(_PlottingMixin):
 
         epochs = self._epochs
         print_each = self._print_each
-        show_plots = self._show_plots
-        save_plots = self._save_plots
+        show_plots = self._plotter is not None
+        save_plots = self._plotter.save if self._plotter else None
         
         params_dict = self._build_params()
         weights = self.weights
@@ -2014,9 +2094,6 @@ class Trainer(_PlottingMixin):
         # Initialize RNG key for shuffling
         shuffle_key = jax.random.PRNGKey(self.rng.integers(0, 2**31))
 
-        # Learning rate scheduler
-        lr_scheduler = getattr(self, '_lr_scheduler', None)
-        
         # Print epoch 0 (before any training)
         if print_each > 0:
             metrics_batch_size = self._batch_size if self._batch_size and self._batch_size > 0 else 1000
@@ -2033,23 +2110,22 @@ class Trainer(_PlottingMixin):
                 do_plot=False,
             )
         
+        self._current_epoch = 0
         for epoch in range(epochs):
+            self._current_epoch = epoch
             epoch_start = time.time()
             global_epoch = start_epoch + epoch
 
-            # Scheduler on_epoch_start hooks (resample, adaptive, curriculum, etc.)
+            # Scheduler on_epoch_start hooks (resample, adaptive, curriculum, lr, etc.)
             for _s in getattr(self, '_schedulers', []):
                 _s.on_epoch_start(self, epoch)
 
-            # Update learning rate if scheduler is provided
-            # Skip for SOAP (has its own LR handling) and L-BFGS
-            if lr_scheduler is not None and self.optimizer_name not in ("lbfgs", "soap"):
-                new_lr = lr_scheduler.lr(self.learning_rate, global_epoch)
-                if hasattr(self.opt_state, 'hyperparams'):
-                    new_hyperparams = dict(self.opt_state.hyperparams)
-                    new_hyperparams['learning_rate'] = new_lr
-                    self.opt_state = self.opt_state._replace(hyperparams=new_hyperparams)
-            
+            # Collect per-scheduler JIT states (e.g. Lagrange multipliers)
+            _sched_states = {
+                i: s.get_jit_state()
+                for i, s in enumerate(getattr(self, '_schedulers', []))
+            }
+
             # ── Rollout face mini-batching: sample fresh indices each epoch ──────────
             _rfb = getattr(self, '_rollout_face_batch', None)
             _rnf = getattr(self, '_rollout_n_faces', None)
@@ -2132,10 +2208,11 @@ class Trainer(_PlottingMixin):
                     
                     if is_full_jit:
                         self.network.params, self.opt_state, loss = train_step(
-                                self.network.params, self.opt_state, batch_data, batch_targets
+                                self.network.params, self.opt_state, batch_data, batch_targets,
+                                _sched_states,
                             )
                     else:
-                        loss, grads = grad_fn(self.network.params, batch_data, batch_targets)
+                        loss, grads = grad_fn(self.network.params, batch_data, batch_targets, _sched_states)
                         self.network.params, self.opt_state = apply_updates(self.network.params, grads, self.opt_state)
                     
                     epoch_loss += float(loss)
@@ -2157,19 +2234,20 @@ class Trainer(_PlottingMixin):
                         self._rollout_lambdas = self._rollout_lambdas + self.lagrange_lr * _step_res
                     else:
                         self.network.params, self.opt_state, loss = train_step(
-                                self.network.params, self.opt_state, self._train_data, train_targets
+                                self.network.params, self.opt_state, self._train_data, train_targets,
+                                _sched_states,
                             )
                 else:
-                    loss, grads = grad_fn(self.network.params, self._train_data, train_targets)
+                    loss, grads = grad_fn(self.network.params, self._train_data, train_targets, _sched_states)
                     self.network.params, self.opt_state = apply_updates(self.network.params, grads, self.opt_state)
             
             epoch_time = time.time() - epoch_start
             self.history['epoch_times'].append(epoch_time)
-            
-            # Update ReduceLROnPlateau scheduler with current loss
-            if lr_scheduler is not None and hasattr(lr_scheduler, 'step'):
-                lr_scheduler.step(float(loss), global_epoch)
-            
+
+            # Scheduler on_epoch_end hooks (lr plateau detection, etc.)
+            for _s in getattr(self, '_schedulers', []):
+                _s.on_epoch_end(self, epoch, float(loss))
+
             if print_each > 0 and ((global_epoch + 1) % print_each == 0 or epoch == epochs - 1):
                 elapsed = time.time() - start_time
                 metrics_batch_size = self._batch_size if self._batch_size and self._batch_size > 0 else 1000
@@ -2182,8 +2260,8 @@ class Trainer(_PlottingMixin):
                     global_epoch, global_epoch + 1, _ep_total, None, elapsed,
                     weights, params_dict, show_plots, save_plots, auto_save_path,
                     metrics_batch_size=metrics_batch_size, stage_prefix=_stage_pfx,
-                    callback=getattr(self, '_plot_callback', None),
-                )
+callback=self._plotter.callback if self._plotter else None,
+            )
         
         self._global_epoch += epochs
         if not getattr(self, '_curriculum_running', False):
@@ -2193,8 +2271,8 @@ class Trainer(_PlottingMixin):
         self._curriculum_restore()
         
         # Close figure to prevent duplicate display in notebooks
-        if is_notebook() and show_plots and self._fig is not None:
-            plt.close(self._fig)
+        if is_notebook() and show_plots and self._plotter is not None and self._plotter._fig is not None:
+            plt.close(self._plotter._fig)
 
     def _curriculum_restore(self):
         """Clear per-stage display attributes after a stage's train() call ends."""
@@ -2216,10 +2294,11 @@ class Trainer(_PlottingMixin):
         # Build the loss function for L-BFGS
         compute_loss = self._make_lbfgs_loss_fn(weights, params_dict)
         
-        # Get L-BFGS parameters from compile()
-        max_iter = getattr(self, '_lbfgs_max_iter', 5)
-        history_size = getattr(self, '_lbfgs_history_size', 50)
-        tolerance = getattr(self, '_lbfgs_tolerance', 1e-9)
+        # Get L-BFGS parameters from the optimizer instance
+        _lbfgs_obj = self._optimizer_obj
+        max_iter = getattr(_lbfgs_obj, 'max_iter', 5)
+        history_size = getattr(_lbfgs_obj, 'history_size', 50)
+        tolerance = getattr(_lbfgs_obj, 'tol', 1e-9)
         
         # Create L-BFGS solver
         solver = jaxopt.LBFGS(
@@ -2248,7 +2327,9 @@ class Trainer(_PlottingMixin):
                 do_plot=False,
             )
         
+        self._current_epoch = 0
         for epoch in range(epochs):
+            self._current_epoch = epoch
             epoch_start = time.time()
             global_epoch = start_epoch + epoch
             
@@ -2272,8 +2353,8 @@ class Trainer(_PlottingMixin):
         print(f"L-BFGS training complete in {time.time() - start_time:.1f}s")
         
         # Close figure to prevent duplicate display in notebooks
-        if is_notebook() and show_plots and self._fig is not None:
-            plt.close(self._fig)
+        if is_notebook() and show_plots and self._plotter is not None and self._plotter._fig is not None:
+            plt.close(self._plotter._fig)
 
     def _make_lbfgs_loss_fn(self, weights, params_dict):
         """Create loss function for L-BFGS: thin wrapper around _make_compute_loss_fn."""

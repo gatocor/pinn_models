@@ -50,7 +50,14 @@ from .models.layers.laplacian import LaplacianFeatures
 from .functional import derivative, gradient, laplacian, divergence
 
 # Training
-from .trainer import Trainer, LRScheduler, ExponentialDecay, ReduceLROnPlateau
+from .trainer import (Trainer, TrainPlotter,
+                      Scheduler, is_notebook,
+                      SchedulerExponentialDecay, SchedulerReduceLROnPlateau,
+                      SchedulerResample, SchedulerAdaptiveResample,
+                      SchedulerCurriculum, SchedulerLagrange,
+                      BaseOptimizer,
+                      AdamOptimizer, AdamWOptimizer, SGDOptimizer, RMSPropOptimizer,
+                      LionOptimizer, LBFGSOptimizer, SOAPOptimizer)
 
 __all__ = [
     "__version__",
@@ -70,6 +77,12 @@ __all__ = [
     "PartitionFB", "PartitionX", "StepperStep", "StepperDt", "register_interface_loss",
     "ProblemStrong", "ProblemWeak",
     "derivative", "gradient", "laplacian", "divergence",
-    "Trainer",
-    "LRScheduler", "ExponentialDecay", "ReduceLROnPlateau",
+    "Trainer", "TrainPlotter",
+    "Scheduler", "is_notebook",
+    "SchedulerExponentialDecay", "SchedulerReduceLROnPlateau",
+    "SchedulerResample", "SchedulerAdaptiveResample",
+    "SchedulerCurriculum", "SchedulerLagrange",
+    "BaseOptimizer",
+    "AdamOptimizer", "AdamWOptimizer", "SGDOptimizer", "RMSPropOptimizer",
+    "LionOptimizer", "LBFGSOptimizer", "SOAPOptimizer",
 ]

@@ -2,10 +2,10 @@
 Exponential decay learning rate scheduler.
 """
 
-from .base import LRScheduler
+from .scheduler_base import Scheduler
 
 
-class ExponentialDecay(LRScheduler):
+class SchedulerExponentialDecay(Scheduler):
     """
     Exponential decay learning rate scheduler.
     
@@ -59,4 +59,4 @@ class ExponentialDecay(LRScheduler):
         return base_lr * (self.gamma ** decay_count)
 
 
-__all__ = ["ExponentialDecay"]
+__all__ = ["SchedulerExponentialDecay"]

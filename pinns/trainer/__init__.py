@@ -3,15 +3,29 @@ Trainer package for PINN training.
 """
 
 from .trainer import Trainer
+from ._plotting import TrainPlotter
 from .schedulers import (
-    LRScheduler, ExponentialDecay, ReduceLROnPlateau,
-    Scheduler, SchedulerResample, SchedulerAdaptiveResample,
+    Scheduler, is_notebook,
+    SchedulerExponentialDecay, SchedulerReduceLROnPlateau,
+    SchedulerResample, SchedulerAdaptiveResample,
     SchedulerCurriculum, SchedulerLagrange,
+)
+from .optimizers import (
+    BaseOptimizer,
+    AdamOptimizer, AdamWOptimizer, SGDOptimizer, RMSPropOptimizer, LionOptimizer,
+    LBFGSOptimizer, SOAPOptimizer,
+    OPTIMIZER_REGISTRY, get_optimizer_class, build_optimizer,
 )
 
 __all__ = [
     "Trainer",
-    "LRScheduler", "ExponentialDecay", "ReduceLROnPlateau",
-    "Scheduler", "SchedulerResample", "SchedulerAdaptiveResample",
+    "TrainPlotter",
+    "Scheduler", "is_notebook",
+    "SchedulerExponentialDecay", "SchedulerReduceLROnPlateau",
+    "SchedulerResample", "SchedulerAdaptiveResample",
     "SchedulerCurriculum", "SchedulerLagrange",
+    "BaseOptimizer",
+    "AdamOptimizer", "AdamWOptimizer", "SGDOptimizer", "RMSPropOptimizer", "LionOptimizer",
+    "LBFGSOptimizer", "SOAPOptimizer",
+    "OPTIMIZER_REGISTRY", "get_optimizer_class", "build_optimizer",
 ]
