@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union, Literal, Tuple, Lis
 from dataclasses import dataclass
 
 if TYPE_CHECKING:
-    from ..terms import TermDirichletBC, TermNeumannBC, TermRobinBC, TermPoints
+    from ..problems.terms import TermDirichletBC, TermNeumannBC, TermRobinBC, TermPoints
 
 # ============================================================================
 # Subdomain info class for easy filtering
@@ -461,6 +461,7 @@ class DomainCubic:
         # _boundary_regions: name → {'fixed_dim', 'fixed_val', 'lo', 'hi'}
         self._inner_regions: dict = {}
         self._boundary_regions: dict = {}
+        self._periodic_regions: dict = {}
 
     @property
     def has_time(self) -> bool:
@@ -828,6 +829,17 @@ class DomainCubic:
                     return self._sample_face(
                         n_points, dim, side, rng, method, transform, params)
             raise ValueError(f"_parse_boundary_str returned no fixed dim for {region!r}")
+
+        # ── periodic region: return stacked pair (side A then side B) ─────
+        if isinstance(region, str) and region in self._periodic_regions:
+            _pr = self._periodic_regions[region]
+            x_a = self.sample_boundary(n_points, region=_pr['region_a'],
+                                       rng=rng, method=method,
+                                       transform=transform, params=params)
+            x_b = self.sample_boundary(n_points, region=_pr['region_b'],
+                                       rng=rng, method=method,
+                                       transform=transform, params=params)
+            return np.concatenate([x_a, x_b], axis=0)
 
         # ── single named custom region ────────────────────────────────────
         if isinstance(region, str):
@@ -1355,6 +1367,40 @@ class DomainCubic:
             'hi': hi,
         }
 
+    # Mapping from axis name to spatial dimension index
+    _AXIS_DIM: dict = {'x': 0, 'y': 1, 'z': 2, 'x4': 3, 'x5': 4}
+
+    def add_periodic(self, axis: str, name: str) -> None:
+        """Register a **periodic** boundary pairing along a coordinate axis.
+
+        Samples along ``axis_min`` and ``axis_max`` faces are paired for
+        periodicity enforcement.  The pairing is stored in
+        ``domain._periodic_regions[name]`` and can be referenced from
+        :meth:`~pinns.problems.BaseProblem.add_periodic`.
+
+        Args:
+            axis: Spatial axis to enforce periodicity on.  One of
+                ``'x'``, ``'y'``, ``'z'``, or ``'t'``.
+            name: String label stored in ``_periodic_regions``.
+
+        Raises:
+            ValueError: If *axis* is not recognised.
+
+        Example::
+
+            domain.add_periodic('x', name='per_x')
+        """
+        _AXIS_LABELS = {'x': 0, 'y': 1, 'z': 2, 'x4': 3, 'x5': 4, 't': -1}
+        if axis not in _AXIS_LABELS:
+            raise ValueError(
+                f"add_periodic: axis {axis!r} not recognised. "
+                f"Choose from {list(_AXIS_LABELS)}.")
+        self._periodic_regions[name] = {
+            'region_a': f'{axis}min',
+            'region_b': f'{axis}max',
+            'axis':     axis,
+        }
+
     def contains(self, x):
         """
         Test whether points lie inside the domain (inclusive bounds).
@@ -1451,6 +1497,55 @@ class DomainCubic:
         else:
             dim = int(dim_or_t)
         return (dim, 1 if side == 1 else -1)
+
+    def get_boundary_normals(self, x: 'np.ndarray', region: str) -> 'np.ndarray':
+        """Return outward unit normals at *x* for the given boundary *region*.
+
+        For :class:`DomainCubic` every registered boundary region is an
+        axis-aligned face, so the normal is **constant** and is simply
+        broadcast to all *n* points.
+
+        Args:
+            x:      Query coordinates, shape ``(n, n_dims)``.
+            region: Built-in face label (e.g. ``'xmin'``, ``'left'``) or a
+                    custom region name registered with :meth:`add_boundary`.
+
+        Returns:
+            ``np.ndarray`` of shape ``(n, n_spatial_dims)`` with the outward
+            unit normal replicated for every point.
+
+        Raises:
+            KeyError: If *region* is not recognised.
+        """
+        n = len(x)
+        n_spatial = self._spatial_dims
+
+        # 1) Built-in face label
+        face_info = self.get_face_normal_direction(region)
+        if face_info is not None:
+            dim, sign = face_info
+            dim = min(dim, n_spatial - 1)   # clamp time dim index
+            normal = np.zeros(n_spatial, dtype=np.float32)
+            normal[dim] = float(sign)
+            return np.broadcast_to(normal, (n, n_spatial)).copy()
+
+        # 2) Custom registered region (also axis-aligned)
+        if region in self._boundary_regions:
+            reg = self._boundary_regions[region]
+            fixed_dim = reg['fixed_dim']
+            fixed_val = float(reg['fixed_val'])
+            sign = (+1.0 if abs(fixed_val - float(self.xmax[fixed_dim]))
+                         < abs(fixed_val - float(self.xmin[fixed_dim]))
+                    else -1.0)
+            normal = np.zeros(n_spatial, dtype=np.float32)
+            normal[fixed_dim] = sign
+            return np.broadcast_to(normal, (n, n_spatial)).copy()
+
+        raise KeyError(
+            f"Unknown boundary region '{region}'. "
+            f"Built-in: {list(self._BOUNDARY_LABEL_MAP)}  "
+            f"Custom: {list(self._boundary_regions)}"
+        )
 
     def _validate_subspace(self, boundary: Tuple, subspace, name: str) -> None:
         """Validate that all (lo, hi) ranges in *subspace* lie within the domain.

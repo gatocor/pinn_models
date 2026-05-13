@@ -340,29 +340,6 @@ def _build_mesh_arrays(verts: np.ndarray, faces: np.ndarray):
     return edge_src, edge_dst, edge_weights, nodes_norm_jnp
 
 
-def _build_bc_arrays(domain, n_nodes: int, n_outputs: int, verts: np.ndarray):
-    """Build hard-BC mask and value arrays from domain Dirichlet BCs."""
-    bc_mask   = np.zeros((n_nodes, n_outputs), dtype=np.float32)
-    bc_values = np.zeros((n_nodes, n_outputs), dtype=np.float32)
-    from pinns.terms import TermMeshNodeBC
-    for bc in getattr(domain, 'boundary_conditions', []):
-        if not (isinstance(bc, TermMeshNodeBC) and bc.bc_type == 'dirichlet'):
-            continue
-        t_mode = getattr(bc, 't_mode', None)
-        if t_mode not in (None, 'all'):
-            continue
-        comp = bc.component
-        if comp >= n_outputs:
-            continue
-        node_idx = (np.unique(bc.node_indices) if bc.node_indices is not None
-                    else np.unique(bc.edges))
-        node_pos = verts[node_idx]
-        vals = bc.get_value(node_pos)
-        bc_mask[node_idx, comp]   = 1.0
-        bc_values[node_idx, comp] = vals
-    return jnp.array(bc_mask, dtype=jnp.float32), jnp.array(bc_values, dtype=jnp.float32)
-
-
 def _query_context_to_nodes(
     ctx_query: jnp.ndarray,   # (n_query, n_ctx)
     x_spatial: jnp.ndarray,   # (n_query, 2)

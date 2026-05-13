@@ -1,0 +1,1569 @@
+"""
+Plotting mixin for Trainer.
+
+All region-parsing, figure creation, and plot_progress logic lives here
+so that trainer.py can focus on the training loop and loss computation.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.tri as mtri
+from typing import Dict, List, Optional
+
+from .schedulers import is_notebook
+
+
+class _PlottingMixin:
+    """Mixin that provides all plotting methods for Trainer.
+
+    Assumes *self* has the following attributes (provided by Trainer):
+        problem, network, history, rng, train_samples,
+        _fig, _axes, _colorbars, _display_handle, _plot_kwargs, _plot_time_points,
+        predict(), _build_params(), _compute_residuals(), _evaluate_observables(),
+        _sample_bc_np(), _get_{input,output,bc_plot}_name(), _get_colormap(),
+        _call_solution(), _get_bc_plot_names()
+    """
+
+    # ==================== Region Parsing ====================
+    
+    def _parse_region_nd(self, region):
+        """Parse an N-dimensional region specification.
+        
+        Args:
+            region: Tuple with one element per dimension. Each element can be:
+                - None: use full range for this dimension (free dimension)
+                - (min, max): range for this dimension (free dimension, zoomed)
+                - scalar: fix this dimension at that value (sliced dimension)
+                
+        Returns:
+            tuple: (free_dims, free_ranges, fixed_dims, fixed_values)
+        """
+        n_dims = self.problem.n_dims
+        
+        if region is None:
+            region = [None] * n_dims
+        
+        free_dims = []
+        free_ranges = []
+        fixed_dims = []
+        fixed_values = []
+        
+        for i, spec in enumerate(region):
+            if spec is None:
+                free_dims.append(i)
+                free_ranges.append((self.problem.xmin[i], self.problem.xmax[i]))
+            elif isinstance(spec, (list, tuple)) and len(spec) == 2:
+                free_dims.append(i)
+                free_ranges.append((spec[0], spec[1]))
+            else:
+                fixed_dims.append(i)
+                fixed_values.append(float(spec))
+        
+        return free_dims, free_ranges, fixed_dims, fixed_values
+    
+    # ==================== Plotting Methods ====================
+    
+    def _clear_colorbars(self):
+        """Remove all stored colorbars."""
+        if hasattr(self, '_colorbars'):
+            for cbar in self._colorbars:
+                try:
+                    cbar.remove()
+                except:
+                    pass
+        self._colorbars = []
+    
+    def _apply_plot_kwargs(self, ax, key: str):
+        """Apply user-supplied plot_kwargs for *key* to *ax* via ax.set()."""
+        _IMSHOW_KEYS = {'norm', 'cmap', 'vmin', 'vmax', 'alpha', 'interpolation'}
+        kwargs = {k: v for k, v in getattr(self, '_plot_kwargs', {}).get(key, {}).items()
+                  if k not in _IMSHOW_KEYS}
+        if kwargs:
+            ax.set(**kwargs)
+
+    def _get_imshow_kwargs(self, key: str) -> dict:
+        """Return imshow-specific kwargs (norm, cmap, vmin, vmax, …) from plot_kwargs[key]."""
+        _IMSHOW_KEYS = {'norm', 'cmap', 'vmin', 'vmax', 'alpha', 'interpolation'}
+        return {k: v for k, v in getattr(self, '_plot_kwargs', {}).get(key, {}).items()
+                if k in _IMSHOW_KEYS}
+
+    def _apply_plot_style(self, fig, axes: dict):
+        """Apply plot_style settings (theme, bg_color, fig_color, text_color) to fig/axes."""
+        style = getattr(self, '_plot_style', {})
+        if not style:
+            return
+
+        theme = style.get('theme', 'light')
+        if theme == 'dark':
+            default_bg   = '#1a1a2e'
+            default_fig  = '#0f0f1a'
+            default_text = 'white'
+            default_grid = '#444466'
+        else:
+            default_bg   = 'white'
+            default_fig  = '#f8f8f8'
+            default_text = 'black'
+            default_grid = '#cccccc'
+
+        bg_color   = style.get('bg_color',   default_bg)
+        fig_color  = style.get('fig_color',  default_fig)
+        text_color = style.get('text_color', default_text)
+        grid_color = style.get('grid_color', default_grid)
+
+        fig.patch.set_facecolor(fig_color)
+
+        for ax in axes.values():
+            ax.set_facecolor(bg_color)
+            ax.tick_params(colors=text_color)
+            ax.xaxis.label.set_color(text_color)
+            ax.yaxis.label.set_color(text_color)
+            ax.title.set_color(text_color)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(text_color)
+            # Recolor existing gridlines
+            ax.grid(True, color=grid_color, alpha=0.4)
+            # Recolor legend text if present
+            legend = ax.get_legend()
+            if legend is not None:
+                legend.get_frame().set_facecolor(bg_color)
+                legend.get_frame().set_edgecolor(text_color)
+                for text in legend.get_texts():
+                    text.set_color(text_color)
+
+        # Recolor colorbars
+        for cbar in getattr(self, '_colorbars', []):
+            cbar.ax.tick_params(colors=text_color)
+            cbar.ax.yaxis.label.set_color(text_color)
+            cbar.ax.xaxis.label.set_color(text_color)
+            cbar.outline.set_edgecolor(text_color)
+            # colorbar label (set via label= kwarg in colorbar())
+            if cbar.ax.get_ylabel():
+                cbar.ax.yaxis.label.set_color(text_color)
+            for spine in cbar.ax.spines.values():
+                spine.set_edgecolor(text_color)
+
+    def _create_figure(self):
+        """Create figure and axes for plotting."""
+        n_dims = self.problem.n_dims
+        n_outputs = self.problem.n_outputs
+        has_solution = self.problem.solution is not None
+        n_regions = len(getattr(self, '_plot_regions', []))
+        obs_names = list(getattr(self.problem, 'obs_names', None) or [])
+        obs_spatial = list(getattr(self.problem, 'obs_spatial', None) or [])
+        # Regular observables: those not listed in obs_spatial
+        obs_regular = [n for n in obs_names if n not in obs_spatial]
+        has_spatial = len(obs_spatial) > 0
+        n_obs = len(obs_regular) + (1 if has_spatial else 0)
+
+        if n_dims == 1:
+            if has_solution:
+                n_cols = 3  # solution, residuals, error
+            else:
+                n_cols = 2  # solution, residuals
+            
+            # 2 rows for losses + mse_losses
+            n_rows = 2 + n_outputs + n_regions + n_obs
+            fig = plt.figure(figsize=(5 * n_cols, 3.5 * n_rows))
+            gs = fig.add_gridspec(n_rows, n_cols)
+            
+            axes = {}
+            axes['losses'] = fig.add_subplot(gs[0, :])
+            axes['mse_losses'] = fig.add_subplot(gs[1, :])
+            
+            for i in range(n_outputs):
+                axes[f'sol_{i}'] = fig.add_subplot(gs[2 + i, 0])
+                axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, 1])
+                if has_solution:
+                    axes[f'err_{i}'] = fig.add_subplot(gs[2 + i, 2])
+            
+            # Region plots
+            for r in range(n_regions):
+                axes[f'region_{r}'] = fig.add_subplot(gs[2 + n_outputs + r, :])
+
+            # Regular observable plots
+            for k, name in enumerate(obs_regular):
+                axes[f'obs_{name}'] = fig.add_subplot(gs[2 + n_outputs + n_regions + k, :])
+            # Joint deformed-mesh plot for spatial observables (two panels: original | deformed)
+            if has_spatial:
+                row_s = 2 + n_outputs + n_regions + len(obs_regular)
+                axes['obs__deformed_ref'] = fig.add_subplot(gs[row_s, 0])
+                axes['obs__deformed_def'] = fig.add_subplot(gs[row_s, 1])
+        
+        elif n_dims == 2:
+            if has_solution:
+                n_cols = 4  # predicted, true, residuals, error
+            else:
+                n_cols = 2  # predicted, residuals
+            
+            n_rows = 2 + n_outputs + n_regions + n_obs
+            fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
+            gs = fig.add_gridspec(n_rows, n_cols)
+            
+            axes = {}
+            axes['losses'] = fig.add_subplot(gs[0, :])
+            axes['mse_losses'] = fig.add_subplot(gs[1, :])
+            
+            for i in range(n_outputs):
+                axes[f'sol_{i}'] = fig.add_subplot(gs[2 + i, 0])
+                if has_solution:
+                    axes[f'true_{i}'] = fig.add_subplot(gs[2 + i, 1])
+                    axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, 2])
+                    axes[f'err_{i}'] = fig.add_subplot(gs[2 + i, 3])
+                else:
+                    axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, 1])
+            
+            for r in range(n_regions):
+                axes[f'region_{r}'] = fig.add_subplot(gs[2 + n_outputs + r, :])
+
+            # Regular observable plots — one subplot per observable, spanning first two columns
+            for k, name in enumerate(obs_regular):
+                axes[f'obs_{name}'] = fig.add_subplot(gs[2 + n_outputs + n_regions + k, :2])
+            # Joint deformed-mesh plot for spatial observables (two panels: original | deformed)
+            if has_spatial:
+                row_s = 2 + n_outputs + n_regions + len(obs_regular)
+                axes['obs__deformed_ref'] = fig.add_subplot(gs[row_s, 0])
+                axes['obs__deformed_def'] = fig.add_subplot(gs[row_s, 1])
+        
+        elif self._is_mesh_domain() and getattr(self, '_plot_time_points', None):
+            # Transient mesh domain with time snapshots.
+            # Columns: predicted | true (opt) | residual | error (opt)
+            # Rows: 2 loss rows + one row per (time × output)
+            ts = self._plot_time_points
+            n_snap = len(ts) * n_outputs
+            if has_solution:
+                n_cols = 4  # predicted, true, residual, error
+            else:
+                n_cols = 2  # predicted, residual
+
+            n_rows = 2 + n_snap
+            fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
+            gs = fig.add_gridspec(n_rows, n_cols)
+
+            axes = {}
+            axes['losses'] = fig.add_subplot(gs[0, :])
+            axes['mse_losses'] = fig.add_subplot(gs[1, :])
+
+            row = 2
+            for t_val in ts:
+                for i in range(n_outputs):
+                    key = f'snap_sol_{i}_t{t_val}'
+                    axes[key] = fig.add_subplot(gs[row, 0])
+                    if has_solution:
+                        axes[f'snap_true_{i}_t{t_val}'] = fig.add_subplot(gs[row, 1])
+                        axes[f'snap_res_{i}_t{t_val}'] = fig.add_subplot(gs[row, 2])
+                        axes[f'snap_err_{i}_t{t_val}'] = fig.add_subplot(gs[row, 3])
+                    else:
+                        axes[f'snap_res_{i}_t{t_val}'] = fig.add_subplot(gs[row, 1])
+                    row += 1
+        else:
+            # For 3D+: loss plot + region slices for all outputs with residuals
+            n_cols = 2 * n_outputs  # Two columns per output (solution + residual)
+            n_rows = 2 + n_regions  # 2 for losses + one row per region
+            fig = plt.figure(figsize=(4 * n_cols, 4 * n_rows))
+            gs = fig.add_gridspec(n_rows, n_cols)
+            
+            axes = {}
+            axes['losses'] = fig.add_subplot(gs[0, :])
+            axes['mse_losses'] = fig.add_subplot(gs[1, :])
+            
+            for r in range(n_regions):
+                for i in range(n_outputs):
+                    axes[f'region_{r}_{i}'] = fig.add_subplot(gs[2 + r, 2*i])
+                    axes[f'region_res_{r}_{i}'] = fig.add_subplot(gs[2 + r, 2*i + 1])
+        
+        self._colorbars = []
+        self._apply_plot_style(fig, axes)
+        return fig, axes
+    
+    def _plot_losses(self, ax):
+        """Plot loss curves on given axes."""
+        epochs = self.history['epoch']
+        if not epochs:
+            return
+        
+        # Total loss (use 'loss' or 'train_loss')
+        loss_data = self.history.get('loss', self.history.get('train_loss', []))
+        if loss_data:
+            ax.semilogy(epochs, loss_data, 'k-', label='Total', linewidth=2)
+        
+        # PDE losses
+        pde_losses = self.history.get('loss_pde', [])
+        if len(pde_losses) > 0:
+            if isinstance(pde_losses[0], (list, tuple)):
+                pde_array = np.array(pde_losses)
+                for i in range(pde_array.shape[1]):
+                    ax.semilogy(epochs, pde_array[:, i], '--', label=f'PDE eq{i+1}')
+            else:
+                ax.semilogy(epochs, pde_losses, '--', label='PDE')
+        
+        # BC losses with names
+        bc_names = self._get_bc_plot_names()
+        bc_losses = self.history.get('loss_bcs', [])
+        if bc_losses and len(bc_losses) > 0:
+            bc_losses_array = np.array(bc_losses)
+            if bc_losses_array.ndim == 2:
+                for i in range(bc_losses_array.shape[1]):
+                    bc_label = bc_names[i] if i < len(bc_names) else f'BC {i+1}'
+                    ax.semilogy(epochs, bc_losses_array[:, i], '--', label=bc_label)
+        
+        # Test loss if available
+        test_loss = self.history.get('test_loss', [])
+        if len(test_loss) > 0:
+            n_test = len(test_loss)
+            test_epochs = np.linspace(epochs[0], epochs[-1], n_test).astype(int) if n_test > 1 else [epochs[-1]]
+            ax.semilogy(test_epochs, test_loss, 'r:', marker='o', markersize=4, label='Test', linewidth=2)
+        
+        # Solution error if available
+        sol_error = self.history.get('solution_error', [])
+        if len(sol_error) > 0:
+            n_err = len(sol_error)
+            err_epochs = np.linspace(epochs[0], epochs[-1], n_err).astype(int) if n_err > 1 else [epochs[-1]]
+            ax.semilogy(err_epochs, sol_error, 'm-', marker='s', markersize=4, label='Solution Error', linewidth=2)
+        
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title('Training Losses')
+        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8)
+        ax.grid(True, alpha=0.3)
+    
+    def _plot_mse_losses(self, ax):
+        """Plot MSE loss components on given axes."""
+        epochs = self.history['epoch']
+        if not epochs:
+            return
+        
+        # Total MSE loss
+        loss_data = self.history.get('loss', self.history.get('train_loss', []))
+        if loss_data:
+            ax.semilogy(epochs, loss_data, 'k-', label='MSE Total', linewidth=2)
+        
+        # PDE MSE losses
+        pde_losses = self.history.get('loss_pde', [])
+        if len(pde_losses) > 0:
+            if isinstance(pde_losses[0], (list, tuple)):
+                pde_array = np.array(pde_losses)
+                for i in range(pde_array.shape[1]):
+                    ax.semilogy(epochs, pde_array[:, i], 'b--', label=f'PDE eq{i+1}')
+            else:
+                ax.semilogy(epochs, pde_losses, 'b--', label='PDE')
+        
+        # BC MSE losses with names
+        bc_names = self._get_bc_plot_names()
+        bc_losses = self.history.get('loss_bcs', [])
+        if bc_losses and len(bc_losses) > 0:
+            bc_losses_array = np.array(bc_losses)
+            if bc_losses_array.ndim == 2:
+                for i in range(bc_losses_array.shape[1]):
+                    bc_label = bc_names[i] if i < len(bc_names) else f'BC {i+1}'
+                    ax.semilogy(epochs, bc_losses_array[:, i], '--', label=bc_label)
+        
+        # Test loss
+        test_loss = self.history.get('test_loss', [])
+        if len(test_loss) > 0:
+            n_test = len(test_loss)
+            test_epochs = np.linspace(epochs[0], epochs[-1], n_test).astype(int) if n_test > 1 else [epochs[-1]]
+            ax.semilogy(test_epochs, test_loss, 'r:', marker='o', markersize=4, label='Test', linewidth=2)
+        
+        # Solution error
+        sol_error = self.history.get('solution_error', [])
+        if len(sol_error) > 0:
+            n_err = len(sol_error)
+            err_epochs = np.linspace(epochs[0], epochs[-1], n_err).astype(int) if n_err > 1 else [epochs[-1]]
+            ax.semilogy(err_epochs, sol_error, 'm-', marker='s', markersize=4, label='Solution Error', linewidth=2)
+        
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('MSE Loss')
+        ax.set_title('MSE Losses (Components)')
+        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8)
+        ax.grid(True, alpha=0.3)
+    
+    def _plot_solution_1d(self, ax, output_idx, n_points=200):
+        """Plot 1D solution on given axes."""
+        x = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points).reshape(-1, 1)
+        y = self.predict(x)
+        
+        # Plot true solution if available
+        if self.problem.solution is not None:
+            y_true = self._call_solution(x)
+            if isinstance(y_true, (list, tuple)):
+                y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
+            elif y_true.ndim == 1:
+                y_true = y_true.reshape(-1, 1)
+            ax.plot(x, y_true[:, output_idx], 'r-', linewidth=2, label='True')
+            ax.plot(x, y[:, output_idx], 'b--', linewidth=2, label='Predicted')
+            ax.legend(loc='best', fontsize=8)
+        else:
+            ax.plot(x, y[:, output_idx], 'b-', linewidth=2)
+        
+        output_name = self._get_output_name(output_idx)
+        input_name = self._get_input_name(0)
+        ax.set_xlabel(input_name)
+        ax.set_ylabel(output_name)
+        ax.set_title(f'Solution ({output_name})')
+        ax.grid(True, alpha=0.3)
+    
+    def _is_mesh_domain(self):
+        """Return True when the problem domain is a DomainMesh."""
+        try:
+            from pinns.domain import DomainMesh as _DomainMesh
+            return isinstance(self.problem.domain, _DomainMesh)
+        except ImportError:
+            return False
+
+    def _plot_mesh_snapshot_base(self, ax, output_idx, t_val, kind='sol'):
+        """Plot a spatial snapshot of a transient mesh solution at time t_val.
+
+        kind : 'sol'  – predicted u(x,y,t)
+               'true' – reference solution u(x,y,t)
+               'res'  – absolute weak residual |R_j| (t ignored, uses stored residual)
+               'err'  – absolute pointwise error |pred - true|
+        """
+        import matplotlib.tri as _mtri
+
+        dom      = self.problem.domain
+        verts_xy = dom._vertices          # (N, 2)
+        faces    = dom._faces             # (F, 3)
+        n_verts  = len(verts_xy)
+        t_dim    = getattr(dom, '_t_dim', self.problem.n_dims - 1)
+
+        # Build space-time input: (N, n_inputs) with t injected at t_dim
+        n_inputs = self.problem.n_dims
+        x_st = np.zeros((n_verts, n_inputs), dtype=np.float32)
+        spatial_dims = [d for d in range(n_inputs) if d != t_dim]
+        for k, sd in enumerate(spatial_dims):
+            x_st[:, sd] = verts_xy[:, k]
+        x_st[:, t_dim] = float(t_val)
+
+        tri_obj = _mtri.Triangulation(verts_xy[:, 0], verts_xy[:, 1], faces)
+
+        if kind == 'res':
+            # Use the true weak-form per-node residual R_j = Σ_k ∫_T_k φ_j·volume_fn dΩ
+            # evaluated at the requested time t_val.  Falls back to a placeholder if
+            # the machinery is not available (e.g. non-weak problem).
+            try:
+                from pinns.problems.problem_weak import ProblemWeak as _PW
+                _u_and_grad = getattr(self, '_u_and_grad_fn', None)
+                if not isinstance(self.problem, _PW) or _u_and_grad is None:
+                    raise ValueError('weak residual not available')
+                import jax as _jax
+                _res_fn = _jax.jit(
+                    self.problem.make_residual_vector_fn_at_t(_u_and_grad, float(t_val))
+                )
+                R_full = np.array(_res_fn(self.network.params))   # (n_dofs * n_comp,)
+                _n_dofs = self.problem.n_dofs
+                # Take the component for output_idx (row block)
+                R_comp = R_full[output_idx * _n_dofs:(output_idx + 1) * _n_dofs]
+                # Place values on nodes; non-free nodes get NaN (Dirichlet BCs)
+                vals = np.full(n_verts, np.nan, dtype=float)
+                for _nj in self.problem.free_nodes:
+                    if int(_nj) < n_verts:
+                        vals[int(_nj)] = float(np.abs(R_comp[int(_nj)]))
+                # Normalise by node support area so the colour scale is O(residual)
+                _node_norm = getattr(self.problem, 'node_norm', None)
+                if _node_norm is not None:
+                    for _nj in self.problem.free_nodes:
+                        if int(_nj) < n_verts and _node_norm[int(_nj)] > 0:
+                            vals[int(_nj)] /= float(_node_norm[int(_nj)])
+                # Mask triangles where ALL three vertices are non-free (Dirichlet)
+                tri_mask = np.array([
+                    np.isnan(vals[f[0]]) and np.isnan(vals[f[1]]) and np.isnan(vals[f[2]])
+                    for f in faces
+                ])
+                tri_obj.set_mask(tri_mask)
+                # Fill NaN boundary nodes with 0 for contour plotting
+                vals_plot = np.where(np.isnan(vals), 0.0, vals)
+            except Exception:
+                ax.text(0.5, 0.5, 'Residual\nnot available',
+                        ha='center', va='center', transform=ax.transAxes, fontsize=9, color='gray')
+                ax.set_title(f'|R_j| (t={t_val:.3g})')
+                return
+            cmap = 'inferno'
+            label = f'|R_j| (t={t_val:.3g})'
+            im = ax.tricontourf(tri_obj, vals_plot, levels=50, cmap=cmap)
+        else:
+            y_pred = self.predict(x_st)[:, output_idx]
+            if kind == 'true':
+                if self.problem.solution is None:
+                    return
+                y_true_raw = self._call_solution(x_st)
+                if isinstance(y_true_raw, (list, tuple)):
+                    y_true_raw = np.concatenate(
+                        [np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true_raw], axis=1)
+                elif y_true_raw.ndim == 1:
+                    y_true_raw = y_true_raw.reshape(-1, 1)
+                vals = y_true_raw[:, output_idx].astype(float)
+                label = f'True (t={t_val:.3g})'
+                cmap = self._get_colormap(output_idx)
+            elif kind == 'err':
+                if self.problem.solution is None:
+                    return
+                y_true_raw = self._call_solution(x_st)
+                if isinstance(y_true_raw, (list, tuple)):
+                    y_true_raw = np.concatenate(
+                        [np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true_raw], axis=1)
+                elif y_true_raw.ndim == 1:
+                    y_true_raw = y_true_raw.reshape(-1, 1)
+                vals = np.abs(y_pred - y_true_raw[:, output_idx]).astype(float)
+                label = f'|Error| (t={t_val:.3g})'
+                cmap = 'Reds'
+            else:  # 'sol'
+                vals = y_pred.astype(float)
+                label = f'Predicted (t={t_val:.3g})'
+                cmap = self._get_colormap(output_idx)
+            # Mask triangles where any vertex has a non-finite value (e.g. NaN
+            # returned by the reference interpolator near irregular boundaries).
+            nan_mask = np.array([
+                not (np.isfinite(vals[f[0]]) and np.isfinite(vals[f[1]]) and np.isfinite(vals[f[2]]))
+                for f in faces
+            ])
+            tri_obj.set_mask(nan_mask)
+            vals_plot = np.where(np.isfinite(vals), vals, 0.0)
+            im = ax.tricontourf(tri_obj, vals_plot, levels=50, cmap=cmap)
+
+        ax.triplot(tri_obj, color='gray', lw=0.3, alpha=0.3)
+        cbar = self._fig.colorbar(im, ax=ax)
+        self._colorbars.append(cbar)
+        out_name = self._get_output_name(output_idx)
+        ax.set_title(f'{label} ({out_name})')
+        ax.set_xlabel(self._get_input_name(spatial_dims[0]))
+        ax.set_ylabel(self._get_input_name(spatial_dims[1]) if len(spatial_dims) > 1 else '')
+        ax.set_aspect('equal')
+
+    def _plot_solution_2d(self, ax, output_idx, n_points=50, plot_key='solution'):
+        """Plot 2D solution as heatmap on given axes."""
+        cmap = self._get_colormap(output_idx)
+        ikw = {'cmap': cmap}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
+            y = self.predict(dom._vertices)
+            vals = y[:, output_idx]
+            im = ax.tricontourf(tri, vals, levels=50, **ikw)
+            ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_flat = np.column_stack([X0.ravel(), X1.ravel()])
+            y = self.predict(x_flat)
+            Y = y[:, output_idx].reshape(X0.shape)
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', **ikw)
+
+        cbar = self._fig.colorbar(im, ax=ax)
+        self._colorbars.append(cbar)
+
+        output_name = self._get_output_name(output_idx)
+        ax.set_title(f'Predicted ({output_name})')
+        ax.set_xlabel(self._get_input_name(0))
+        ax.set_ylabel(self._get_input_name(1))
+    
+    def _plot_true_solution_2d(self, ax, output_idx, n_points=50, plot_key='solution'):
+        """Plot 2D true solution as heatmap on given axes."""
+        if self.problem.solution is None:
+            return
+
+        cmap = self._get_colormap(output_idx)
+        ikw = {'cmap': cmap}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+
+        def _normalise(y_true):
+            if isinstance(y_true, (list, tuple)):
+                y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
+            elif y_true.ndim == 1:
+                y_true = y_true.reshape(-1, 1)
+            return y_true
+
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
+            y_true = _normalise(self._call_solution(dom._vertices))
+            vals = y_true[:, output_idx]
+            im = ax.tricontourf(tri, vals, levels=50, **ikw)
+            ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_flat = np.column_stack([X0.ravel(), X1.ravel()])
+            y_true = _normalise(self._call_solution(x_flat))
+            Y_true = y_true[:, output_idx].reshape(X0.shape)
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            im = ax.imshow(Y_true, extent=extent, origin='lower', aspect='equal', **ikw)
+
+        cbar = self._fig.colorbar(im, ax=ax)
+        self._colorbars.append(cbar)
+
+        output_name = self._get_output_name(output_idx)
+        ax.set_title(f'True Solution ({output_name})')
+        ax.set_xlabel(self._get_input_name(0))
+        ax.set_ylabel(self._get_input_name(1))
+    
+    def _plot_error_1d(self, ax, output_idx, n_points=200):
+        """Plot 1D absolute error."""
+        if self.problem.solution is None:
+            return
+        
+        x = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points).reshape(-1, 1)
+        y = self.predict(x)
+        
+        y_true = self._call_solution(x)
+        if isinstance(y_true, (list, tuple)):
+            y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
+        elif y_true.ndim == 1:
+            y_true = y_true.reshape(-1, 1)
+        
+        error = np.abs(y[:, output_idx] - y_true[:, output_idx])
+        ax.plot(x, error, 'r-', linewidth=2)
+        
+        output_name = self._get_output_name(output_idx)
+        input_name = self._get_input_name(0)
+        ax.set_xlabel(input_name)
+        ax.set_ylabel(f'|Error| ({output_name})')
+        ax.set_title(f'Absolute Error ({output_name})')
+        ax.grid(True, alpha=0.3)
+    
+    def _plot_error_2d(self, ax, output_idx, n_points=50, plot_key='error'):
+        """Plot 2D absolute error as heatmap."""
+        if self.problem.solution is None:
+            return
+
+        ikw = {'cmap': 'Reds'}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+
+        def _normalise(y_true):
+            if isinstance(y_true, (list, tuple)):
+                y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
+            elif y_true.ndim == 1:
+                y_true = y_true.reshape(-1, 1)
+            return y_true
+
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
+            y = self.predict(dom._vertices)
+            y_true = _normalise(self._call_solution(dom._vertices))
+            error = np.abs(y[:, output_idx] - y_true[:, output_idx])
+            im = ax.tricontourf(tri, error, levels=50, **ikw)
+            ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_flat = np.column_stack([X0.ravel(), X1.ravel()])
+            y = self.predict(x_flat)
+            y_true = _normalise(self._call_solution(x_flat))
+            error = np.abs(y[:, output_idx] - y_true[:, output_idx]).reshape(X0.shape)
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            im = ax.imshow(error, extent=extent, origin='lower', aspect='equal', **ikw)
+
+        cbar = self._fig.colorbar(im, ax=ax)
+        self._colorbars.append(cbar)
+
+        output_name = self._get_output_name(output_idx)
+        ax.set_title(f'Absolute Error ({output_name})')
+        ax.set_xlabel(self._get_input_name(0))
+        ax.set_ylabel(self._get_input_name(1))
+    
+    def _plot_region_nd(self, ax, output_idx, region, n_points=50):
+        """Plot a region of an N-dimensional solution as 1D or 2D."""
+        free_dims, free_ranges, fixed_dims, fixed_values = self._parse_region_nd(region)
+        n_free = len(free_dims)
+        
+        if n_free == 0:
+            # No free dimensions - just show the single point value
+            x_point = np.zeros((1, self.problem.n_dims))
+            for i, val in zip(fixed_dims, fixed_values):
+                x_point[0, i] = val
+            y = self.predict(x_point)
+            ax.text(0.5, 0.5, f'u={y[0, output_idx]:.4f}',
+                   ha='center', va='center', transform=ax.transAxes, fontsize=14)
+            ax.set_title(self._get_output_name(output_idx))
+            return
+        
+        elif n_free == 1:
+            # 1D plot
+            dim = free_dims[0]
+            x_range = free_ranges[0]
+            x_vals = np.linspace(x_range[0], x_range[1], n_points)
+            
+            x_full = np.zeros((n_points, self.problem.n_dims))
+            x_full[:, dim] = x_vals
+            for i, val in zip(fixed_dims, fixed_values):
+                x_full[:, i] = val
+            
+            y = self.predict(x_full)
+            
+            ax.plot(x_vals, y[:, output_idx], linewidth=2)
+            ax.set_xlabel(self._get_input_name(dim))
+            ax.set_ylabel(self._get_output_name(output_idx))
+            
+            title_parts = [self._get_output_name(output_idx)]
+            if fixed_dims:
+                fixed_str = ', '.join([f'{self._get_input_name(d)}={v:.3g}' 
+                                       for d, v in zip(fixed_dims, fixed_values)])
+                title_parts.append(f'at {fixed_str}')
+            ax.set_title(' '.join(title_parts))
+            ax.grid(True, alpha=0.3)
+            
+        elif n_free == 2:
+            # 2D plot
+            dim0, dim1 = free_dims[0], free_dims[1]
+            x0_range, x1_range = free_ranges[0], free_ranges[1]
+            
+            x0 = np.linspace(x0_range[0], x0_range[1], n_points)
+            x1 = np.linspace(x1_range[0], x1_range[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            
+            n_total = X0.size
+            x_full = np.zeros((n_total, self.problem.n_dims))
+            x_full[:, dim0] = X0.ravel()
+            x_full[:, dim1] = X1.ravel()
+            for i, val in zip(fixed_dims, fixed_values):
+                x_full[:, i] = val
+            
+            y = self.predict(x_full)
+            Y = y[:, output_idx].reshape(X0.shape)
+            
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            cmap = self._get_colormap(output_idx)
+            im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', cmap=cmap)
+            cbar = self._fig.colorbar(im, ax=ax)
+            self._colorbars.append(cbar)
+            
+            ax.set_xlabel(self._get_input_name(dim0))
+            ax.set_ylabel(self._get_input_name(dim1))
+            
+            output_name = self._get_output_name(output_idx)
+            if fixed_dims:
+                fixed_str = ', '.join([f'{self._get_input_name(d)}={v:.3g}' 
+                                       for d, v in zip(fixed_dims, fixed_values)])
+                ax.set_title(f'{output_name} at {fixed_str}')
+            else:
+                ax.set_title(output_name)
+        else:
+            ax.text(0.5, 0.5, f'Cannot plot {n_free}D (max 2D)',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(self._get_output_name(output_idx))
+    
+    def _plot_region_residuals_nd(self, ax, residual_idx, region, n_points=50):
+        """Plot residuals for a region of an N-dimensional problem as 1D or 2D."""
+        free_dims, free_ranges, fixed_dims, fixed_values = self._parse_region_nd(region)
+        n_free = len(free_dims)
+        
+        if n_free == 0:
+            # No free dimensions - just show the single point residual value
+            x_point = np.zeros((1, self.problem.n_dims))
+            for i, val in zip(fixed_dims, fixed_values):
+                x_point[0, i] = val
+            residuals = self._compute_residuals(x_point)
+            if residual_idx < len(residuals):
+                res_val = np.abs(residuals[residual_idx][0])
+            else:
+                res_val = 0.0
+            ax.text(0.5, 0.5, f'|R|={res_val:.4e}',
+                   ha='center', va='center', transform=ax.transAxes, fontsize=14)
+            ax.set_title(f'Residual eq{residual_idx+1}')
+            return
+        
+        elif n_free == 1:
+            # 1D plot
+            dim = free_dims[0]
+            x_range = free_ranges[0]
+            x_vals = np.linspace(x_range[0], x_range[1], n_points)
+            
+            x_full = np.zeros((n_points, self.problem.n_dims))
+            x_full[:, dim] = x_vals
+            for i, val in zip(fixed_dims, fixed_values):
+                x_full[:, i] = val
+            
+            residuals = self._compute_residuals(x_full)
+            if residual_idx < len(residuals):
+                res = np.abs(residuals[residual_idx])
+            else:
+                res = np.zeros(n_points)
+            
+            ax.plot(x_vals, res, 'm-', linewidth=2)
+            ax.set_xlabel(self._get_input_name(dim))
+            ax.set_ylabel(f'|Residual eq{residual_idx+1}|')
+            
+            title_parts = [f'Residual eq{residual_idx+1}']
+            if fixed_dims:
+                fixed_str = ', '.join([f'{self._get_input_name(d)}={v:.3g}' 
+                                       for d, v in zip(fixed_dims, fixed_values)])
+                title_parts.append(f'at {fixed_str}')
+            ax.set_title(' '.join(title_parts))
+            ax.grid(True, alpha=0.3)
+            
+        elif n_free == 2:
+            # 2D plot
+            dim0, dim1 = free_dims[0], free_dims[1]
+            x0_range, x1_range = free_ranges[0], free_ranges[1]
+            
+            x0 = np.linspace(x0_range[0], x0_range[1], n_points)
+            x1 = np.linspace(x1_range[0], x1_range[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            
+            n_total = X0.size
+            x_full = np.zeros((n_total, self.problem.n_dims))
+            x_full[:, dim0] = X0.ravel()
+            x_full[:, dim1] = X1.ravel()
+            for i, val in zip(fixed_dims, fixed_values):
+                x_full[:, i] = val
+            
+            residuals = self._compute_residuals(x_full)
+            if residual_idx < len(residuals):
+                Res = np.abs(residuals[residual_idx]).reshape(X0.shape)
+            else:
+                Res = np.zeros(X0.shape)
+            
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', cmap='viridis')
+            cbar = self._fig.colorbar(im, ax=ax, label='|Residual|')
+            self._colorbars.append(cbar)
+            
+            ax.set_xlabel(self._get_input_name(dim0))
+            ax.set_ylabel(self._get_input_name(dim1))
+            
+            if fixed_dims:
+                fixed_str = ', '.join([f'{self._get_input_name(d)}={v:.3g}' 
+                                       for d, v in zip(fixed_dims, fixed_values)])
+                ax.set_title(f'Res. eq{residual_idx+1} at {fixed_str}')
+            else:
+                ax.set_title(f'Residual eq{residual_idx+1}')
+        else:
+            ax.text(0.5, 0.5, f'Cannot plot {n_free}D (max 2D)',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'Residual eq{residual_idx+1}')
+    
+    def _update_figure(self, fig, axes, n_points=200):
+        """Update existing figure with current data."""
+        n_dims = self.problem.n_dims
+        n_outputs = self.problem.n_outputs
+        has_solution = self.problem.solution is not None
+        
+        self._clear_colorbars()
+        
+        for key, ax in axes.items():
+            if hasattr(ax, 'clear'):
+                ax.clear()
+        
+        self._plot_losses(axes['losses'])
+        self._apply_plot_kwargs(axes['losses'], 'losses')
+        
+        # Plot MSE losses if axis exists
+        if 'mse_losses' in axes:
+            self._plot_mse_losses(axes['mse_losses'])
+            self._apply_plot_kwargs(axes['mse_losses'], 'mse_losses')
+        
+        if n_dims == 1:
+            for i in range(n_outputs):
+                if f'sol_{i}' in axes:
+                    self._plot_solution_1d(axes[f'sol_{i}'], i, n_points)
+                    self._apply_plot_kwargs(axes[f'sol_{i}'], 'solution')
+                if f'res_{i}' in axes:
+                    self._plot_residuals_1d(axes[f'res_{i}'], i, n_points)
+                    self._apply_plot_kwargs(axes[f'res_{i}'], 'residuals')
+                if f'err_{i}' in axes and has_solution:
+                    self._plot_error_1d(axes[f'err_{i}'], i, n_points)
+                    self._apply_plot_kwargs(axes[f'err_{i}'], 'error')
+        
+        elif n_dims == 2:
+            for i in range(n_outputs):
+                if f'sol_{i}' in axes:
+                    self._plot_solution_2d(axes[f'sol_{i}'], i, n_points, plot_key='solution')
+                    self._apply_plot_kwargs(axes[f'sol_{i}'], 'solution')
+                if f'true_{i}' in axes and has_solution:
+                    self._plot_true_solution_2d(axes[f'true_{i}'], i, n_points, plot_key='solution')
+                    self._apply_plot_kwargs(axes[f'true_{i}'], 'solution')
+                if f'res_{i}' in axes:
+                    self._plot_residuals_2d(axes[f'res_{i}'], i, n_points, plot_key='residuals')
+                    self._apply_plot_kwargs(axes[f'res_{i}'], 'residuals')
+                if f'err_{i}' in axes and has_solution:
+                    self._plot_error_2d(axes[f'err_{i}'], i, n_points, plot_key='error')
+                    self._apply_plot_kwargs(axes[f'err_{i}'], 'error')
+
+        # ── Transient mesh snapshots (works regardless of n_dims) ──────────────
+        _pts = getattr(self, '_plot_time_points', None)
+        if _pts and self._is_mesh_domain():
+            for _t_val in _pts:
+                for _i in range(n_outputs):
+                    _sol_key  = f'snap_sol_{_i}_t{_t_val}'
+                    _true_key = f'snap_true_{_i}_t{_t_val}'
+                    _res_key  = f'snap_res_{_i}_t{_t_val}'
+                    _err_key  = f'snap_err_{_i}_t{_t_val}'
+                    if _sol_key in axes:
+                        self._plot_mesh_snapshot(axes[_sol_key], _i, _t_val, 'sol')
+                    if _true_key in axes and has_solution:
+                        self._plot_mesh_snapshot(axes[_true_key], _i, _t_val, 'true')
+                    if _res_key in axes:
+                        self._plot_mesh_snapshot(axes[_res_key], _i, _t_val, 'res')
+                    if _err_key in axes and has_solution:
+                        self._plot_mesh_snapshot(axes[_err_key], _i, _t_val, 'err')
+
+        # Plot observables (1D or 2D)
+        obs_spatial = list(getattr(self.problem, 'obs_spatial', None) or [])
+        for obs_name in (getattr(self.problem, 'obs_names', None) or []):
+            if obs_name in obs_spatial:
+                continue  # handled below as joint deformed mesh
+            ax_key = f'obs_{obs_name}'
+            if ax_key not in axes:
+                continue
+            if n_dims == 1:
+                self._plot_observable_1d(axes[ax_key], obs_name, n_points)
+            else:
+                self._plot_observable_2d(axes[ax_key], obs_name, n_points)
+        # Joint deformed-mesh plot
+        if obs_spatial and 'obs__deformed_ref' in axes:
+            self._plot_deformed_mesh_spatial(axes['obs__deformed_ref'], axes['obs__deformed_def'], obs_spatial, n_points)
+
+        # Plot regions (for any dimension)
+        regions = getattr(self, '_plot_regions', [])
+        n_outputs = self.problem.n_outputs
+        for r, region in enumerate(regions):
+            # Check if we have per-output region axes (3D+ case)
+            if f'region_{r}_0' in axes:
+                for i in range(n_outputs):
+                    if f'region_{r}_{i}' in axes:
+                        self._plot_region_nd(axes[f'region_{r}_{i}'], i, region, n_points)
+                        self._apply_plot_kwargs(axes[f'region_{r}_{i}'], 'region')
+                        self._apply_plot_kwargs(axes[f'region_{r}_{i}'], f'region_{r}')
+                    if f'region_res_{r}_{i}' in axes:
+                        self._plot_region_residuals_nd(axes[f'region_res_{r}_{i}'], i, region, n_points)
+                        self._apply_plot_kwargs(axes[f'region_res_{r}_{i}'], 'region')
+                        self._apply_plot_kwargs(axes[f'region_res_{r}_{i}'], f'region_{r}')
+            elif f'region_{r}' in axes:
+                # 1D/2D case: single axis per region (plots first output)
+                self._plot_region_nd(axes[f'region_{r}'], 0, region, n_points)
+                self._apply_plot_kwargs(axes[f'region_{r}'], 'region')
+                self._apply_plot_kwargs(axes[f'region_{r}'], f'region_{r}')
+        
+        self._apply_plot_style(fig, axes)
+        fig.tight_layout()
+    
+    def plot_progress(self, save_path=None, n_points=200, fig=None, axes=None, display_handle=None, **kwargs):
+        """
+        Generate a figure with loss curves and solution plots.
+        
+        Args:
+            save_path: Path to save the figure.
+            n_points: Number of points for solution plots.
+            fig: Existing figure to update.
+            axes: Existing axes to update.
+            display_handle: IPython display handle for in-place updates.
+            
+        Returns:
+            tuple: (fig, axes, display_handle)
+        """
+        if fig is None or axes is None:
+            fig, axes = self._create_figure()
+        
+        self._update_figure(fig, axes, n_points)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        
+        if is_notebook():
+            from IPython.display import display, update_display
+            if display_handle is None:
+                display_handle = display(fig, display_id=True)
+            else:
+                display_handle.update(fig)
+        # Script mode: no interactive display, just save to file
+        
+        return fig, axes, display_handle
+    
+# ==================== Residual Plotting ====================
+
+    def _plot_residuals_1d(self, ax, output_idx, n_points=200):
+        """Plot 1D PDE residuals."""
+        from pinns.problems.problem_weak import ProblemWeak as _ProblemWeak
+        if isinstance(self.problem, _ProblemWeak):
+            self._plot_weak_residuals_on_mesh(ax, output_idx)
+            return
+        x_np = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points).reshape(-1, 1)
+        
+        residuals = self._compute_residuals(x_np)
+        
+        if output_idx < len(residuals):
+            res = np.abs(residuals[output_idx]).flatten()
+        else:
+            res = np.zeros(n_points)
+        
+        ax.plot(x_np.flatten(), res, 'm-', linewidth=2)
+        
+        output_name = self._get_output_name(output_idx)
+        input_name = self._get_input_name(0)
+        ax.set_xlabel(input_name)
+        ax.set_ylabel(f'|Residual| ({output_name})')
+        ax.set_title(f'PDE Residual ({output_name})')
+        ax.grid(True, alpha=0.3)
+
+    def _plot_weak_residuals_on_mesh(self, ax, output_idx=0):
+        """Plot the nodal weak-form residual |R_j| on the mesh triangulation.
+
+        Only free (interior) nodes are shown; Dirichlet boundary nodes are
+        masked (NaN / white) because their residual is never minimized and
+        has no meaningful interpretation in the loss.
+        """
+        import matplotlib.tri as _mtri
+        weak_res_fn = getattr(self, '_weak_residual_fn', None)
+        if weak_res_fn is None:
+            ax.text(0.5, 0.5, 'Weak residual\nnot available',
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=10, color='gray')
+            ax.set_title('Weak Residual')
+            return
+
+        R_raw = weak_res_fn(self.network.params)
+
+        dom        = self.problem.domain
+        verts_xy   = dom._vertices                        # (n_verts, 2)
+        faces      = dom._faces                           # (n_faces, 3)
+        n_verts    = len(verts_xy)
+
+        # make_residual_fn returns dict {term_name: array of shape (n_free * n_comp,)}
+        # where n_free = number of truly-free nodes (Dirichlet nodes excluded).
+        # Reconstruct a full-vertex array with NaN at constrained nodes.
+        R_verts = np.full(n_verts, np.nan, dtype=float)
+
+        free_nodes = getattr(self.problem, 'free_nodes', None)
+        if isinstance(R_raw, dict) and free_nodes is not None:
+            import jax.numpy as _jnp
+            # Reproduce the same true-free list used in make_residual_fn
+            _dset: set = set()
+            _domain = self.problem.domain
+            for _bc in self.problem.boundary_conditions:
+                if _bc.kind == 'dirichlet':
+                    _region = getattr(_bc, 'region', None)
+                    if _region and _region in _domain._boundary_regions:
+                        _ni = _domain._boundary_regions[_region].get('node_indices')
+                        if _ni is not None:
+                            _dset.update(int(i) for i in _ni)
+                    elif hasattr(_bc, 'node_indices') and _bc.node_indices is not None:
+                        _dset.update(int(i) for i in _bc.node_indices)
+            _all_free = set(int(i) for i in free_nodes if int(i) < n_verts)
+            true_free = sorted(_all_free - _dset)
+            n_free = len(true_free)
+            if n_free > 0:
+                # Average absolute residuals across all terms and components
+                R_flat = np.array(_jnp.concatenate(list(R_raw.values())))
+                n_comp = len(R_flat) // n_free
+                R_per_node = np.zeros(n_free, dtype=float)
+                for _k in range(max(n_comp, 1)):
+                    R_per_node += np.abs(R_flat[_k * n_free: (_k + 1) * n_free])
+                R_per_node /= max(n_comp, 1)
+                for _idx, _node in enumerate(true_free):
+                    R_verts[_node] = R_per_node[_idx]
+        elif not isinstance(R_raw, dict):
+            # Legacy: flat (n_dofs,) vector
+            R_flat = np.abs(np.array(R_raw)[:n_verts]).astype(float)
+            if free_nodes is not None:
+                free_set = set(int(i) for i in free_nodes if int(i) < n_verts)
+                for _i, _v in enumerate(R_flat):
+                    if _i in free_set:
+                        R_verts[_i] = _v
+            else:
+                R_verts = R_flat
+
+        # Build a triangulation from the original mesh connectivity.
+        # Mask any triangle that has at least one fully-masked (boundary) vertex
+        # on ALL three corners — tricontourf cannot handle interior NaN nodes.
+        tri_obj = _mtri.Triangulation(verts_xy[:, 0], verts_xy[:, 1], faces)
+
+        # Mask triangles whose nodes are ALL outside free_set (pure boundary triangles)
+        if free_nodes is not None:
+            tri_mask = np.array([
+                np.isnan(R_verts[f[0]]) and np.isnan(R_verts[f[1]]) and np.isnan(R_verts[f[2]])
+                for f in faces
+            ])
+            tri_obj.set_mask(tri_mask)
+
+        # For any remaining triangle that still has a NaN corner, replace NaN
+        # with the mean of the valid corners (edge-boundary triangles touching
+        # both a free interior node and a Dirichlet corner).
+        # This avoids the "masked points within triangulation" ValueError from
+        # tricontourf while keeping the colormap driven by free-node values.
+        R_plot = R_verts.copy()
+        nan_mask = np.isnan(R_plot)
+        if nan_mask.any():
+            valid_mean = float(np.nanmean(R_plot)) if not np.all(nan_mask) else 0.0
+            R_plot[nan_mask] = valid_mean
+
+        ikw = {'cmap': 'inferno'}
+        ikw.update(self._get_imshow_kwargs('residuals'))
+        try:
+            im = ax.tricontourf(tri_obj, R_plot, levels=50, **ikw)
+        except Exception:
+            # Fallback: scatter plot coloured by free-node residuals
+            sc = ax.scatter(verts_xy[:, 0], verts_xy[:, 1],
+                            c=R_plot, cmap='inferno', s=8)
+            im = sc
+
+        # Overlay the original mesh edges
+        ax.triplot(tri_obj, color='white', lw=0.3, alpha=0.4)
+        cbar = self._fig.colorbar(im, ax=ax, label='|R_j| (free nodes only)')
+        self._colorbars.append(cbar)
+        ax.set_title('Weak Residual |R_j| (free nodes)')
+        ax.set_xlabel(self._get_input_name(0))
+        ax.set_ylabel(self._get_input_name(1))
+
+    def _plot_residuals_2d(self, ax, output_idx, n_points=50, plot_key='residuals'):
+        """Plot 2D PDE residuals as heatmap."""
+        from pinns.problems.problem_weak import ProblemWeak as _ProblemWeak
+        if isinstance(self.problem, _ProblemWeak):
+            self._plot_weak_residuals_on_mesh(ax, output_idx)
+            return
+        ikw = {'cmap': 'viridis'}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
+            residuals = self._compute_residuals(dom._vertices)
+            if output_idx < len(residuals):
+                res = np.abs(residuals[output_idx]).flatten()
+            else:
+                res = np.zeros(dom._vertices.shape[0])
+            im = ax.tricontourf(tri, res, levels=50, **ikw)
+            ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_np = np.column_stack([X0.ravel(), X1.ravel()])
+            try:
+                residuals = self._compute_residuals(x_np)
+            except Exception:
+                residuals = []
+            expected = X0.size
+            if output_idx < len(residuals):
+                res = np.abs(residuals[output_idx]).flatten()
+                if res.size != expected:
+                    res = np.zeros(expected)
+            else:
+                res = np.zeros(expected)
+            Res = res.reshape(X0.shape)
+            extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+            im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', **ikw)
+
+        cbar = self._fig.colorbar(im, ax=ax, label='|Residual|')
+        self._colorbars.append(cbar)
+
+        output_name = self._get_output_name(output_idx)
+        ax.set_title(f'PDE Residual ({output_name})')
+        ax.set_xlabel(self._get_input_name(0))
+        ax.set_ylabel(self._get_input_name(1))
+
+    # ==================== Observable Plotting ====================
+
+    def _plot_observable_1d(self, ax, obs_name: str, n_points: int = 200):
+        """Plot a 1D observable field on the given axes."""
+        x_np = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points).reshape(-1, 1)
+        obs = self._evaluate_observables(x_np)
+        if obs_name not in obs:
+            ax.text(0.5, 0.5, f'Observable\n{obs_name!r}\nnot available',
+                    ha='center', va='center', transform=ax.transAxes)
+            return
+        vals = obs[obs_name]   # (n, 1) or (n,)
+        ax.plot(x_np.flatten(), vals.flatten(), linewidth=2)
+        ax.set_xlabel(self._get_input_name(0))
+        ax.set_ylabel(obs_name)
+        ax.set_title(f'Observable: {obs_name}')
+        ax.grid(True, alpha=0.3)
+
+    def _plot_observable_2d(self, ax, obs_name: str, n_points: int = 50):
+        """Plot a scalar 2D observable as a filled contour / heatmap."""
+        ikw = {'cmap': 'viridis'}
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            x_np = dom._vertices
+            obs = self._evaluate_observables(x_np)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_np = np.column_stack([X0.ravel(), X1.ravel()])
+            obs = self._evaluate_observables(x_np)
+
+        if obs_name not in obs:
+            ax.text(0.5, 0.5, f'Observable\n{obs_name!r}\nnot available',
+                    ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'Observable: {obs_name}')
+            return
+
+        vals = obs[obs_name]   # (n, k)
+        scalar = vals[:, 0] if vals.ndim == 2 else vals.flatten()
+
+        if self._is_mesh_domain():
+            tri = mtri.Triangulation(x_np[:, 0], x_np[:, 1], dom._faces)
+            im = ax.tricontourf(tri, scalar, levels=50, **ikw)
+            ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
+        else:
+            Y = scalar.reshape(n_points, n_points)
+            extent = [x_np[:, 0].min(), x_np[:, 0].max(),
+                      x_np[:, 1].min(), x_np[:, 1].max()]
+            im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', **ikw)
+
+        cbar = self._fig.colorbar(im, ax=ax)
+        self._colorbars.append(cbar)
+        ax.set_title(f'Observable: {obs_name}')
+        ax.set_xlabel(self._get_input_name(0))
+        ax.set_ylabel(self._get_input_name(1))
+
+    def _plot_deformed_mesh_spatial(self, ax_ref, ax_def, obs_spatial: list, n_points: int = 50):
+        """Side-by-side deformed-mesh plot.
+
+        ``obs_spatial`` is an ordered list of observable names whose scalar
+        values are the **absolute new positions** of each node (e.g. ``x + u1``,
+        ``y + u2``).
+
+        * Left panel (``ax_ref``): original (undeformed) mesh
+        * Right panel (``ax_def``): deformed mesh coloured by ``‖displacement‖``
+        """
+        if self._is_mesh_domain():
+            dom = self.problem.domain
+            x_np = dom._vertices   # (n, 2)
+        else:
+            x0 = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points)
+            x1 = np.linspace(self.problem.xmin[1], self.problem.xmax[1], n_points)
+            X0, X1 = np.meshgrid(x0, x1)
+            x_np = np.column_stack([X0.ravel(), X1.ravel()])
+
+        obs = self._evaluate_observables(x_np)
+
+        # Stack displacement components: each spatial name contributes one column
+        disp_cols = []
+        for name in obs_spatial:
+            if name not in obs:
+                for ax in (ax_ref, ax_def):
+                    ax.text(0.5, 0.5, f'Spatial observable\n{name!r}\nnot available',
+                            ha='center', va='center', transform=ax.transAxes)
+                    ax.set_title('Deformed mesh')
+                return
+            v = obs[name]   # (n,) or (n, k)
+            disp_cols.append(v[:, 0] if v.ndim == 2 else v.flatten())
+
+        x_def = np.column_stack(disp_cols)              # (n, n_spatial_dims)
+        mag   = np.linalg.norm(x_def - x_np[:, :x_def.shape[1]], axis=1)  # |displacement|
+
+        xlabel = self._get_input_name(0)
+        ylabel = self._get_input_name(1)
+
+        # Shared colour scale across both panels
+        vmin, vmax = mag.min(), mag.max()
+        levels = np.linspace(vmin, vmax, 51)
+
+        # Shared axis limits: union of original and deformed extents
+        all_x = np.concatenate([x_np[:, 0], x_def[:, 0]])
+        all_y = np.concatenate([x_np[:, 1], x_def[:, 1]])
+        pad_x = (all_x.max() - all_x.min()) * 0.05 or 0.05
+        pad_y = (all_y.max() - all_y.min()) * 0.05 or 0.05
+        xlim = (all_x.min() - pad_x, all_x.max() + pad_x)
+        ylim = (all_y.min() - pad_y, all_y.max() + pad_y)
+
+        if self._is_mesh_domain():
+            faces = dom._faces
+            ref_tri = mtri.Triangulation(x_np[:, 0], x_np[:, 1], faces)
+            def_tri = mtri.Triangulation(x_def[:, 0], x_def[:, 1], faces)
+
+            # Left: original mesh coloured by displacement magnitude
+            im = ax_ref.tricontourf(ref_tri, mag, levels=levels, cmap='inferno', vmin=vmin, vmax=vmax)
+            ax_ref.triplot(ref_tri, color='white', lw=0.3, alpha=0.4)
+
+            # Right: deformed mesh coloured by displacement magnitude
+            ax_def.tricontourf(def_tri, mag, levels=levels, cmap='inferno', vmin=vmin, vmax=vmax)
+            ax_def.triplot(def_tri, color='white', lw=0.3, alpha=0.4)
+        else:
+            scatter_kw = dict(c=mag, cmap='inferno', vmin=vmin, vmax=vmax, s=4)
+            im = ax_ref.scatter(x_np[:, 0], x_np[:, 1], **scatter_kw)
+            ax_def.scatter(x_def[:, 0], x_def[:, 1], **scatter_kw)
+
+        for ax, title in ((ax_ref, 'Original (undeformed)'), (ax_def, 'Deformed')):
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+            ax.set_aspect('equal')
+            ax.set_title(title)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+
+        # Place the colorbar to the right of ax_def, and add a matching invisible
+        # axes to the left of ax_ref so both plots remain the same width.
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        div_ref = make_axes_locatable(ax_ref)
+        cax_dummy = div_ref.append_axes("left", size="5%", pad=0.08)
+        cax_dummy.set_visible(False)
+        divider = make_axes_locatable(ax_def)
+        cax = divider.append_axes("right", size="5%", pad=0.08)
+        cbar = self._fig.colorbar(im, cax=cax, label='‖displacement‖')
+        self._colorbars.append(cbar)
+
+    # ==================== FBPINN-specific Plotting ====================
+
+    def _get_subdomain_predictions_np(self, x_np: np.ndarray):
+        """
+        Get subdomain predictions and windows for FBPINN networks.
+        
+        Args:
+            x_np: Input points as numpy array.
+            
+        Returns:
+            Tuple of (predictions, windows) as numpy arrays, or (None, None) if not FBPINN.
+            predictions shape: (n_points, n_subdomains, n_outputs)
+            windows shape: (n_points, n_subdomains)
+        """
+        # Default: not supported. Override in subclass for FBPINN support.
+        return None, None
+
+    def _plot_fbpinn_subdomains_1d(self, ax, output_idx, n_points=200):
+        """Plot individual FBPINN network predictions with their windows."""
+        x_np = np.linspace(self.problem.xmin[0], self.problem.xmax[0], n_points).reshape(-1, 1)
+        
+        predictions, windows = self._get_subdomain_predictions_np(x_np)
+        
+        if predictions is None:
+            return  # Not an FBPINN network
+        
+        if hasattr(self.network, 'domain'):
+            lower_bounds, upper_bounds = self.network.domain.get_subdomain_bounds()
+            n_subdomains = self.network.n_subdomains
+            colors = plt.cm.tab10(np.linspace(0, 1, min(n_subdomains, 10)))
+            
+            for i in range(n_subdomains):
+                pred_i = predictions[:, i, output_idx]
+                
+                # Unnormalize if needed
+                if hasattr(self.network, 'output_range_min') and self.network.output_range_min is not None:
+                    if hasattr(self.network, 'unnormalize_output') and self.network.unnormalize_output:
+                        y_min = np.array(self.network.output_range_min[output_idx])
+                        y_max = np.array(self.network.output_range_max[output_idx])
+                        # Handle tensor conversion if needed
+                        y_min = np.asarray(y_min)
+                        y_max = np.asarray(y_max)
+                        pred_i = (pred_i + 1.0) / 2.0 * (y_max - y_min) + y_min
+                
+                window_i = windows[:, i]
+                mask = window_i > 0.01
+                if mask.any():
+                    color = colors[i % len(colors)]
+                    ax.plot(x_np[mask], pred_i[mask], '-', color=color,
+                           alpha=0.4, linewidth=1.5, label=f'Net {i}' if i < 10 else None)
+
+    def _plot_subdomain_boundaries_2d(self, ax):
+        """Plot 2D subdomain boundaries as rectangles."""
+        from matplotlib.patches import Rectangle
+        
+        if hasattr(self.network, 'domain') and hasattr(self.network.domain, 'get_subdomain_bounds'):
+            lower_bounds, upper_bounds = self.network.domain.get_subdomain_bounds()
+            n_subdomains = self.network.n_subdomains
+            
+            for i in range(n_subdomains):
+                lb = lower_bounds[i]
+                ub = upper_bounds[i]
+                # Convert to numpy
+                lb = np.asarray(lb)
+                ub = np.asarray(ub)
+                width = ub[0] - lb[0]
+                height = ub[1] - lb[1]
+                rect = Rectangle((lb[0], lb[1]), width, height,
+                                linewidth=0.5, edgecolor="white",
+                                facecolor='none', alpha=1, linestyle='--')
+                ax.add_patch(rect)
+
+    # ==================== Sampling Point Plotting ====================
+
+    def _plot_sampling_points_1d(self, ax, cmap='viridis'):
+        """Plot training sampling points on 1D axes."""
+        train_color = '#15B01A'
+        
+        y_min, y_max = ax.get_ylim()
+        y_range = y_max - y_min
+        
+        if self.train_samples[0] > 0:
+            x_train = self.problem.domain.sample_interior(
+                self.train_samples[0], rng=self.rng)
+            n_train = len(x_train)
+            train_size = max(5, min(50, 1000 / n_train))
+            y_train = np.full(n_train, y_min + 0.02 * y_range)
+            ax.scatter(x_train[:, 0], y_train, s=train_size, c=train_color,
+                      alpha=1, marker='|', label=f'Train ({n_train})', zorder=5)
+
+    def _plot_sampling_points_2d(self, ax, cmap='viridis'):
+        """Plot training sampling points on 2D axes."""
+        train_color = '#15B01A'
+        bc_color = '#15B01A'
+        
+        if self.train_samples[0] > 0:
+            x_train = self.problem.domain.sample_interior(
+                self.train_samples[0], rng=self.rng)
+            n_train = len(x_train)
+            train_size = max(1, min(20, 500 / n_train))
+            ax.scatter(x_train[:, 0], x_train[:, 1], s=train_size, c=train_color,
+                      alpha=1, marker='.', label=f'Train ({n_train})', zorder=5)
+        
+        for i, bc in enumerate(self.problem.boundary_conditions):
+            if self.train_samples[i + 1] > 0:
+                x_bc = self._sample_bc_np(bc, self.train_samples[i + 1])
+                n_bc = len(x_bc)
+                bc_size = max(2, min(30, 300 / n_bc))
+                ax.scatter(x_bc[:, 0], x_bc[:, 1], s=bc_size, c=bc_color,
+                          alpha=1, marker='x', zorder=6)
+
+    # ==================== Plot snapshot (rollout override) ====================
+
+    def _plot_mesh_snapshot(self, ax, output_idx, t_val, kind='sol'):
+        """Override: for BPTT rollout, fetch the correct time-step from predict_rollout."""
+        from pinns.problems.problem_weak import ProblemWeak as _PW
+        import numpy as _np
+
+        _is_rollout = (
+            isinstance(self.problem, _PW)
+            and getattr(self.problem.domain, '_time_mode', None) == 'discrete'
+            and getattr(self.problem, 'n_time_steps', None) is not None
+            and hasattr(self.network, 'predict_rollout')
+        )
+        if not _is_rollout or kind not in ('sol', 'err', 'true', 'res'):
+            return self._plot_mesh_snapshot_base(ax, output_idx, t_val, kind)
+
+        domain = self.problem.domain
+        # Always roll out the full domain horizon for plotting
+        n_steps = domain.n_steps
+        dt = float(domain.dt)
+        t_points = _np.array(domain._time_points)  # (n_steps+1,)
+
+        # run rollout over the full domain
+        try:
+            u_all = self.network.predict_rollout(n_steps=n_steps, dt=dt)  # (n_steps+1, n_nodes)
+        except Exception:
+            ax.text(0.5, 0.5, 'Rollout not ready', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=10, color='gray')
+            ax.set_title(f't={t_val:.3g}')
+            return
+
+        # linearly interpolate between the two bracketing time steps
+        t_val_f = float(t_val)
+        idx_hi = int(_np.searchsorted(t_points, t_val_f, side='left'))
+        idx_hi = int(_np.clip(idx_hi, 1, len(t_points) - 1))
+        idx_lo = idx_hi - 1
+        t_lo, t_hi = float(t_points[idx_lo]), float(t_points[idx_hi])
+        alpha = (t_val_f - t_lo) / (t_hi - t_lo) if t_hi > t_lo else 0.0
+        u_snap = (1.0 - alpha) * u_all[idx_lo] + alpha * u_all[idx_hi]
+        t_actual = t_val_f
+
+        import matplotlib.tri as _mtri
+        verts_xy = _np.array(domain._vertices)
+        faces = _np.array(domain._faces)
+        tri_obj = _mtri.Triangulation(verts_xy[:, 0], verts_xy[:, 1], faces)
+
+        if kind == 'sol':
+            vals = u_snap.astype(float)
+            cmap = 'viridis'
+            label = f'u pred (t={t_actual:.3g})'
+            vmin, vmax = 0.0, 1.0
+            im = ax.tricontourf(tri_obj, vals, levels=50, cmap=cmap, vmin=vmin, vmax=vmax)
+            cbar = self._fig.colorbar(im, ax=ax)
+            self._colorbars.append(cbar)
+            ax.set_aspect('equal')
+            ax.set_title(label)
+            ax.set_xlabel('x'); ax.set_ylabel('y')
+
+        elif kind == 'err' and self.problem.solution is not None:
+            x_ref = _np.hstack([verts_xy, _np.full((len(verts_xy), 1), t_actual, dtype=_np.float32)])
+            y_true = self._call_solution(x_ref)
+            if y_true is None:
+                return
+            y_true_np = _np.atleast_2d(y_true).reshape(-1) if y_true.ndim > 1 else y_true
+            err = _np.abs(u_snap - y_true_np)
+            err[~_np.isfinite(err)] = _np.nan
+            vals_plot = _np.where(_np.isnan(err), 0.0, err)
+            cmap = 'viridis'
+            label = f'|error| (t={t_actual:.3g})'
+            im = ax.tricontourf(tri_obj, vals_plot, levels=50, cmap=cmap)
+            cbar = self._fig.colorbar(im, ax=ax)
+            self._colorbars.append(cbar)
+            ax.set_aspect('equal')
+            ax.set_title(label)
+            ax.set_xlabel('x'); ax.set_ylabel('y')
+
+        elif kind == 'true' and self.problem.solution is not None:
+            x_ref = _np.hstack([verts_xy, _np.full((len(verts_xy), 1), t_actual, dtype=_np.float32)])
+            y_true = self._call_solution(x_ref)
+            if y_true is None:
+                return
+            y_true_np = _np.atleast_2d(y_true).reshape(-1) if y_true.ndim > 1 else y_true
+            vals = y_true_np.astype(float)
+            vals_plot = _np.where(_np.isfinite(vals), vals, 0.0)
+            nan_mask = _np.array([
+                not (_np.isfinite(vals[f[0]]) and _np.isfinite(vals[f[1]]) and _np.isfinite(vals[f[2]]))
+                for f in faces
+            ])
+            tri_obj.set_mask(nan_mask)
+            im = ax.tricontourf(tri_obj, vals_plot, levels=50, cmap='viridis', vmin=0.0, vmax=1.0)
+            cbar = self._fig.colorbar(im, ax=ax)
+            self._colorbars.append(cbar)
+            ax.set_aspect('equal')
+            ax.set_title(f'True (t={t_actual:.3g})')
+            ax.set_xlabel('x'); ax.set_ylabel('y')
+
+        elif kind == 'res':
+            # Accumulated |residual| over steps 1..k, where k corresponds to t_val.
+            acc_res = self._compute_rollout_accumulated_residual(u_all)  # (n_steps+1, n_nodes)
+            # Interpolate between bracketing steps (same logic as u_snap above)
+            res_snap = (1.0 - alpha) * acc_res[idx_lo] + alpha * acc_res[idx_hi]
+            vals_plot = res_snap.astype(float)
+            label = f'Accum |R| (t={t_actual:.3g})'
+            im = ax.tricontourf(tri_obj, vals_plot, levels=50, cmap='inferno')
+            cbar = self._fig.colorbar(im, ax=ax)
+            self._colorbars.append(cbar)
+            ax.set_aspect('equal')
+            ax.set_title(label)
+            ax.set_xlabel('x'); ax.set_ylabel('y')
+
+    def _compute_rollout_accumulated_residual(self, u_all):
+        """Compute accumulated absolute per-node weak residual across rollout steps.
+
+        Returns array of shape (n_steps+1, n_nodes) where entry [k] is the
+        sum of |R_1| + |R_2| + ... + |R_k| (entry [0] is all zeros).
+        """
+        import numpy as _np
+        cd   = self.problem.cubature_data
+        phi  = _np.array(cd['phi'],      dtype=float)   # (F, Q, L)
+        gph  = _np.array(cd['grad_phi'], dtype=float)   # (F, Q, L, 2)
+        wts  = _np.array(cd['weights'],  dtype=float)   # (F, Q)
+        nid  = _np.array(cd['node_ids'], dtype=int)     # (F, L)
+        dt   = float(self.problem.domain.dt)
+        kappa = float(self.problem.params.get('kappa', 1.0))
+
+        F, Q, L = phi.shape
+        n_nodes = u_all.shape[1]
+
+        phi_f = phi.reshape(F * Q, L)           # (FQ, L)
+        gph_f = gph.reshape(F * Q, L, 2)        # (FQ, L, 2)
+        wts_f = wts.reshape(F * Q)              # (FQ,)
+        # node id for each (quad-pt, basis-fn) pair
+        nid_f = _np.tile(nid[:, None, :], (1, Q, 1)).reshape(F * Q, L)  # (FQ, L)
+
+        acc = _np.zeros(n_nodes, dtype=float)
+        result = [acc.copy()]  # step 0: zero residual (no step taken)
+
+        for n in range(1, u_all.shape[0]):
+            u_prev = u_all[n - 1].astype(float)  # (n_nodes,)
+            u_next = u_all[n].astype(float)       # (n_nodes,)
+
+            u_prev_cub = _np.sum(phi_f * u_prev[nid_f], axis=-1)   # (FQ,)
+            u_next_cub = _np.sum(phi_f * u_next[nid_f], axis=-1)   # (FQ,)
+            grad_u     = _np.einsum('kl,kli->ki', u_next[nid_f], gph_f)  # (FQ, 2)
+
+            mass  = phi_f * ((u_next_cub - u_prev_cub) / dt)[:, None]  # (FQ, L)
+            diff  = kappa * _np.einsum('ki,kli->kl', grad_u, gph_f)    # (FQ, L)
+            contrib = (mass + diff) * wts_f[:, None]                    # (FQ, L)
+
+            R = _np.zeros(n_nodes, dtype=float)
+            _np.add.at(R, nid_f.reshape(-1), contrib.reshape(-1))
+
+            acc = acc + _np.abs(R)
+            result.append(acc.copy())
+
+        return _np.stack(result, axis=0)  # (n_steps+1, n_nodes)

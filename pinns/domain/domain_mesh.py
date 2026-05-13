@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union, Literal, Tuple, Lis
 from dataclasses import dataclass
 
 if TYPE_CHECKING:
-    from ..terms import TermDirichletBC, TermNeumannBC, TermRobinBC, TermPoints
+    from ..problems.terms import TermDirichletBC, TermNeumannBC, TermRobinBC
 
 class DomainMesh:
     """
@@ -258,6 +258,7 @@ class DomainMesh:
         # Named sampling regions (fully independent from the BC system).
         self._inner_regions:    dict = {}
         self._boundary_regions: dict = {}
+        self._periodic_regions: dict = {}
 
         # Partition (set via set_partition()).
         self._partition_labels:          np.ndarray | None = None
@@ -714,6 +715,10 @@ class DomainMesh:
         v0      = self._vertices[edges[:, 0]]
         v1      = self._vertices[edges[:, 1]]
         lengths = np.linalg.norm(v1 - v0, axis=1)
+        # Precompute outward normals for 2-D meshes only; 3-D surface meshes
+        # don't have a meaningful in-plane edge normal via this method.
+        normals = (self._infer_edge_outward_normals(edges)
+                   if self._spatial_dims == 2 else None)
         t_lo, t_hi = self._resolve_time_region(time)
         self._boundary_regions[name] = {
             'node_indices': node_idx,
@@ -721,8 +726,57 @@ class DomainMesh:
             'edges':        edges,
             'edge_lengths': lengths,
             'edge_probs':   lengths / lengths.sum(),
+            'normals':      normals,
             't_lo':         t_lo,
             't_hi':         t_hi,
+        }
+
+    def add_periodic(self, select_a, select_b, name: str) -> None:
+        """Register a **periodic** boundary pairing between two boundary regions.
+
+        Pairs nodes on *select_a* with their nearest neighbours on *select_b*
+        using a KD-tree (after shifting *select_a* toward *select_b*).  The
+        matched arrays are stored in ``domain._periodic_regions[name]`` and
+        can be referenced by name from :meth:`~pinns.problems.BaseProblem.add_periodic`.
+
+        Args:
+            select_a: Boundary-node selector for the first boundary (same forms
+                as in :meth:`add_boundary`).
+            select_b: Boundary-node selector for the second boundary.
+            name: String label stored in ``_periodic_regions``.
+
+        Raises:
+            UserWarning: If the largest pairing distance exceeds 10% of the
+                mean shift distance (nodes not well matched).
+
+        Example::
+
+            domain.add_periodic(lambda v: np.abs(v[:, 0]) < 1e-6,
+                                 lambda v: np.abs(v[:, 0] - 1.0) < 1e-6,
+                                 name='per_x')
+        """
+        from scipy.spatial import cKDTree
+        import warnings
+        edges_a = self._all_edges[self._resolve_select(select_a)]
+        edges_b = self._all_edges[self._resolve_select(select_b)]
+        pts_a = self._vertices[np.unique(edges_a)]
+        pts_b = self._vertices[np.unique(edges_b)]
+        shift = pts_b.mean(axis=0) - pts_a.mean(axis=0)
+        pts_a_shifted = pts_a + shift
+        tree = cKDTree(pts_b)
+        dists, idx = tree.query(pts_a_shifted, k=1)
+        max_dist = dists.max()
+        tol = np.linalg.norm(shift) * 0.1 + 1e-10
+        if max_dist > tol:
+            warnings.warn(
+                f"add_periodic('{name}'): largest pairing distance is {max_dist:.4g}."
+                " The two boundaries may not have matching node distributions.",
+                UserWarning,
+            )
+        pts_b_matched = pts_b[idx]
+        self._periodic_regions[name] = {
+            'node_positions_a': pts_a.astype(np.float32),
+            'node_positions_b': pts_b_matched.astype(np.float32),
         }
 
     # ------------------------------------------------------------------ #
@@ -1007,6 +1061,51 @@ class DomainMesh:
         normals[flip] *= -1
         return normals
 
+    def get_boundary_normals(self, x: np.ndarray, region: str) -> np.ndarray:
+        """Return outward unit normals at *x* for the given boundary *region*.
+
+        For each query point the normal of the nearest boundary edge
+        (by midpoint distance) is returned.  Normals are precomputed when
+        :meth:`add_boundary` is called and are available for **2-D meshes**
+        only; 3-D surface meshes do not have unambiguous in-plane normals.
+
+        Args:
+            x:      Query coordinates, shape ``(n, n_dims)``.
+            region: Name of a boundary region registered with
+                    :meth:`add_boundary`.
+
+        Returns:
+            ``np.ndarray`` of shape ``(n, 2)`` outward unit normals.
+
+        Raises:
+            KeyError:            If *region* has not been registered.
+            NotImplementedError: If the mesh is 3-D (normals unavailable).
+        """
+        if region not in self._boundary_regions:
+            raise KeyError(
+                f"Boundary region '{region}' not registered. "
+                f"Available: {list(self._boundary_regions.keys())}"
+            )
+        reg = self._boundary_regions[region]
+        normals_arr = reg.get('normals')
+        if normals_arr is None:
+            raise NotImplementedError(
+                f"Outward normals are not available for region '{region}' on a "
+                "3-D DomainMesh.  Only 2-D meshes precompute edge normals."
+            )
+        # Build (and cache) a KD-tree over edge midpoints.
+        if '_normal_tree' not in reg:
+            from scipy.spatial import KDTree
+            edges = reg['edges']
+            midpoints = (
+                self._vertices[edges[:, 0]] +
+                self._vertices[edges[:, 1]]
+            ) / 2.0
+            reg['_normal_tree'] = KDTree(midpoints)
+        tree = reg['_normal_tree']
+        _, idx = tree.query(x[:, :normals_arr.shape[1]])
+        return normals_arr[idx].astype(np.float32)
+
     # ------------------------------------------------------------------ #
     #  Temporal-overlap validation                                        #
     # ------------------------------------------------------------------ #
@@ -1234,6 +1333,13 @@ class DomainMesh:
             if n_inner > 0:
                 parts.append(self._sample_partition_inner_boundary(n_inner, size, rng))
             return np.vstack(parts)
+        # ── periodic region: return stacked pair (side A then side B) ────
+        if isinstance(region, str) and region in self._periodic_regions:
+            _pr = self._periodic_regions[region]
+            x_a = np.asarray(_pr['node_positions_a'], dtype=np.float32)
+            x_b = np.asarray(_pr['node_positions_b'], dtype=np.float32)
+            return np.concatenate([x_a, x_b], axis=0)
+
         if isinstance(region, str):
             if region not in self._boundary_regions:
                 raise KeyError(
@@ -1246,53 +1352,65 @@ class DomainMesh:
         raise ValueError(f"Invalid region: {region!r}")
 
     def sample_boundary_bc(self, bc, n_points: int, rng=None) -> np.ndarray:
-        """Sample *n_points* from a specific :class:`~pinns.boundary.TermMeshNodeBC`.
+        """Sample *n_points* for a registered BC term.
 
-        This is the **trainer-internal** method called by
-        :class:`~pinns.backends.base_trainer.BaseTrainer` during the BC loss
-        computation.  It differs from :meth:`sample_boundary` in two key ways:
+        Geometry is looked up from ``domain._boundary_regions[bc.region]`` —
+        the Term itself carries only the region name string.
 
-        1. It accepts a ``TermMeshNodeBC`` object directly instead of a region name,
-           so the trainer drives sampling from its registered BC list.
-        2. It returns a ``(pts, edge_idx)`` *tuple* — the edge indices are
-           needed by the trainer to look up per-edge outward normals for Neumann
-           conditions (``bc.edge_normals[edge_idx]``).
-
-        When the BC has precomputed edges, points are interpolated *along* the
-        boundary edges (weighted by edge length) rather than snapping to mesh
-        node positions, giving continuous coverage.  When no edges are stored
-        (isolated-node or initial-condition BCs) the method falls back to
-        sampling from ``bc.node_positions``.
+        Returns ``(pts, edge_idx)`` where *edge_idx* indexes into the region's
+        edge array (needed by the trainer to fetch per-edge normals for Neumann
+        BCs).  For node-only regions (e.g. initial conditions) *edge_idx*
+        contains node indices instead.
 
         A time coordinate is appended according to ``bc.time_window``.
 
         Args:
-            bc: A :class:`~pinns.boundary.TermMeshNodeBC` that has already been
-                appended to ``self.boundary_conditions``.
+            bc: A BC Term with a ``region`` attribute.
             n_points: Number of collocation points to draw.
             rng: NumPy random generator.
 
         Returns:
-            ``(pts, edge_idx)`` where *pts* is ``(n_points, n_dims)`` and
-            *edge_idx* is a 1-D integer array of length *n_points* holding
-            the sampled edge index for each point.
+            ``(pts, idx)`` where *pts* is ``(n_points, n_dims)`` and *idx*
+            is a 1-D integer array of length *n_points*.
         """
         if rng is None:
             rng = np.random.default_rng()
 
-        if bc.edges is not None:
-            # ── Edge-based sampling: uniform along boundary edges ──────────
-            probs    = bc.edge_lengths / bc.edge_lengths.sum()
-            idx      = rng.choice(len(bc.edges), size=n_points, p=probs)
-            t_param  = rng.uniform(0.0, 1.0, (n_points, 1))
-            v0       = self._vertices[bc.edges[idx, 0]]
-            v1       = self._vertices[bc.edges[idx, 1]]
-            pts_sp   = v0 + t_param * (v1 - v0)
+        region = getattr(bc, 'region', None)
+        if region == 'all':
+            edges   = self._bnd_edges
+            lengths = self._bnd_edge_lengths
+            probs   = self._bnd_edge_probs
+        elif region and region in self._boundary_regions:
+            reg     = self._boundary_regions[region]
+            edges   = reg.get('edges')
+            lengths = reg.get('edge_lengths')
+            probs   = reg.get('edge_probs')
         else:
-            # ── Fallback: sample from discrete node positions ──────────────
+            edges = lengths = probs = None
+
+        if edges is not None:
+            # ── Edge-based sampling: uniform along boundary edges ──────────
+            idx     = rng.choice(len(edges), size=n_points, p=probs)
+            t_param = rng.uniform(0.0, 1.0, (n_points, 1))
+            v0      = self._vertices[edges[idx, 0]]
+            v1      = self._vertices[edges[idx, 1]]
+            pts_sp  = v0 + t_param * (v1 - v0)
+        elif region and region in self._boundary_regions:
+            # ── Node-only fallback (e.g. IC regions with no edges) ─────────
+            ni      = self._boundary_regions[region]['node_indices']
+            idx     = rng.integers(0, len(ni), n_points)
+            pts_sp  = self._vertices[ni[idx]]
+        elif hasattr(bc, 'node_positions'):
+            # ── Legacy fallback for any BC that still carries node_positions ─
             n_nodes = len(bc.node_positions)
             idx     = rng.integers(0, n_nodes, n_points)
             pts_sp  = bc.node_positions[idx]
+        else:
+            raise ValueError(
+                f"sample_boundary_bc: cannot sample BC with region={region!r}: "
+                "no edges or node_indices found in domain._boundary_regions."
+            )
 
         tw = getattr(bc, 'time_window', None)
         if self._t_min is None or tw is None:

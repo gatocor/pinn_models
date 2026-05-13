@@ -6,13 +6,12 @@ is a plain dataclass that:
 
 * Stores **only the loss specification** — what to enforce (value / residual
   function) and **where** (a region name string).
-* Exposes ``compute_loss_dict(x, y, ops)`` → ``{name: scalar_loss}``.
-* Carries **no resolved coordinates**, node arrays, or edge lists — those
-  live on the domain.
+* Carries **no resolved coordinates**, node arrays, edge lists, or problem-form
+  specific evaluation logic — those live on the problem and trainer.
 
-The trainer calls ``domain.sample_boundary(n, region=term.region)`` to
-obtain collocation points, then sets ``ops.normals`` before calling
-``term.compute_loss_dict(x, y, ops)`` for Neumann / Robin terms.
+The trainer (or problem's ``make_residual_fn``) reads ``term.kind`` and the
+relevant data fields (``value``, ``component``, ``fn``/``f``, ``components``,
+``outputs``, ``eq_idx``) to compute residuals appropriate for the problem form.
 
 Boundary region names
 ---------------------
@@ -36,7 +35,6 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Union, Callable, Optional, List
 
-
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
@@ -53,48 +51,6 @@ def _call_value_function(value_fn, x) -> np.ndarray:
         result = result.squeeze(-1)
     return result
 
-def _call_residual_fn(fn, x, y, ops):
-    """Call *fn* with the right number of arguments and return a tuple of residuals."""
-    import inspect as _inspect
-    n_p = len(_inspect.signature(fn).parameters)
-    if n_p >= 4:
-        residual = fn(x, y, ops.params_dict, None)
-    elif n_p == 3:
-        residual = fn(x, y, ops.params_dict)
-    else:
-        residual = fn(x, y)
-    return residual if isinstance(residual, (list, tuple)) else (residual,)
-
-
-# ---------------------------------------------------------------------------
-# TermOps — backend operation bundle
-# ---------------------------------------------------------------------------
-
-class TermOps:
-    """Bundle of backend tensor operations passed to every ``compute_loss_dict``.
-
-    Created by ``Trainer._make_bc_ops(params_dict)`` so that term classes can
-    compute losses without importing or depending on any backend.
-
-    Attributes:
-        to_tensor: ``(np.ndarray) -> tensor`` — convert numpy to backend type.
-        mean_sq: ``(tensor) -> scalar`` — mean of squared residual values.
-        directional_derivative: ``(x, component, dim) -> du_component/dx_dim``.
-        params_dict: Structured parameters dict (fixed + inferred params).
-        normals: Per-point outward unit normal vectors as a backend tensor,
-                 shape ``(n, n_spatial_dims)``.  Set by the trainer before
-                 calling ``compute_loss_dict`` on Neumann / Robin terms.
-                 ``None`` for terms that do not need normals.
-    """
-
-    def __init__(self, to_tensor, mean_sq, directional_derivative,
-                 params_dict=None, normals=None):
-        self.to_tensor = to_tensor
-        self.mean_sq = mean_sq
-        self.directional_derivative = directional_derivative
-        self.params_dict = params_dict
-        self.normals = normals          # (n, n_spatial_dims) tensor or None
-
 
 # ---------------------------------------------------------------------------
 # Boundary / constraint terms
@@ -108,8 +64,9 @@ class TermDirichletBC:
         region: Name of the boundary region on the domain (e.g. ``'xmin'``,
                 ``'left_wall'``).  Built-in face labels are resolved
                 automatically for :class:`~pinns.domain.DomainCubic`.
-        value: Target value — scalar float or callable
-               ``(x: np.ndarray) -> np.ndarray`` returning ``(n,)``.
+        value: Target value — scalar float, callable
+               ``(x: np.ndarray) -> np.ndarray`` returning ``(n,)``, or
+               callable ``(x, params_dict) -> array`` (strong-form usage).
         component: Output component index (default 0).
         name: Label used in loss / weight dicts.
 
@@ -124,15 +81,27 @@ class TermDirichletBC:
     component: int           = 0
     name:      Optional[str] = None
 
-    def get_value(self, x) -> np.ndarray:
+    # class-level kind string — used by the trainer for routing
+    kind:      'ClassVar[str]'  = 'dirichlet'
+    has_value: 'ClassVar[bool]' = True
+
+    def get_value(self, x, params_dict=None) -> np.ndarray:
+        """Evaluate the prescribed value at *x*.
+
+        Supports three callable forms:
+        * ``(x) -> array``
+        * ``(x, params_dict) -> array``
+        * scalar constant
+        """
         if callable(self.value):
-            return _call_value_function(self.value, x)
+            import inspect as _inspect
+            n_p = len(_inspect.signature(self.value).parameters)
+            if n_p >= 2:
+                result = self.value(x, params_dict)
+            else:
+                result = _call_value_function(self.value, x)
+            return np.asarray(result, dtype=np.float32)
         return np.full(x.shape[0], float(self.value), dtype=np.float32)
-
-    def compute_loss_dict(self, x, y, ops) -> dict:
-        target = ops.to_tensor(self.get_value(x))
-        return {self.name or 'bc': ops.mean_sq(y[:, self.component] - target)}
-
 
 @dataclass
 class TermNeumannBC:
@@ -154,24 +123,23 @@ class TermNeumannBC:
     """
     region:    str
     value:     Union[float, Callable]
-    component: int           = 0
-    name:      Optional[str] = None
+    component: int                = 0
+    name:      Optional[str]      = None
+    fn:        Optional[Callable] = None   # pre-built residual closure (strong form)
 
-    def get_value(self, x) -> np.ndarray:
+    kind:      'ClassVar[str]'  = 'neumann'
+    has_value: 'ClassVar[bool]' = True
+
+    def get_value(self, x, params_dict=None) -> np.ndarray:
         if callable(self.value):
-            return _call_value_function(self.value, x)
+            import inspect as _inspect
+            n_p = len(_inspect.signature(self.value).parameters)
+            if n_p >= 2:
+                result = self.value(x, params_dict)
+            else:
+                result = _call_value_function(self.value, x)
+            return np.asarray(result, dtype=np.float32)
         return np.full(x.shape[0], float(self.value), dtype=np.float32)
-
-    def compute_loss_dict(self, x, y, ops) -> dict:
-        """Requires ``ops.normals`` to be set by the trainer."""
-        normals = ops.normals            # (n, n_spatial_dims) tensor
-        n_dims  = normals.shape[1] if hasattr(normals, 'shape') else len(normals[0])
-        du_dn   = sum(
-            ops.directional_derivative(x, self.component, d) * normals[:, d]
-            for d in range(n_dims)
-        )
-        target = ops.to_tensor(self.get_value(x))
-        return {self.name or 'bc': ops.mean_sq(du_dn - target)}
 
 
 @dataclass
@@ -195,25 +163,23 @@ class TermRobinBC:
     alpha:     float
     beta:      float
     value:     Union[float, Callable]
-    component: int           = 0
-    name:      Optional[str] = None
+    component: int                = 0
+    name:      Optional[str]      = None
+    fn:        Optional[Callable] = None   # pre-built residual closure (strong form)
 
-    def get_value(self, x) -> np.ndarray:
+    kind:      'ClassVar[str]'  = 'robin'
+    has_value: 'ClassVar[bool]' = True
+
+    def get_value(self, x, params_dict=None) -> np.ndarray:
         if callable(self.value):
-            return _call_value_function(self.value, x)
+            import inspect as _inspect
+            n_p = len(_inspect.signature(self.value).parameters)
+            if n_p >= 2:
+                result = self.value(x, params_dict)
+            else:
+                result = _call_value_function(self.value, x)
+            return np.asarray(result, dtype=np.float32)
         return np.full(x.shape[0], float(self.value), dtype=np.float32)
-
-    def compute_loss_dict(self, x, y, ops) -> dict:
-        """Requires ``ops.normals`` to be set by the trainer."""
-        normals = ops.normals
-        n_dims  = normals.shape[1] if hasattr(normals, 'shape') else len(normals[0])
-        du_dn   = sum(
-            ops.directional_derivative(x, self.component, d) * normals[:, d]
-            for d in range(n_dims)
-        )
-        gamma    = ops.to_tensor(self.get_value(x))
-        residual = self.alpha * y[:, self.component] + self.beta * du_dn - gamma
-        return {self.name or 'bc': ops.mean_sq(residual)}
 
 
 @dataclass
@@ -240,20 +206,22 @@ class TermCustomBC:
         def traction(x, y):
             # sigma_xx*nx + sigma_xy*ny = tx
             ...
-        TermCustomBC(region='right', f=traction, name='traction')
+        TermCustomBC(region='right', fn=traction, name='traction')
     """
     region:       str
-    f:            Callable
+    fn:           Callable
     name:         Optional[str]       = None
     output_names: Optional[List[str]] = None
+    eq_idx:       Optional[int]       = None
 
-    def compute_loss_dict(self, x, y, ops) -> dict:
-        residuals = _call_residual_fn(self.f, x, y, ops)
+    kind:      'ClassVar[str]'  = 'boundary'
+    has_value: 'ClassVar[bool]' = False
+
+    def _output_names(self, residuals):
         base  = self.name or 'bc'
-        names = (self.output_names
-                 or ([base] if len(residuals) == 1
-                     else [f'{base}_{k}' for k in range(len(residuals))]))
-        return {n: ops.mean_sq(r) for n, r in zip(names, residuals)}
+        return (self.output_names
+                or ([base] if len(residuals) == 1
+                    else [f'{base}_{k}' for k in range(len(residuals))]))
 
 
 @dataclass
@@ -264,93 +232,41 @@ class TermPeriodicBC:
     ``region_b`` (either by random node pairing on a mesh or by sampling the
     lower / upper face of the same spatial dimension on a cubic domain).
 
-    This term has **no** ``compute_loss_dict`` — the trainer handles it
-    specially because it needs two forward passes at *different* coordinates.
+    For strong-form problems (via :meth:`~ProblemStrong.add_periodic`) the
+    boundary residual is supplied by ``fn`` — in that case ``region_a`` holds
+    the axis name (``'x'``, ``'y'``, …) and ``region_b`` may be left empty.
 
     Args:
-        region_a: Name of the first boundary region (e.g. ``'xmin'``).
-        region_b: Name of the matching boundary region (e.g. ``'xmax'``).
+        region_a: Name of the first boundary region (e.g. ``'xmin'``), or
+                  the axis label for strong-form periodic BCs.
+        region_b: Name of the matching boundary region (e.g. ``'xmax'``).  
+                  May be empty (``''``) for strong-form usage.
         n_pairs: Number of collocation pairs.  ``None`` → use all available
                  node pairs (DomainMesh) or a default count (DomainCubic).
         component: Output component to enforce, or ``None`` for all components.
         name: Base label used in weight dicts.
         match_x_derivative: If ``True``, also penalise the tangential derivative
                              mismatch ``|du/ds(x_a) - du/ds(x_b)|^2``.
+        fn: Residual callable for strong-form usage.  ``None`` for weak form.
 
     Example::
 
         TermPeriodicBC(region_a='xmin', region_b='xmax',
                        component=0, name='periodic_x')
     """
-    region_a:           str
-    region_b:           str
+    region:             str           = ''
+    region_a:           str           = ''
+    region_b:           str           = ''
     n_pairs:            Optional[int] = None
     component:          Optional[int] = None
     name:               Optional[str] = None
     match_x_derivative: bool          = True
+    fn:                 Optional[Callable] = None
 
-
-# ---------------------------------------------------------------------------
-# Data / observation term
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TermPoints:
-    """Data-assimilation term at arbitrary fixed coordinates.
-
-    Points may lie anywhere — on the boundary, in the interior, or scattered
-    measurement data.  The trainer always uses **all** points in a single
-    batch (no domain-based sampling).
-
-    When multiple output components are supervised, provide an ``(N, K)``
-    target array and a matching ``components`` list.  Each column produces
-    one independent sub-loss.
-
-    Args:
-        inputs: ``(N, n_dims)`` observation coordinates.
-        outputs: ``(N, K)`` target values.  A 1-D array of length ``N`` is
-                 treated as ``(N, 1)``.
-        components: Network output index for each column of *outputs*.
-        name: Base label used in weight dicts and plots.
-        output_names: Optional per-column labels.
-
-    Example::
-
-        obs = TermPoints(inputs=x_meas, outputs=u_meas, components=0, name='obs')
-    """
-    inputs:       'np.ndarray'
-    outputs:      'np.ndarray'
-    components:   Union[int, List[int]] = 0
-    name:         Optional[str]         = None
-    output_names: Optional[List[str]]   = None
-
-    def __post_init__(self):
-        self.inputs  = np.asarray(self.inputs,  dtype=np.float32)
-        self.outputs = np.asarray(self.outputs, dtype=np.float32)
-        if self.inputs.ndim  == 1: self.inputs  = self.inputs[:, None]
-        if self.outputs.ndim == 1: self.outputs = self.outputs[:, None]
-        if isinstance(self.components, int):
-            self.components = [self.components]
-        n_cols = self.outputs.shape[1]
-        if n_cols != len(self.components):
-            raise ValueError(
-                f"TermPoints '{self.name}': outputs has {n_cols} column(s) "
-                f"but components has {len(self.components)} element(s)."
-            )
-
-    def get_input_names(self) -> List[str]:
-        base = self.name or 'pts'
-        if self.output_names is not None:
-            return list(self.output_names)
-        return [base] if len(self.components) == 1 else \
-               [f'{base}_{k}' for k in range(len(self.components))]
-
-    def compute_loss_dict(self, x, y, ops) -> dict:
-        out_names = self.get_input_names()
-        return {
-            oname: ops.mean_sq(y[:, comp] - ops.to_tensor(self.outputs[:, k]))
-            for k, (comp, oname) in enumerate(zip(self.components, out_names))
-        }
+    kind:      'ClassVar[str]'  = 'periodic'
+    has_value: 'ClassVar[bool]' = False
+    eq_idx = None
+    rhs    = None
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +288,10 @@ class TermInner:
                 ``None`` → full interior.
         output_names: Per-residual labels when *fn* returns a tuple.
 
+        eq_idx: When set, select only this column from a multi-equation *fn*
+                return. Used internally when ``add_inner(fn, name=[...])`` creates
+                one term per equation.
+
     Example::
 
         TermInner(fn=heat_residual, name='heat')
@@ -381,28 +301,15 @@ class TermInner:
     name:         str              = 'pde'
     region:       Optional[str]    = None
     output_names: Optional[List[str]] = None
+    eq_idx:       Optional[int]    = None
 
-    def compute_loss_dict(self, x, y, ops) -> dict:
-        residuals = _call_residual_fn(self.fn, x, y, ops)
-        base  = self.name
-        names = (self.output_names
-                 or ([base] if len(residuals) == 1
-                     else [f'{base}_{k}' for k in range(len(residuals))]))
-        return {n: ops.mean_sq(r) for n, r in zip(names, residuals)}
+    kind:      'ClassVar[str]'  = 'inner'
+    has_value: 'ClassVar[bool]' = False
 
 
 @dataclass
 class TermInitial:
     """Initial-condition residual term, sampled from the ``t = t_min`` slice.
-
-    Structurally identical to :class:`TermInner` but marks the term as an
-    initial condition so the trainer samples from the initial-time surface
-    rather than the full interior.
-
-    Args:
-        fn: Residual callable ``f(x, y[, params[, derivative]])``.
-        name: Base label used in loss / weight dicts.
-        output_names: Per-residual labels when *fn* returns a tuple.
 
     Example::
 
@@ -411,14 +318,11 @@ class TermInitial:
     fn:           Callable
     name:         str              = 'ic'
     output_names: Optional[List[str]] = None
+    region:       str              = 'initial'
+    output_idx:   Optional[int]    = None
 
-    def compute_loss_dict(self, x, y, ops) -> dict:
-        residuals = _call_residual_fn(self.fn, x, y, ops)
-        base  = self.name
-        names = (self.output_names
-                 or ([base] if len(residuals) == 1
-                     else [f'{base}_{k}' for k in range(len(residuals))]))
-        return {n: ops.mean_sq(r) for n, r in zip(names, residuals)}
+    kind:      'ClassVar[str]'  = 'initial'
+    has_value: 'ClassVar[bool]' = False
 
 
 # ---------------------------------------------------------------------------

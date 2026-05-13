@@ -8,17 +8,18 @@ __version__ = "0.1.0"
 from .domain import DomainCubic, DomainMesh, SubdomainInfo, bump
 
 # Residual terms (boundary conditions + interior / initial / data-point terms)
-from .terms import (
+from .problems.terms import (
     # BC classes
     TermDirichletBC, TermNeumannBC, TermRobinBC,
     TermCustomBC,
-    TermPoints,
     TermPeriodicBC,
     TermCollection,
-    TermOps,
-    # Interior / initial / data-point PDE terms
+    # Interior / initial PDE terms
     TermInner, TermInitial,
 )
+
+# Dataset (fixed observation / measurement data)
+from .dataset import Dataset, TermPoints
 
 # Strategies
 from .models.partition import PartitionFB, PartitionX, register_interface_loss
@@ -58,10 +59,9 @@ __all__ = [
     # BC classes
     "TermDirichletBC", "TermNeumannBC", "TermRobinBC",
     "TermCustomBC",
-    "TermPoints",
+    "Dataset", "TermPoints",
     "TermPeriodicBC",
     "TermCollection",
-    "TermOps",
     # Interior / initial / data-point PDE terms
     "TermInner", "TermInitial",
     "FNN", "WFFNN", "PirateNet", "ResNet", "RandomFourierFeatures", "FourierFeatures", "DenseRWF",

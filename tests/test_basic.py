@@ -67,7 +67,7 @@ def test_boundary_conditions():
 
 
 def test_term_points():
-    """TermPoints with observation data."""
+    """TermPoints with observation data (lives in pinns.dataset)."""
     from pinns import TermPoints
 
     x_obs = np.random.rand(50, 2).astype(np.float32)

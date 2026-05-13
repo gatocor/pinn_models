@@ -37,7 +37,6 @@ optimizer : str
 """
 
 import time
-import inspect
 
 import jax
 import jax.numpy as jnp
@@ -134,7 +133,7 @@ class SchedulerLagrange(Scheduler):
         save_plots = trainer._save_plots
 
         params_dict  = trainer._build_params()
-        weights_dict = trainer._list_to_dict_weights(trainer.weights)
+        weights_dict = trainer.weights
 
         compute_al_loss, _ = self._build_al_loss_fn(trainer, params_dict)
         lag_lr_ratio = self.lr / max(float(
@@ -335,15 +334,14 @@ class SchedulerLagrange(Scheduler):
             if name in trainer._train_data and (rc is None or name in rc):
                 _add(name, len(trainer._train_data[name]))
 
-        # TermPeriodicBC pairs
-        from pinns.terms import TermPeriodicBC as _PBC
+        # Periodic BC pairs
         _n_out = (len(trainer.problem.output_names)
                   if (hasattr(trainer.problem, 'output_names')
                       and trainer.problem.output_names)
                   else getattr(trainer.problem, 'n_outputs', 1))
         for bc in getattr(getattr(trainer.problem, 'domain', None),
                           'boundary_conditions', []):
-            if not isinstance(bc, _PBC):
+            if getattr(bc, 'kind', None) != 'periodic':
                 continue
             comps = ([bc.component] if bc.component is not None
                      else list(range(_n_out)))
@@ -389,161 +387,19 @@ class SchedulerLagrange(Scheduler):
 
     def _build_al_loss_fn(self, trainer, params_dict):
         """Return ``(compute_al_loss, compute_residuals)`` closures."""
-        from pinns.functional import make_derivative_fn, set_context, clear_context
-        from pinns.terms import TermNeumannBC, TermRobinBC, TermPeriodicBC
-
-        rc   = self._resolved_constraints
-        sched = self  # alias for inner closures
-
-        def _constraint_uses_quad(name):
-            return trainer._constraint_uses_quadratic(name)
-
-        # ── ProblemWeak ───────────────────────────────────────────────
         from pinns.problems.problem_weak import ProblemWeak as _PW
         if isinstance(trainer.problem, _PW):
             return self._build_al_loss_fn_weak(trainer, params_dict)
 
-        # ── ProblemStrong ─────────────────────────────────────────────
         from pinns.problems.problem_strong import ProblemStrong as _PS
         if isinstance(trainer.problem, _PS):
             return self._build_al_loss_fn_strong(trainer, params_dict)
 
-        # ── Generic (old Problem API) ─────────────────────────────────
-        network  = trainer.network
-        pde_fn   = trainer.problem.pde_fn
-        pde4args = len(inspect.signature(pde_fn).parameters) >= 4
-
-        def _model(params, x):
-            return network.apply(params, x, params_dict)
-
-        bc_names = trainer._get_bc_names()
-        bc_info  = {}
-        _periodic_entries = []
-        _n_out = (len(trainer.problem.output_names)
-                  if (hasattr(trainer.problem, 'output_names')
-                      and trainer.problem.output_names)
-                  else getattr(trainer.problem, 'n_outputs', 1))
-
-        # Periodic AL entries
-        import numpy as _np
-        for bc in getattr(getattr(trainer.problem, 'domain', None),
-                          'boundary_conditions', []):
-            if not isinstance(bc, TermPeriodicBC):
-                continue
-            if hasattr(bc, 'node_positions_a'):
-                _xa = jnp.asarray(bc.node_positions_a, dtype=jnp.float32)
-                _xb = jnp.asarray(bc.node_positions_b, dtype=jnp.float32)
-            else:
-                _rng = _np.random.default_rng()
-                _n   = bc.n_pairs or 200
-                _xa  = jnp.asarray(
-                    trainer.problem.domain.sample_boundary(_n, region=bc.region_a, rng=_rng),
-                    dtype=jnp.float32)
-                _xb  = jnp.asarray(
-                    trainer.problem.domain.sample_boundary(_n, region=bc.region_b, rng=_rng),
-                    dtype=jnp.float32)
-            comps = ([bc.component] if bc.component is not None
-                     else list(range(_n_out)))
-            for i in comps:
-                sub = bc.name if bc.component is not None else f'{bc.name}_{i}'
-                _periodic_entries.append({
-                    'name': sub, 'x_a': _xa, 'x_b': _xb,
-                    'component': i, 'dim': 1,
-                    'match_deriv': getattr(bc, 'match_x_derivative', False),
-                })
-
-        name_idx = 0
-        for bc in getattr(trainer.problem, 'boundary_conditions', []):
-            if isinstance(bc, TermPeriodicBC):
-                continue
-            name = bc_names[name_idx]; name_idx += 1
-            is_nm = isinstance(bc, (TermNeumannBC, TermRobinBC))
-            bc_info[name] = {
-                'component':      bc.component,
-                'is_neumann':     is_nm,
-                'const_value':    bc.value if not callable(bc.value) else None,
-                'normal_dim':     0,
-                'normal_sign':    1,
-            }
-            if is_nm:
-                _ni = trainer.problem.domain.get_face_normal_direction(
-                    getattr(bc, 'region', '')) or (0, 1)
-                bc_info[name]['normal_dim']  = _ni[0]
-                bc_info[name]['normal_sign'] = _ni[1]
-
-        def compute_residuals(params, train_data, targets_dict=None):
-            td = {} if targets_dict is None else targets_dict
-            res = {}
-            if 'pde' in train_data:
-                xp = train_data['pde']
-                yp = _model(params, xp)
-                df = make_derivative_fn(_model, params)
-                if pde4args:
-                    r = pde_fn(xp, yp, params_dict, df)
-                else:
-                    set_context(network.apply, params)
-                    try:
-                        r = pde_fn(xp, yp, params_dict)
-                    finally:
-                        clear_context()
-                res['pde'] = (sum(ri.flatten() for ri in r)
-                              if isinstance(r, (list, tuple)) else r.flatten())
-            for name, info in bc_info.items():
-                if name not in train_data:
-                    continue
-                xb = train_data[name]
-                yb = _model(params, xb)
-                comp   = info['component']
-                target = (info['const_value'] if info['const_value'] is not None
-                          else td.get(name, 0.0))
-                if info['is_neumann']:
-                    def _fwd(x): return _model(params, x)[:, comp]
-                    tang = jnp.zeros_like(xb).at[:, info['normal_dim']].set(1.0)
-                    _, du = jax.jvp(_fwd, (xb,), (tang,))
-                    res[name] = (info['normal_sign'] * du - target).flatten()
-                else:
-                    res[name] = (yb[:, comp] - target).flatten()
-            for pe in _periodic_entries:
-                ya = _model(params, pe['x_a'])
-                yb2 = _model(params, pe['x_b'])
-                ru = ya[:, pe['component']] - yb2[:, pe['component']]
-                if pe['match_deriv']:
-                    d = pe['dim']
-                    ta = jnp.zeros_like(pe['x_a']).at[:, d].set(1.0)
-                    tb = jnp.zeros_like(pe['x_b']).at[:, d].set(1.0)
-                    def _fa(x): return _model(params, x)[:, pe['component']]
-                    def _fb(x): return _model(params, x)[:, pe['component']]
-                    _, ua = jax.jvp(_fa, (pe['x_a'],), (ta,))
-                    _, ub = jax.jvp(_fb, (pe['x_b'],), (tb,))
-                    res[pe['name']] = jnp.concatenate([ru, ua - ub])
-                else:
-                    res[pe['name']] = ru
-            return res
-
-        def compute_al_loss(params, train_data, lagrange_dict,
-                            weights_dict, targets_dict=None):
-            residuals = compute_residuals(params, train_data, targets_dict)
-            total = 0.0
-            losses = {'bcs': []}
-            for name, g in residuals.items():
-                lam = lagrange_dict.get(name, jnp.zeros_like(g))
-                if len(lam) != len(g):
-                    lam = jnp.zeros_like(g)
-                quad = _constraint_uses_quad(name)
-                use_lam = rc is None or name in rc
-                penalty    = weights_dict.get(name, 1.0) * jnp.mean(g ** 2) if quad else 0.0
-                lagrangian = jnp.mean(jax.lax.stop_gradient(lam) * g) if use_lam else 0.0
-                cl = penalty + lagrangian
-                losses[name] = cl
-                losses[f'{name}_penalty']       = penalty
-                losses[f'{name}_lagrangian']    = lagrangian
-                losses[f'{name}_residual_mean'] = jnp.mean(jnp.abs(g))
-                if name != 'pde':
-                    losses['bcs'].append(cl)
-                total = total + cl
-            return total, (losses, residuals)
-
-        return compute_al_loss, compute_residuals
+        raise TypeError(
+            f"SchedulerLagrange does not support problem type "
+            f"{type(trainer.problem).__name__}. "
+            f"Use ProblemStrong or ProblemWeak."
+        )
 
     # ------------------------------------------------------------------
     # ProblemWeak AL
@@ -551,7 +407,6 @@ class SchedulerLagrange(Scheduler):
 
     def _build_al_loss_fn_weak(self, trainer, params_dict):
         from pinns.problems.problem_weak import ProblemWeak as _PW
-        from pinns.terms import TermPeriodicBC
 
         network = trainer.network
         _n_out  = trainer.problem.n_outputs
@@ -585,7 +440,7 @@ class SchedulerLagrange(Scheduler):
         _bc_info    = []
         _periodic_bc_idx = 0
         for i, bc in enumerate(trainer.problem.boundary_conditions):
-            if isinstance(bc, TermPeriodicBC):
+            if getattr(bc, 'kind', None) == 'periodic':
                 continue
             name = bc_names[_periodic_bc_idx]; _periodic_bc_idx += 1
             _bc_info.append({
@@ -660,19 +515,24 @@ class SchedulerLagrange(Scheduler):
                     continue
                 x = train_data[term.name]
                 u = _model(params, x)
-                if term.kind == 'points':
-                    col = term.output_idx if term.output_idx is not None else 0
-                    tgt = jnp.array(term.u_data, dtype=jnp.float32).flatten()
-                    r   = (u[:, col] - tgt).flatten()
-                elif term.fn is not None and callable(term.fn):
-                    r = term.fn(x, u, params_dict, df)
-                    if (term.eq_idx is not None
-                            and hasattr(r, 'ndim') and r.ndim == 2):
-                        r = r[:, term.eq_idx:term.eq_idx + 1]
-                    r = r.flatten()
-                elif term.fn is not None:
-                    col = term.output_idx if term.output_idx is not None else 0
-                    r   = (u[:, col:col + 1] - float(term.fn)).flatten()
+                if term.kind in ('inner', 'initial', 'boundary'):
+                    fn = term.f if term.kind == 'boundary' else term.fn
+                    if not callable(fn):
+                        col = getattr(term, 'output_idx', 0) or 0
+                        r   = (u[:, col:col + 1] - float(fn)).flatten()
+                    else:
+                        r = fn(x, u, params_dict, df)
+                        eq_idx = getattr(term, 'eq_idx', None)
+                        if (eq_idx is not None
+                                and hasattr(r, 'ndim') and r.ndim == 2):
+                            r = r[:, eq_idx:eq_idx + 1]
+                        r = r.flatten()
+                elif term.kind == 'dirichlet':
+                    col = term.component
+                    tgt = jnp.array(term.get_value(x, params_dict), dtype=jnp.float32)
+                    if hasattr(tgt, 'ndim') and tgt.ndim == 2:
+                        tgt = tgt[:, 0]
+                    r = (u[:, col] - tgt).flatten()
                 else:
                     continue
                 res[term.name] = r

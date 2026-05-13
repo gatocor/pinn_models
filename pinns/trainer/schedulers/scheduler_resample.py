@@ -80,8 +80,7 @@ class SchedulerResample(Scheduler):
     def _build_pool(self, trainer) -> None:
         """Sample a large pool for cheap index-based resampling."""
         trainer._train_pool = {}
-        samples_dict = trainer._list_to_dict_samples(trainer.train_samples)
-        for name, n in samples_dict.items():
+        for name, n in trainer.train_samples.items():
             if n > 0:
                 np_data = trainer._sample_points_np(name, n * self.pool_size)
                 trainer._train_pool[name] = trainer._to_tensor(np_data)
@@ -95,10 +94,9 @@ class SchedulerResample(Scheduler):
 
         trainer._train_data = {}
         trainer._train_targets = {}
-        samples_dict = trainer._list_to_dict_samples(trainer.train_samples)
         rng = trainer.rng
 
-        for name, n in samples_dict.items():
+        for name, n in trainer.train_samples.items():
             if n > 0 and name in pool:
                 pool_tensor = pool[name]
                 pool_n = len(pool_tensor)

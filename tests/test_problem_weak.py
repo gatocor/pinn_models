@@ -71,11 +71,6 @@ class TestConstruction:
         # 2-D spatial domain → auto input_names = ['x', 'y']
         assert p.input_names == ["x", "y"]
 
-    def test_explicit_input_names(self):
-        d = _domain()
-        p = ProblemWeak(d, output_names=["u"], input_names=["x1", "x2"])
-        assert p.input_names == ["x1", "x2"]
-
     def test_cubature_order_stored(self):
         d = _domain()
         p = ProblemWeak(d, output_names=["u"], cubature_order=2)
@@ -138,12 +133,6 @@ class TestAddInner:
         ret = p.add_inner(_volume_fn_poisson)
         assert ret is p
 
-    def test_constructor_volume_fn(self):
-        """volume_fn can still be passed to the constructor for backward compat."""
-        d = _domain()
-        p = ProblemWeak(d, output_names=["u"], volume_fn=_volume_fn_poisson)
-        assert p.volume_fn is _volume_fn_poisson
-
 
 # ---------------------------------------------------------------------------
 # add_solution
@@ -205,7 +194,7 @@ class TestAddDirichlet:
         p.add_dirichlet(0.0, name="bc_bottom", region="bottom")
         assert len(p.boundary_conditions) == 1
         bc = p.boundary_conditions[0]
-        from pinns.terms import TermDirichletBC
+        from pinns.problems.terms import TermDirichletBC
         assert isinstance(bc, TermDirichletBC)
         assert bc.name == "bc_bottom"
 
@@ -231,12 +220,6 @@ class TestAddDirichlet:
         p.add_dirichlet(0.0, name="bc_all")
         assert len(p.boundary_conditions) == 1
 
-    def test_unknown_region_raises(self):
-        d = _domain()
-        p = ProblemWeak(d, output_names=["u"])
-        with pytest.raises(ValueError, match="not registered"):
-            p.add_dirichlet(0.0, name="bc_x", region="does_not_exist")
-
     def test_callable_value(self):
         d = _domain()
         p = ProblemWeak(d, output_names=["u"])
@@ -246,8 +229,8 @@ class TestAddDirichlet:
     def test_component_stored(self):
         d = _domain()
         p = ProblemWeak(d, output_names=["u", "v"])
-        p.add_dirichlet(0.0, name="bc_u", region="bottom", component=0)
-        p.add_dirichlet(0.0, name="bc_v", region="bottom", component=1)
+        p.add_dirichlet(0.0, name="bc_u", region="bottom", outputs="u")
+        p.add_dirichlet(0.0, name="bc_v", region="bottom", outputs="v")
         assert p.boundary_conditions[0].component == 0
         assert p.boundary_conditions[1].component == 1
 
@@ -256,8 +239,10 @@ class TestAddDirichlet:
         p = ProblemWeak(d, output_names=["u"])
         p.add_dirichlet(0.0, name="bc_bottom", region="bottom")
         bc = p.boundary_conditions[0]
-        assert bc.node_indices is not None
-        assert len(bc.node_indices) > 0
+        # Geometry lives on the domain, not patched onto the Term
+        ni = d._boundary_regions[bc.region]['node_indices']
+        assert ni is not None
+        assert len(ni) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +256,7 @@ class TestAddNeumann:
         p.add_neumann(0.0, name="nbc_right", region="right")
         assert len(p.boundary_conditions) == 1
         bc = p.boundary_conditions[0]
-        from pinns.terms import TermNeumannBC
+        from pinns.problems.terms import TermNeumannBC
         assert isinstance(bc, TermNeumannBC)
         assert bc.name == "nbc_right"
 
@@ -280,12 +265,6 @@ class TestAddNeumann:
         p = ProblemWeak(d, output_names=["u"])
         ret = p.add_neumann(0.0, name="nbc_right", region="right")
         assert ret is p
-
-    def test_unknown_region_raises(self):
-        d = _domain()
-        p = ProblemWeak(d, output_names=["u"])
-        with pytest.raises(ValueError, match="not registered"):
-            p.add_neumann(0.0, name="nbc_x", region="no_such_region")
 
 
 # ---------------------------------------------------------------------------

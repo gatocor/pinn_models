@@ -4,7 +4,7 @@ import pytest
 
 from pinns.domain import DomainCubic
 from pinns.problems.problem_strong import ProblemStrong
-from pinns import PartitionFB, PartitionX, StepperStep
+
 
 
 # ---------------------------------------------------------------------------
@@ -61,41 +61,6 @@ class TestConstruction:
         with pytest.raises(ValueError):
             ProblemStrong(_domain_1d(), [])
 
-    # ── strategy validation ──────────────────────────────────────────────
-
-    def test_valid_strategy_fb(self):
-        p = ProblemStrong(_domain_1d(), ['u'], strategy=PartitionFB())
-        assert isinstance(p.strategy, PartitionFB)
-
-    def test_valid_strategy_x(self):
-        p = ProblemStrong(_domain_1d(), ['u'], strategy=PartitionX())
-        assert isinstance(p.strategy, PartitionX)
-
-    def test_valid_strategy_step(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StepperStep())
-        assert isinstance(p.strategy, StepperStep)
-        assert p.stepper is p.strategy
-
-    def test_bad_strategy_raises(self):
-        with pytest.raises(TypeError, match="strategy must be"):
-            ProblemStrong(_domain_1d(), ['u'], strategy="invalid")
-
-    def test_no_strategy_defaults_none(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
-        assert p.strategy is None
-        assert p.stepper is None
-
-    # ── stepper= backward compat ─────────────────────────────────────────
-
-    def test_stepper_compat(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], stepper=StepperStep())
-        assert isinstance(p.strategy, StepperStep)
-        assert p.stepper is p.strategy
-
-    def test_stepper_bad_type_raises(self):
-        with pytest.raises(TypeError, match="stepper must be"):
-            ProblemStrong(_domain_1d_step(), ['u'], stepper=PartitionFB())
-
 
 # ---------------------------------------------------------------------------
 # input_names auto-derivation
@@ -147,12 +112,6 @@ class TestAddInner:
         result = p.add_inner(_res, name='pde')
         assert result is p
 
-    def test_lagrange_flag(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
-        p.add_inner(_res, name='pde', lagrange=True)
-        assert p.inner_terms[0].lagrange is True
-        assert len(p.lagrange_terms) == 1
-
 
 # ---------------------------------------------------------------------------
 # add_boundary / add_dirichlet / add_neumann / add_robin
@@ -169,13 +128,13 @@ class TestBoundaryTerms:
         p.add_dirichlet(0.0, name='left_bc')
         assert len(p.boundary_terms) == 1
         assert p.boundary_terms[0].kind == 'dirichlet'
-        assert p.boundary_terms[0].rhs == 0.0
+        assert p.boundary_terms[0].value == 0.0
 
     def test_add_dirichlet_callable(self):
         g = lambda x, pars: np.zeros(x.shape[0])
         p = ProblemStrong(_domain_1d(), ['u'])
         p.add_dirichlet(g, name='left_bc')
-        assert callable(p.boundary_terms[0].rhs)
+        assert callable(p.boundary_terms[0].value)
 
     def test_add_dirichlet_multi_output(self):
         p = ProblemStrong(_domain_2d(), ['u', 'v'])
@@ -190,15 +149,16 @@ class TestBoundaryTerms:
     def test_add_neumann(self):
         p = ProblemStrong(_domain_1d(), ['u'])
         p.add_neumann(1.0, name='flux_bc')
-        assert p.boundary_terms[0].kind == 'neumann'
+        t = p.boundary_terms[0]
+        assert t.kind == 'neumann'
+        assert callable(t.fn)
 
     def test_add_robin(self):
         p = ProblemStrong(_domain_1d(), ['u'])
         p.add_robin(alpha=1.0, beta=1.0, g=0.0, name='robin_bc')
         t = p.boundary_terms[0]
         assert t.kind == 'robin'
-        assert t.alpha == 1.0
-        assert t.beta == 1.0
+        assert callable(t.fn)
 
 
 # ---------------------------------------------------------------------------
@@ -207,22 +167,21 @@ class TestBoundaryTerms:
 
 class TestAddPeriodic:
     def test_valid(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
-        p.add_periodic(_res, name='per', axis='x')
+        d = _domain_1d()
+        p = ProblemStrong(d, ['u'])
+        d.add_periodic('x', name='per')
+        p.add_periodic('per', name='per')
         assert len(p.boundary_terms) == 1
 
     def test_invalid_axis_raises(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
-        with pytest.raises(ValueError, match="axis"):
-            p.add_periodic(_res, name='per', axis='w')
+        d = _domain_1d()
+        with pytest.raises(ValueError):
+            d.add_periodic('w', name='per')
 
-    def test_mesh_domain_raises(self):
-        from pinns.domain import DomainMesh
-        from pinns import meshes
-        domain = DomainMesh(meshes.square())
-        p = ProblemStrong(domain, ['u'])
-        with pytest.raises(TypeError, match="DomainCubic"):
-            p.add_periodic(_res, name='per', axis='x')
+    def test_unregistered_region_raises(self):
+        p = ProblemStrong(_domain_1d(), ['u'])
+        with pytest.raises(ValueError, match="not registered"):
+            p.add_periodic('missing', name='per')
 
 
 # ---------------------------------------------------------------------------
@@ -249,30 +208,35 @@ class TestAddInitial:
 
 
 # ---------------------------------------------------------------------------
-# add_points
+# Dataset
 # ---------------------------------------------------------------------------
 
-class TestAddPoints:
+class TestDataset:
     def test_register(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
+        from pinns import Dataset
+        ds = Dataset()
         x = np.linspace(0, 1, 10)[:, None]
         u = np.zeros(10)
-        p.add_points(x, u, name='obs')
-        assert len(p.points_terms) == 1
-
-    def test_dim_mismatch_raises(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
-        x = np.zeros((5, 2))  # 2-D points but domain is 1-D
-        u = np.zeros(5)
-        with pytest.raises(ValueError, match="column"):
-            p.add_points(x, u, name='obs')
+        ds.add_points(x, u, name='obs')
+        assert len(ds) == 1
+        assert ds.data_terms[0].name == 'obs'
 
     def test_len_mismatch_raises(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
+        from pinns import Dataset
+        ds = Dataset()
         x = np.zeros((5, 1))
         u = np.zeros(3)
         with pytest.raises(ValueError, match="row"):
-            p.add_points(x, u, name='obs')
+            ds.add_points(x, u, name='obs')
+
+    def test_multiple_pointsets(self):
+        from pinns import Dataset
+        ds = Dataset()
+        x = np.zeros((5, 1))
+        ds.add_points(x, np.zeros(5), name='a')
+        ds.add_points(x, np.ones(5),  name='b')
+        assert len(ds) == 2
+        assert ds.names == ['a', 'b']
 
 
 # ---------------------------------------------------------------------------
@@ -328,14 +292,11 @@ class TestParams:
 # ---------------------------------------------------------------------------
 
 class TestAddDependency:
-    def _stepping_problem(self):
-        """ProblemStrong with StepperStep ready for add_dependency."""
-        return ProblemStrong(
-            _domain_1d_step(), ['u'], strategy=StepperStep()
-        )
+    def _problem(self):
+        return ProblemStrong(_domain_1d_step(), ['u'])
 
     def test_basic(self):
-        p = self._stepping_problem()
+        p = self._problem()
         p.add_dependency('u_prev')
         assert len(p.dependencies) == 1
         assert p.dependencies[0].name == 'u_prev'
@@ -343,81 +304,40 @@ class TestAddDependency:
         assert p.dependencies[0].order == ()
 
     def test_with_derivative(self):
-        p = self._stepping_problem()
+        p = self._problem()
         p.add_dependency('du_dx_prev', component=0, order=(0,))
         dep = p.dependencies[0]
         assert dep.order == (0,)
 
     def test_chaining(self):
-        p = self._stepping_problem()
+        p = self._problem()
         result = p.add_dependency('u_prev')
         assert result is p
 
     def test_duplicate_name_raises(self):
-        p = self._stepping_problem()
+        p = self._problem()
         p.add_dependency('u_prev')
         with pytest.raises(ValueError, match="already registered"):
             p.add_dependency('u_prev')
 
     def test_bad_component_raises(self):
-        p = self._stepping_problem()
+        p = self._problem()
         with pytest.raises(ValueError, match="component"):
             p.add_dependency('bad', component=99)
 
     def test_bad_order_dim_raises(self):
-        p = self._stepping_problem()  # n_dims=2 (x,t)
+        p = self._problem()  # n_dims=2 (x,t)
         with pytest.raises(ValueError, match="dimension index"):
             p.add_dependency('bad', order=(99,))
 
     def test_empty_name_raises(self):
-        p = self._stepping_problem()
+        p = self._problem()
         with pytest.raises(ValueError, match="non-empty"):
             p.add_dependency('')
 
-    def test_requires_strategy_step(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'])  # no strategy
-        with pytest.raises(TypeError, match="StepperStep"):
-            p.add_dependency('u_prev')
-
-    def test_requires_strategy_step_not_base(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=PartitionFB())
-        with pytest.raises(TypeError, match="StepperStep"):
-            p.add_dependency('u_prev')
 
 
 # ---------------------------------------------------------------------------
-# is_stepping / validate
-# ---------------------------------------------------------------------------
-
-class TestIsSteppingAndValidate:
-    def test_not_stepping_without_stepper(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
-        assert p.is_stepping is False
-
-    def test_is_stepping_with_strategy_step(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StepperStep())
-        assert p.is_stepping is True
-
-    def test_validate_ok_stepping_with_ic(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StepperStep())
-        p.add_dependency('u_prev')
-        p.add_initial(_res, name='ic')
-        p.validate()  # should not raise
-
-    def test_validate_stepping_no_ic_raises(self):
-        p = ProblemStrong(_domain_1d_step(), ['u'], strategy=StepperStep())
-        p.add_dependency('u_prev')
-        with pytest.raises(ValueError, match="initial condition"):
-            p.validate()
-
-    def test_validate_non_stepping_no_ic_ok(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
-        p.add_inner(_res, name='pde')
-        p.validate()  # no IC required
-
-    def test_validate_returns_self(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
-        assert p.validate() is p
 
 
 # ---------------------------------------------------------------------------
@@ -432,17 +352,6 @@ class TestTermAccessors:
         assert len(p.inner_terms) == 1
         assert len(p.boundary_terms) == 1
 
-    def test_lagrange_terms(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
-        p.add_inner(_res, name='pde', lagrange=True)
-        p.add_boundary(_res, name='bc', lagrange=False)
-        assert len(p.lagrange_terms) == 1
-
-    def test_xmin_xmax(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
-        assert p.xmin is not None
-        assert p.xmax is not None
-
 
 # ---------------------------------------------------------------------------
 # _resolve_outputs
@@ -452,7 +361,7 @@ class TestResolveOutputs:
     def test_none_single_output(self):
         p = ProblemStrong(_domain_1d(), ['u'])
         result = p._resolve_outputs(None)
-        assert result == [(None, '')]
+        assert result == [(0, '')]
 
     def test_none_multi_output_raises(self):
         p = ProblemStrong(_domain_1d(), ['u', 'v'])
