@@ -305,20 +305,24 @@ class Trainer:
         self._after_compile_hook()
         
         self._compiled = True
-    def predict(self, x: np.ndarray, batch_size: Optional[int] = None) -> np.ndarray:
-        """
-        Predict output for given input points using the JAX network.apply() API.
-        
-        Args:
-            x: Input points as numpy array of shape (n_points, n_inputs)
-            batch_size: Optional batch size for large inputs
-            
-        Returns:
-            Predictions as numpy array of shape (n_points, n_outputs)
+    def eval(self, x: np.ndarray, batch_size: Optional[int] = None) -> np.ndarray:
+        """Evaluate the network at given input points.
+
+        Parameters
+        ----------
+        x : np.ndarray, shape ``(N, n_inputs)``
+            Query points.
+        batch_size : int, optional
+            Chunk size for large inputs to avoid OOM.  Defaults to the
+            batch size configured at compile time.
+
+        Returns
+        -------
+        np.ndarray, shape ``(N, n_outputs)``
         """
         if batch_size is None:
             batch_size = getattr(self, '_batch_size', None)
-        
+
         params_dict = self._build_params()
         params = self.network.params
 
@@ -333,7 +337,7 @@ class Trainer:
         for start in range(0, len(x), batch_size):
             results.append(_infer_batch(x[start:start + batch_size]))
         return np.vstack(results)
-    
+
     def _get_bc_target(self, bc, x):
         """
         Get BC target value as backend tensor.
@@ -661,6 +665,12 @@ class Trainer:
             return {n: self._mean_squared(r) for n, r in zip(names, residual)}
 
         elif kind == 'neumann':
+            # ProblemWeak assembles Neumann/traction terms inside the weak-form
+            # residual_fn (boundary integrals are baked into the cubature data).
+            # No separate point-evaluation is needed or possible here.
+            from pinns.problems.problem_weak import ProblemWeak as _PWNeu
+            if isinstance(self.problem, _PWNeu):
+                return {}
             raise NotImplementedError(
                 f"Neumann BC '{bc.name}' cannot be auto-evaluated. "
                 "Use add_boundary() with a callable fn."
@@ -830,6 +840,19 @@ class Trainer:
         # ── ProblemWeak: look up term by kind, route interior vs BC ──
         term = next((t for t in self.problem._terms if t.name == name), None)
         if term is not None and term.kind == 'inner':
+            from pinns.problems.problem_weak import ProblemWeak as _PWeak
+            from pinns.domain.domain_mesh import DomainMesh as _DMWeak
+            if isinstance(self.problem, _PWeak) and isinstance(domain, _DMWeak):
+                # Sample N (node_idx, time) pairs — stochastic Galerkin test functions
+                _free = getattr(self.problem, 'free_nodes', None)
+                _region = getattr(term, 'region', None)
+                if _region in ('all', 'inner', None):
+                    # No spatial restriction — sample from all free nodes
+                    return domain.sample_nodes(n_samples, rng=rng, node_pool=_free)
+                else:
+                    # Region-restricted: pass region (and optionally intersect with free)
+                    return domain.sample_nodes(n_samples, rng=rng,
+                                               node_pool=_free, region=_region)
             return domain.sample_interior(n_samples, rng=rng, params=params)
 
         bc = self._get_bc_by_name(name)
@@ -1119,7 +1142,7 @@ class Trainer:
         else:
             x = self.problem.domain.sample_interior(n_points)
 
-        y_pred = self.predict(x)
+        y_pred = self.eval(x)
         y_true = self._call_solution(x)
         
         if isinstance(y_true, (list, tuple)):
@@ -1221,6 +1244,10 @@ class Trainer:
                     self._test_targets.pop(_k, None)
 
         self._train_samples = {}
+
+        # For ProblemWeak transient: time sampling is handled per-step via
+        # domain.sample_nodes() → sample_data['pde'] = (N, 2) [node_idx, time].
+        # No compile-time cubature tiling needed.
 
     def _constraint_uses_quadratic(self, constraint_name: str) -> bool:
         """Return True if a constraint keeps its quadratic penalty term."""
@@ -1506,6 +1533,7 @@ class Trainer:
         _net_losses = list(getattr(self.network, 'network_losses', []))
         _residual_fn = self.problem.make_residual_fn(self.network)
         self._residual_fn = _residual_fn
+        self._residual_fn_jit = jax.jit(_residual_fn)
         _schedulers = list(schedulers) if schedulers else []
 
         def compute_loss(params, train_data, targets_dict, scheduler_states=None):
@@ -1525,7 +1553,7 @@ class Trainer:
                     s_state = scheduler_states.get(idx, {})
                     if s_state:
                         total_loss = total_loss + s.extra_loss(residuals, s_state)
-            return total_loss
+            return total_loss, residuals
 
         return compute_loss, True
     
@@ -1545,15 +1573,15 @@ class Trainer:
         if pde_accepts_derivative:
             @jax.jit
             def train_step(params, opt_state, train_data, targets_dict, scheduler_states):
-                loss, grads = jax.value_and_grad(compute_loss)(
-                    params, train_data, targets_dict, scheduler_states)
+                (loss, residuals), grads = jax.value_and_grad(
+                    compute_loss, has_aux=True
+                )(params, train_data, targets_dict, scheduler_states)
                 updates, new_opt_state = optim.update(grads, opt_state, params)
                 new_params = optax.apply_updates(params, updates)
-                return new_params, new_opt_state, loss
+                return new_params, new_opt_state, loss, residuals
             return train_step, True, False
         else:
-            grad_fn = jax.value_and_grad(
-                lambda p, td, tgt, ss: compute_loss(p, td, tgt, ss))
+            grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
             @jax.jit
             def apply_updates(params, grads, opt_state):
                 updates, new_opt_state = optim.update(grads, opt_state, params)
@@ -1634,12 +1662,14 @@ class Trainer:
                     bc_data, params_dict, weights_dict, batch_size)
             else:
                 total_loss, losses = 0.0, {}
-            residuals = self._residual_fn(self.network.params, None)
-            weak_pde_loss = float(sum(
-                weights_dict.get(name, 1.0) * jnp.mean(r ** 2)
-                for name, r in residuals.items()
-            ))
-            losses['pde'] = weak_pde_loss
+            residuals = (getattr(self, '_last_residuals', None)
+                         or self._residual_fn(self.network.params, None))
+            weak_pde_loss = 0.0
+            for name, r in residuals.items():
+                _w = weights_dict.get(name, 1.0)
+                _term_loss = float(_w * jnp.mean(r ** 2))
+                losses[name] = _term_loss
+                weak_pde_loss += _term_loss
             total_loss = (total_loss or 0.0) + weak_pde_loss
             return total_loss, losses
         return self._compute_total_loss_batched_base(data, params_dict, weights_dict, batch_size)
@@ -1889,7 +1919,14 @@ class Trainer:
                 "eval_term_residuals() called before compile(). "
                 "Call trainer.compile() first."
             )
-        residuals_dict = self._residual_fn(self.network.params, self._train_data)
+        # Prefer residuals cached from the most recent JIT training step
+        # (zero extra compute).  Fall back to JIT-compiled forward pass
+        # only when cache is empty (e.g. on_compile before first step).
+        _cached = getattr(self, '_last_residuals', None)
+        if _cached is not None and term in _cached:
+            return np.asarray(_cached[term]).flatten()
+        _eval_fn = getattr(self, '_residual_fn_jit', None) or self._residual_fn
+        residuals_dict = _eval_fn(self.network.params, self._train_data)
         if term not in residuals_dict:
             raise KeyError(
                 f"Term {term!r} not found in residuals. "
@@ -2057,10 +2094,9 @@ class Trainer:
         params_dict = self._build_params()
         weights = self.weights
 
-        # L-BFGS uses different training loop
-        if self.optimizer_name == "lbfgs":
-            self._train_lbfgs(epochs, print_each, show_plots, save_plots, 
-                             params_dict, weights)
+        # Optimizer-specific loop (e.g. L-BFGS) — returns True if handled
+        if self._optimizer_obj.train_loop(
+                self, epochs, print_each, show_plots, save_plots, params_dict, weights):
             return
         
         result, is_full_jit, _ = self._make_jit_train_step(weights, params_dict)
@@ -2110,32 +2146,43 @@ class Trainer:
                 do_plot=False,
             )
         
+        # ── Hoist static per-epoch checks outside the loop ─────────────────────
+        _schedulers_list   = getattr(self, '_schedulers', [])
+        _has_schedulers    = bool(_schedulers_list)
+        _rfb               = getattr(self, '_rollout_face_batch', None)
+        _rnf               = getattr(self, '_rollout_n_faces', None)
+        _has_rollout_faces = (_rfb is not None and _rnf is not None)
+        _rts_n_nodes       = getattr(self, '_rts_n_nodes', None)
+        _has_rts           = _rts_n_nodes is not None
+        _al_step_fn        = getattr(self, '_rollout_al_train_step', None)
+        _train_targets     = getattr(self, '_train_targets', {})
+
         self._current_epoch = 0
         for epoch in range(epochs):
             self._current_epoch = epoch
-            epoch_start = time.time()
             global_epoch = start_epoch + epoch
 
             # Scheduler on_epoch_start hooks (resample, adaptive, curriculum, lr, etc.)
-            for _s in getattr(self, '_schedulers', []):
-                _s.on_epoch_start(self, epoch)
+            if _has_schedulers:
+                for _s in _schedulers_list:
+                    _s.on_epoch_start(self, epoch)
 
             # Collect per-scheduler JIT states (e.g. Lagrange multipliers)
-            _sched_states = {
-                i: s.get_jit_state()
-                for i, s in enumerate(getattr(self, '_schedulers', []))
-            }
+            if _has_schedulers:
+                _sched_states = {
+                    i: s.get_jit_state()
+                    for i, s in enumerate(_schedulers_list)
+                }
+            else:
+                _sched_states = {}
 
             # ── Rollout face mini-batching: sample fresh indices each epoch ──────────
-            _rfb = getattr(self, '_rollout_face_batch', None)
-            _rnf = getattr(self, '_rollout_n_faces', None)
-            if _rfb is not None and _rnf is not None:
+            if _has_rollout_faces:
                 _face_idx = np.random.choice(_rnf, size=_rfb, replace=False).astype(np.int32)
                 self._train_data['_rollout_face_idx'] = jnp.array(_face_idx)
 
             # ── Node mini-batching (train_samples={'pde': N}) ──────────────────────
-            _rts_n_nodes = getattr(self, '_rts_n_nodes', None)
-            if _rts_n_nodes is not None:
+            if _has_rts:
                 _n_free = self._rts_n_free_nodes
                 _node_idx = np.random.choice(_n_free, size=_rts_n_nodes, replace=_rts_n_nodes > _n_free).astype(np.int32)
                 self._train_data['_node_idx'] = jnp.array(_node_idx)
@@ -2143,39 +2190,11 @@ class Trainer:
                 _t_per_node = (self._rts_t_min + np.random.uniform(0, 1, _rts_n_nodes) * (self._rts_t_max - self._rts_t_min)).astype(np.float32)
                 self._train_data['_t_vals'] = jnp.array(_t_per_node)
 
-            # ── Random time sampling: draw fresh t_vals each epoch ────────────────
-            _rts_t_min = getattr(self, '_rts_t_min', None)
-            if _rts_t_min is not None and _rts_n_nodes is None:  # skip when node-batching (handled above)
-                _rts_t_max    = self._rts_t_max
-                _rts_n_t      = self._rts_n_t
-                _rts_method   = getattr(self, '_rts_sampling_method', 'uniform')
-                if callable(_rts_method):
-                    _u = _rts_method(_rts_n_t, np.random.default_rng())
-                elif _rts_method in ('latin_hypercube', 'lhs'):
-                    _u = (np.arange(_rts_n_t) + np.random.uniform(0, 1, _rts_n_t)) / _rts_n_t
-                elif _rts_method == 'sobol':
-                    try:
-                        from scipy.stats.qmc import Sobol as _Sobol
-                        _u = _Sobol(d=1, scramble=True).random(_rts_n_t).ravel()
-                    except Exception:
-                        _u = np.random.uniform(0, 1, _rts_n_t)
-                elif _rts_method == 'halton':
-                    try:
-                        from scipy.stats.qmc import Halton as _Halton
-                        _u = _Halton(d=1, scramble=True).random(_rts_n_t).ravel()
-                    except Exception:
-                        _u = np.random.uniform(0, 1, _rts_n_t)
-                else:  # "uniform" or any unknown string
-                    _u = np.random.uniform(0, 1, _rts_n_t)
-                _t_vals = (_rts_t_min + _u * (_rts_t_max - _rts_t_min)).astype(np.float32)
-                self._train_data['_t_vals'] = jnp.array(_t_vals)
-
             if use_batching:
                 # Shuffle data and targets at the start of each epoch
                 shuffle_key, subkey = jax.random.split(shuffle_key)
                 shuffled_train_data = {}
                 shuffled_train_targets = {}
-                train_targets = getattr(self, '_train_targets', {})
                 # Keys that should not be shuffled/batched (non-point arrays)
                 _no_shuffle_keys = {'_rollout_face_idx', '_t_vals', '_node_idx'}
                 for name, data in self._train_data.items():
@@ -2186,8 +2205,8 @@ class Trainer:
                     perm = jax.random.permutation(subkey, n_points)
                     shuffled_train_data[name] = data[perm]
                     # Also shuffle targets with the same permutation
-                    if name in train_targets:
-                        shuffled_train_targets[name] = train_targets[name][perm]
+                    if name in _train_targets:
+                        shuffled_train_targets[name] = _train_targets[name][perm]
                     subkey, _ = jax.random.split(subkey)  # New key for next data array
                 
                 # Mini-batch training
@@ -2207,12 +2226,14 @@ class Trainer:
                             batch_targets[name] = shuffled_train_targets[name][start_idx:end_idx]
                     
                     if is_full_jit:
-                        self.network.params, self.opt_state, loss = train_step(
+                        self.network.params, self.opt_state, loss, _step_res = train_step(
                                 self.network.params, self.opt_state, batch_data, batch_targets,
                                 _sched_states,
                             )
+                        self._last_residuals = _step_res
                     else:
-                        loss, grads = grad_fn(self.network.params, batch_data, batch_targets, _sched_states)
+                        (loss, _step_res), grads = grad_fn(self.network.params, batch_data, batch_targets, _sched_states)
+                        self._last_residuals = _step_res
                         self.network.params, self.opt_state = apply_updates(self.network.params, grads, self.opt_state)
                     
                     epoch_loss += float(loss)
@@ -2220,10 +2241,8 @@ class Trainer:
                 loss = epoch_loss / n_batches
             else:
                 # Full-batch training
-                train_targets = getattr(self, '_train_targets', {})
                 if is_full_jit:
                     # ── Per-step Lagrangian rollout (AL dual-ascent) ──────────
-                    _al_step_fn = getattr(self, '_rollout_al_train_step', None)
                     if _al_step_fn is not None:
                         self.network.params, self.opt_state, loss, _step_res = _al_step_fn(
                             self.network.params, self.opt_state, self._rollout_lambdas
@@ -2233,20 +2252,21 @@ class Trainer:
                         # loss fn, so the update is scale-free w.r.t. mesh size.
                         self._rollout_lambdas = self._rollout_lambdas + self.lagrange_lr * _step_res
                     else:
-                        self.network.params, self.opt_state, loss = train_step(
-                                self.network.params, self.opt_state, self._train_data, train_targets,
+                        self.network.params, self.opt_state, loss, _step_res = train_step(
+                                self.network.params, self.opt_state, self._train_data, _train_targets,
                                 _sched_states,
                             )
+                        self._last_residuals = _step_res
                 else:
-                    loss, grads = grad_fn(self.network.params, self._train_data, train_targets, _sched_states)
+                    (loss, _step_res), grads = grad_fn(self.network.params, self._train_data, _train_targets, _sched_states)
+                    self._last_residuals = _step_res
                     self.network.params, self.opt_state = apply_updates(self.network.params, grads, self.opt_state)
-            
-            epoch_time = time.time() - epoch_start
-            self.history['epoch_times'].append(epoch_time)
 
             # Scheduler on_epoch_end hooks (lr plateau detection, etc.)
-            for _s in getattr(self, '_schedulers', []):
-                _s.on_epoch_end(self, epoch, float(loss))
+            if _has_schedulers:
+                _loss_float = float(loss)  # one host-device sync when schedulers need it
+                for _s in _schedulers_list:
+                    _s.on_epoch_end(self, epoch, _loss_float)
 
             if print_each > 0 and ((global_epoch + 1) % print_each == 0 or epoch == epochs - 1):
                 elapsed = time.time() - start_time
@@ -2264,9 +2284,13 @@ callback=self._plotter.callback if self._plotter else None,
             )
         
         self._global_epoch += epochs
+        _total_elapsed = time.time() - start_time
+        # Record per-epoch average time so get_time() stays accurate
+        _avg_epoch_time = _total_elapsed / epochs if epochs > 0 else 0.0
+        self.history['epoch_times'].extend([_avg_epoch_time] * epochs)
         if not getattr(self, '_curriculum_running', False):
-            print(f"Training complete in {time.time() - start_time:.1f}s")
-            for _s in getattr(self, '_schedulers', []):
+            print(f"Training complete in {_total_elapsed:.1f}s")
+            for _s in _schedulers_list:
                 _s.on_training_end(self)
         self._curriculum_restore()
         
@@ -2282,89 +2306,6 @@ callback=self._plotter.callback if self._plotter else None,
             self._curriculum_stage         = None
             self._curriculum_n_stages      = None
             self._curriculum_total_epochs  = None
-
-    def _train_lbfgs(self, epochs, print_each, show_plots, save_plots, 
-                     params_dict, weights):
-        """
-        Train using L-BFGS optimizer via jaxopt.
-        
-        L-BFGS typically converges faster than gradient descent for PINN problems,
-        especially in the later stages of training.
-        """
-        # Build the loss function for L-BFGS
-        compute_loss = self._make_lbfgs_loss_fn(weights, params_dict)
-        
-        # Get L-BFGS parameters from the optimizer instance
-        _lbfgs_obj = self._optimizer_obj
-        max_iter = getattr(_lbfgs_obj, 'max_iter', 5)
-        history_size = getattr(_lbfgs_obj, 'history_size', 50)
-        tolerance = getattr(_lbfgs_obj, 'tol', 1e-9)
-        
-        # Create L-BFGS solver
-        solver = jaxopt.LBFGS(
-            fun=compute_loss,
-            maxiter=max_iter,
-            history_size=history_size,
-            tol=tolerance,
-        )
-        
-        print(f"Starting L-BFGS training for {epochs} epochs "
-              f"({max_iter} iterations per epoch, history={history_size})...")
-        
-        start_time = time.time()
-        start_epoch = self._global_epoch
-        
-        auto_save_path = self._setup_training_plot(show_plots, save_plots)
-        
-        # Initialize solver state
-        state = solver.init_state(self.network.params, self._train_data)
-        
-        # Print epoch 0 (before any training)
-        if print_each > 0:
-            self._log_epoch(
-                start_epoch, start_epoch, epochs + start_epoch, None, 0.0,
-                weights, params_dict, show_plots, save_plots, auto_save_path,
-                do_plot=False,
-            )
-        
-        self._current_epoch = 0
-        for epoch in range(epochs):
-            self._current_epoch = epoch
-            epoch_start = time.time()
-            global_epoch = start_epoch + epoch
-            
-            # Run L-BFGS step
-            self.network.params, state = solver.update(
-                self.network.params, state, self._train_data
-            )
-            loss = state.value
-            
-            epoch_time = time.time() - epoch_start
-            self.history['epoch_times'].append(epoch_time)
-            
-            if print_each > 0 and ((global_epoch + 1) % print_each == 0 or epoch == epochs - 1):
-                elapsed = time.time() - start_time
-                self._log_epoch(
-                    global_epoch, global_epoch + 1, epochs + start_epoch, loss, elapsed,
-                    weights, params_dict, show_plots, save_plots, auto_save_path,
-                )
-        
-        self._global_epoch += epochs
-        print(f"L-BFGS training complete in {time.time() - start_time:.1f}s")
-        
-        # Close figure to prevent duplicate display in notebooks
-        if is_notebook() and show_plots and self._plotter is not None and self._plotter._fig is not None:
-            plt.close(self._plotter._fig)
-
-    def _make_lbfgs_loss_fn(self, weights, params_dict):
-        """Create loss function for L-BFGS: thin wrapper around _make_compute_loss_fn."""
-        train_targets = dict(getattr(self, '_train_targets', {}))
-        compute_loss, _ = self._make_compute_loss_fn(weights, params_dict)
-
-        def compute_loss_lbfgs(params, train_data):
-            return compute_loss(params, train_data, train_targets)
-
-        return compute_loss_lbfgs
 
     def get_history(self) -> Dict:
         """Get training history."""

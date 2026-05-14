@@ -66,6 +66,8 @@ class TrainPlotter:
         style: Optional[Dict[str, Any]] = None,
         callback: Optional[Callable] = None,
         time_points: Optional[List[float]] = None,
+        show_prediction: bool = True,
+        show_residuals: bool = True,
     ) -> None:
         self.save = save
         self.subdomains = subdomains
@@ -76,6 +78,8 @@ class TrainPlotter:
         self.style = style if style is not None else {}
         self.callback = callback
         self.time_points = list(time_points) if time_points is not None else None
+        self.show_prediction = show_prediction
+        self.show_residuals = show_residuals
 
         # State (set by _activate / reset on each compile)
         self._trainer = None
@@ -109,7 +113,14 @@ class TrainPlotter:
         else:
             self._show_sampling_points = {'solution': False, 'residuals': False, 'zoom': False}
             self._show_sampling_points.update(_sp)
-        self._plot_time_points = self.time_points
+        if self.time_points is not None:
+            self._plot_time_points = self.time_points
+        elif self._is_mesh_domain():
+            domain = self._trainer.problem.domain
+            if domain._t_min is not None:
+                self._plot_time_points = [domain._t_min, domain._t_max]
+        else:
+            self._plot_time_points = None
 
     def __repr__(self) -> str:  # pragma: no cover
         parts = []
@@ -131,6 +142,10 @@ class TrainPlotter:
             parts.append("callback=<callable>")
         if self.time_points is not None:
             parts.append(f"time_points={self.time_points!r}")
+        if not self.show_prediction:
+            parts.append("show_prediction=False")
+        if not self.show_residuals:
+            parts.append("show_residuals=False")
         return f"TrainPlotter({', '.join(parts)})"
 
 
@@ -265,85 +280,83 @@ class TrainPlotter:
         has_spatial = len(obs_spatial) > 0
         n_obs = len(obs_regular) + (1 if has_spatial else 0)
 
+        _show_pred = self.show_prediction
+        _show_res  = self.show_residuals
+
         if n_dims == 1:
-            if has_solution:
-                n_cols = 3  # solution, residuals, error
-            else:
-                n_cols = 2  # solution, residuals
-            
-            # 2 rows for losses + mse_losses
+            n_cols = int(_show_pred) + int(_show_res) + int(has_solution)
+            if n_cols == 0:
+                n_cols = 1  # at minimum keep the loss rows
+
             n_rows = 2 + n_outputs + n_regions + n_obs
             fig = plt.figure(figsize=(5 * n_cols, 3.5 * n_rows))
             gs = fig.add_gridspec(n_rows, n_cols)
-            
+
             axes = {}
             axes['losses'] = fig.add_subplot(gs[0, :])
             axes['mse_losses'] = fig.add_subplot(gs[1, :])
-            
+
             for i in range(n_outputs):
-                axes[f'sol_{i}'] = fig.add_subplot(gs[2 + i, 0])
-                axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, 1])
+                _col = 0
+                if _show_pred:
+                    axes[f'sol_{i}'] = fig.add_subplot(gs[2 + i, _col]); _col += 1
+                if _show_res:
+                    axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, _col]); _col += 1
                 if has_solution:
-                    axes[f'err_{i}'] = fig.add_subplot(gs[2 + i, 2])
-            
-            # Region plots
+                    axes[f'err_{i}'] = fig.add_subplot(gs[2 + i, _col])
+
             for r in range(n_regions):
                 axes[f'region_{r}'] = fig.add_subplot(gs[2 + n_outputs + r, :])
 
-            # Regular observable plots
             for k, name in enumerate(obs_regular):
                 axes[f'obs_{name}'] = fig.add_subplot(gs[2 + n_outputs + n_regions + k, :])
-            # Joint deformed-mesh plot for spatial observables (two panels: original | deformed)
             if has_spatial:
                 row_s = 2 + n_outputs + n_regions + len(obs_regular)
                 axes['obs__deformed_ref'] = fig.add_subplot(gs[row_s, 0])
                 axes['obs__deformed_def'] = fig.add_subplot(gs[row_s, 1])
-        
+
         elif n_dims == 2:
-            if has_solution:
-                n_cols = 4  # predicted, true, residuals, error
-            else:
-                n_cols = 2  # predicted, residuals
-            
+            n_cols = int(_show_pred) + int(has_solution) + int(_show_res) + int(has_solution)
+            if n_cols == 0:
+                n_cols = 1
+
             n_rows = 2 + n_outputs + n_regions + n_obs
             fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
             gs = fig.add_gridspec(n_rows, n_cols)
-            
+
             axes = {}
             axes['losses'] = fig.add_subplot(gs[0, :])
             axes['mse_losses'] = fig.add_subplot(gs[1, :])
-            
+
             for i in range(n_outputs):
-                axes[f'sol_{i}'] = fig.add_subplot(gs[2 + i, 0])
+                _col = 0
+                if _show_pred:
+                    axes[f'sol_{i}'] = fig.add_subplot(gs[2 + i, _col]); _col += 1
                 if has_solution:
-                    axes[f'true_{i}'] = fig.add_subplot(gs[2 + i, 1])
-                    axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, 2])
-                    axes[f'err_{i}'] = fig.add_subplot(gs[2 + i, 3])
-                else:
-                    axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, 1])
-            
+                    axes[f'true_{i}'] = fig.add_subplot(gs[2 + i, _col]); _col += 1
+                if _show_res:
+                    axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, _col]); _col += 1
+                if has_solution:
+                    axes[f'err_{i}'] = fig.add_subplot(gs[2 + i, _col])
+
             for r in range(n_regions):
                 axes[f'region_{r}'] = fig.add_subplot(gs[2 + n_outputs + r, :])
 
-            # Regular observable plots — one subplot per observable, spanning first two columns
             for k, name in enumerate(obs_regular):
                 axes[f'obs_{name}'] = fig.add_subplot(gs[2 + n_outputs + n_regions + k, :2])
-            # Joint deformed-mesh plot for spatial observables (two panels: original | deformed)
             if has_spatial:
                 row_s = 2 + n_outputs + n_regions + len(obs_regular)
                 axes['obs__deformed_ref'] = fig.add_subplot(gs[row_s, 0])
                 axes['obs__deformed_def'] = fig.add_subplot(gs[row_s, 1])
-        
+
         elif self._is_mesh_domain() and self._plot_time_points:
             # Transient mesh domain with time snapshots.
-            # Columns: predicted | true (opt) | residual | error (opt)
-            # Rows: 2 loss rows + one row per (time × output)
+            # Columns: predicted (opt) | true (opt) | residual (opt) | error (opt)
             ts = self._plot_time_points
             n_snap = len(ts) * n_outputs
-            if has_solution:
-                n_cols = 4  # predicted, true, residual, error
-            else:
-                n_cols = 2  # predicted, residual
+            n_cols = int(_show_pred) + int(has_solution) + int(_show_res) + int(has_solution)
+            if n_cols == 0:
+                n_cols = 1
 
             n_rows = 2 + n_snap
             fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
@@ -356,14 +369,15 @@ class TrainPlotter:
             row = 2
             for t_val in ts:
                 for i in range(n_outputs):
-                    key = f'snap_sol_{i}_t{t_val}'
-                    axes[key] = fig.add_subplot(gs[row, 0])
+                    _col = 0
+                    if _show_pred:
+                        axes[f'snap_sol_{i}_t{t_val}'] = fig.add_subplot(gs[row, _col]); _col += 1
                     if has_solution:
-                        axes[f'snap_true_{i}_t{t_val}'] = fig.add_subplot(gs[row, 1])
-                        axes[f'snap_res_{i}_t{t_val}'] = fig.add_subplot(gs[row, 2])
-                        axes[f'snap_err_{i}_t{t_val}'] = fig.add_subplot(gs[row, 3])
-                    else:
-                        axes[f'snap_res_{i}_t{t_val}'] = fig.add_subplot(gs[row, 1])
+                        axes[f'snap_true_{i}_t{t_val}'] = fig.add_subplot(gs[row, _col]); _col += 1
+                    if _show_res:
+                        axes[f'snap_res_{i}_t{t_val}'] = fig.add_subplot(gs[row, _col]); _col += 1
+                    if has_solution:
+                        axes[f'snap_err_{i}_t{t_val}'] = fig.add_subplot(gs[row, _col])
                     row += 1
         else:
             # For 3D+: loss plot + region slices for all outputs with residuals
@@ -490,7 +504,7 @@ class TrainPlotter:
     def _plot_solution_1d(self, ax, output_idx, n_points=200):
         """Plot 1D solution on given axes."""
         x = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points).reshape(-1, 1)
-        y = self._trainer.predict(x)
+        y = self._trainer.eval(x)
         
         # Plot true solution if available
         if self._trainer.problem.solution is not None:
@@ -591,7 +605,7 @@ class TrainPlotter:
             label = f'|R_j| (t={t_val:.3g})'
             im = ax.tricontourf(tri_obj, vals_plot, levels=50, cmap=cmap)
         else:
-            y_pred = self._trainer.predict(x_st)[:, output_idx]
+            y_pred = self._trainer.eval(x_st)[:, output_idx]
             if kind == 'true':
                 if self._trainer.problem.solution is None:
                     return
@@ -648,7 +662,7 @@ class TrainPlotter:
         if self._is_mesh_domain():
             dom = self._trainer.problem.domain
             tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
-            y = self._trainer.predict(dom._vertices)
+            y = self._trainer.eval(dom._vertices)
             vals = y[:, output_idx]
             im = ax.tricontourf(tri, vals, levels=50, **ikw)
             ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
@@ -657,7 +671,7 @@ class TrainPlotter:
             x1 = np.linspace(self._trainer.problem.xmin[1], self._trainer.problem.xmax[1], n_points)
             X0, X1 = np.meshgrid(x0, x1)
             x_flat = np.column_stack([X0.ravel(), X1.ravel()])
-            y = self._trainer.predict(x_flat)
+            y = self._trainer.eval(x_flat)
             Y = y[:, output_idx].reshape(X0.shape)
             extent = [x0.min(), x0.max(), x1.min(), x1.max()]
             im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', **ikw)
@@ -717,7 +731,7 @@ class TrainPlotter:
             return
         
         x = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points).reshape(-1, 1)
-        y = self._trainer.predict(x)
+        y = self._trainer.eval(x)
         
         y_true = self._trainer._call_solution(x)
         if isinstance(y_true, (list, tuple)):
@@ -753,7 +767,7 @@ class TrainPlotter:
         if self._is_mesh_domain():
             dom = self._trainer.problem.domain
             tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
-            y = self._trainer.predict(dom._vertices)
+            y = self._trainer.eval(dom._vertices)
             y_true = _normalise(self._trainer._call_solution(dom._vertices))
             error = np.abs(y[:, output_idx] - y_true[:, output_idx])
             im = ax.tricontourf(tri, error, levels=50, **ikw)
@@ -763,7 +777,7 @@ class TrainPlotter:
             x1 = np.linspace(self._trainer.problem.xmin[1], self._trainer.problem.xmax[1], n_points)
             X0, X1 = np.meshgrid(x0, x1)
             x_flat = np.column_stack([X0.ravel(), X1.ravel()])
-            y = self._trainer.predict(x_flat)
+            y = self._trainer.eval(x_flat)
             y_true = _normalise(self._trainer._call_solution(x_flat))
             error = np.abs(y[:, output_idx] - y_true[:, output_idx]).reshape(X0.shape)
             extent = [x0.min(), x0.max(), x1.min(), x1.max()]
@@ -787,7 +801,7 @@ class TrainPlotter:
             x_point = np.zeros((1, self._trainer.problem.n_dims))
             for i, val in zip(fixed_dims, fixed_values):
                 x_point[0, i] = val
-            y = self._trainer.predict(x_point)
+            y = self._trainer.eval(x_point)
             ax.text(0.5, 0.5, f'u={y[0, output_idx]:.4f}',
                    ha='center', va='center', transform=ax.transAxes, fontsize=14)
             ax.set_title(self._trainer._get_output_name(output_idx))
@@ -804,7 +818,7 @@ class TrainPlotter:
             for i, val in zip(fixed_dims, fixed_values):
                 x_full[:, i] = val
             
-            y = self._trainer.predict(x_full)
+            y = self._trainer.eval(x_full)
             
             ax.plot(x_vals, y[:, output_idx], linewidth=2)
             ax.set_xlabel(self._trainer._get_input_name(dim))
@@ -834,7 +848,7 @@ class TrainPlotter:
             for i, val in zip(fixed_dims, fixed_values):
                 x_full[:, i] = val
             
-            y = self._trainer.predict(x_full)
+            y = self._trainer.eval(x_full)
             Y = y[:, output_idx].reshape(X0.shape)
             
             extent = [x0.min(), x0.max(), x1.min(), x1.max()]

@@ -73,7 +73,22 @@ class SchedulerLagrange(Scheduler):
         """Initialise lambda vectors and record initial array identities."""
         self._lambdas = {}
         self._data_ids = {}
+        # For ProblemWeak, Galerkin residuals are sized by node count, not by
+        # the training-data sample count.  Use eval_term_residuals when available.
         for t in self.terms:
+            # Try to get the true residual size from the assembled problem.
+            try:
+                r = trainer.eval_term_residuals(t)
+                self._lambdas[t] = jnp.zeros(len(r))
+                try:
+                    arr = trainer._train_data[t]
+                    self._data_ids[t] = id(arr)
+                except KeyError:
+                    pass
+                continue
+            except Exception:
+                pass
+            # Fall back to training-data shape.
             try:
                 arr = trainer._train_data[t]
                 self._data_ids[t] = id(arr)
@@ -92,8 +107,14 @@ class SchedulerLagrange(Scheduler):
                 r = trainer.eval_term_residuals(t)          # np.ndarray (N_k,)
             except (KeyError, RuntimeError):
                 continue
+            r_jax = jnp.array(r, dtype=jnp.float32)
+            # Reinitialise λ when the residual size differs from the stored lambda
+            # (e.g. ProblemWeak Galerkin residuals are sized by node count, not
+            # by the training-data sample count used in on_compile).
+            if self._lambdas.get(t, jnp.zeros(0)).shape[0] != r_jax.shape[0]:
+                self._lambdas[t] = jnp.zeros(r_jax.shape[0])
             self._lambdas[t] = jnp.clip(
-                self._lambdas[t] + self._lagrange_lr * jnp.array(r, dtype=jnp.float32),
+                self._lambdas[t] + self._lagrange_lr * r_jax,
                 -self.max_val,
                 self.max_val,
             )

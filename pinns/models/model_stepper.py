@@ -98,6 +98,8 @@ class ModelStepper:
         context_range: Optional[List[Tuple[float, float]]] = None,
         strategy: Optional[StepperDt] = None,
     ):
+        # ModelStepper handles time via discrete stepping — no spatial tiling needed.
+        self.n_time_collocation = None
         if not isinstance(model, (ModelBase, ModelPartitioned)):
             raise TypeError(
                 f"ModelStepper: model must be a ModelBase or ModelPartitioned, "

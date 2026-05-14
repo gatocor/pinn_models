@@ -217,6 +217,75 @@ def u_shape(
     faces = mesh.cells_dict["triangle"].astype(np.int64)
     return _reindex(verts, faces)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# U-shape
+# ──────────────────────────────────────────────────────────────────────────────
+
+def trident(
+    x_max: float = 1.0,
+    y_max: float = 1.0,
+    mesh_size: float = 0.03,
+    random_factor: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Trident.
+
+    A rectangle ``[0, x_max] × [0, y_max]`` with a rectangular notch cut from
+    the top centre: ``(notch_x[0], notch_x[1]) × (notch_y, y_max)``.
+
+    Parameters
+    ----------
+    x_max, y_max : float
+        Outer bounding-box dimensions.
+    notch_x : (float, float)
+        Horizontal extent of the notch (left x, right x).
+    notch_y : float
+        Vertical start of the notch (notch extends upward to ``y_max``).
+    mesh_size : float
+        Target element size passed to gmsh.
+
+    Returns
+    -------
+    verts : ndarray, shape (N, 2)
+    faces : ndarray, shape (F, 3), dtype int64
+    """
+    try:
+        import pygmsh
+    except ImportError as e:
+        raise ImportError(
+            "pygmsh is required for mesh generation: pip install pygmsh"
+        ) from e
+
+    polygon = [
+        [0.0,        0.0    ],
+        [x_max,      0.0    ],
+        [x_max,      y_max  ],
+        [x_max*10/12,y_max  ],
+        [x_max*10/12,y_max*3/12],
+        [x_max*9/12,y_max*3/12],
+        [x_max*9/12,y_max],
+        [x_max*8/12,y_max],
+        [x_max*8/12,y_max*3/12],
+        [x_max*7/12,y_max*3/12],
+        [x_max*7/12,y_max],
+        [x_max*5/12,y_max],
+        [x_max*5/12,y_max*3/12],
+        [x_max*4/12,y_max*3/12],
+        [x_max*4/12,y_max],
+        [x_max*3/12,y_max],
+        [x_max*3/12,y_max*3/12],
+        [x_max*2/12,y_max*3/12],
+        [x_max*2/12,y_max],
+        [0.0,       y_max  ],
+    ]
+
+    with pygmsh.geo.Geometry() as geom:
+        geom.add_polygon(polygon, mesh_size=mesh_size)
+        mesh = _gmsh_generate(geom, random_factor)
+
+    verts = mesh.points[:, :2].copy()
+    faces = mesh.cells_dict["triangle"].astype(np.int64)
+    return _reindex(verts, faces)
+
 
 def horse_shoe(
     width: float = 2.0,

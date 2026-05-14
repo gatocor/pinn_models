@@ -61,3 +61,26 @@ class BaseOptimizer(ABC):
             so the learning rate can be mutated at runtime.
         """
         raise NotImplementedError
+
+    def train_loop(
+        self,
+        trainer,
+        epochs: int,
+        print_each: int,
+        show_plots: bool,
+        save_plots,
+        params_dict,
+        weights,
+    ) -> bool:
+        """Optional custom training loop.
+
+        Override in subclasses that require a loop different from the standard
+        Adam/optax gradient-descent path (e.g. L-BFGS).
+
+        Returns
+        -------
+        bool
+            ``True`` if the loop was handled (trainer should return immediately);
+            ``False`` to fall through to the standard loop.
+        """
+        return False

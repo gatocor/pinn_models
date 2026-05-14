@@ -103,14 +103,5 @@ class SchedulerResample(Scheduler):
                 indices = rng.choice(pool_n, size=n, replace=False)
                 trainer._train_data[name] = trainer._index_tensor(pool_tensor, indices)
 
-                # Re-evaluate callable BC targets for the new selection
-                bc = trainer._get_bc_by_name(name)
-                if bc is not None and hasattr(bc, 'value') and callable(bc.value):
-                    np_data = trainer._to_numpy(trainer._train_data[name])
-                    target_np = bc.value(np_data)
-                    if hasattr(target_np, 'squeeze') and target_np.ndim > 1:
-                        target_np = target_np.squeeze(-1)
-                    trainer._train_targets[name] = trainer._to_tensor(target_np)
-
 
 __all__ = ["SchedulerResample"]

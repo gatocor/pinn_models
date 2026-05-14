@@ -1356,6 +1356,71 @@ class DomainMesh:
             return self._sample_multi_boundary(region, n_points, size, rng)
         raise ValueError(f"Invalid region: {region!r}")
 
+    def sample_nodes(self, n: int, rng, node_pool=None, region=None) -> np.ndarray:
+        """Sample *n* FEM nodes with uniformly-random times (for stochastic Galerkin).
+
+        Returns an ``(n, 2)`` float32 array:
+
+        * column 0 — node index (cast to ``float32``; recover with ``int32()``)
+        * column 1 — time sampled from ``Uniform(t_min, t_max)``, or ``0.0`` for
+          purely-spatial domains
+
+        Parameters
+        ----------
+        n : int
+            Number of (node, time) pairs to sample.
+        rng :
+            NumPy ``Generator`` (e.g. ``np.random.default_rng(…)``).
+        node_pool : array-like of int, optional
+            Explicit subset of node indices to sample from.  When combined with
+            *region*, the pool is the intersection of *node_pool* and region nodes.
+            If *None*, the pool is determined solely by *region*.
+        region : str or None, optional
+            Name of a registered inner region (see :meth:`add_inner`).  Only
+            nodes that belong to that region's face set are eligible.  The
+            region's time window ``(t_lo, t_hi)`` is also used when sampling
+            times.  When combined with *node_pool*, the two are intersected.
+        """
+        if node_pool is not None:
+            pool = np.asarray(node_pool, dtype=np.int32)
+            if region is not None:
+                if region not in self._inner_regions:
+                    raise KeyError(
+                        f"sample_nodes: unknown region '{region}'. "
+                        f"Registered inner regions: {list(self._inner_regions.keys())}")
+                reg_info = self._inner_regions[region]
+                face_idx = reg_info['face_indices']
+                reg_nodes = np.unique(self._faces[face_idx].ravel()).astype(np.int32)
+                pool = np.intersect1d(pool, reg_nodes)
+        elif region is not None:
+            if region not in self._inner_regions:
+                raise KeyError(
+                    f"sample_nodes: unknown region '{region}'. "
+                    f"Registered inner regions: {list(self._inner_regions.keys())}")
+            reg_info = self._inner_regions[region]
+            face_idx = reg_info['face_indices']
+            pool = np.unique(self._faces[face_idx].ravel()).astype(np.int32)
+        else:
+            pool = np.arange(len(self._vertices), dtype=np.int32)
+
+        if n == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        replace = n > len(pool)
+        chosen = rng.choice(pool, size=n, replace=replace).astype(np.float32)
+
+        # Determine time range: respect region's time window if available
+        if self._t_min is not None:
+            if region is not None and region in self._inner_regions:
+                reg_info = self._inner_regions[region]
+                t_lo = reg_info.get('t_lo') if reg_info.get('t_lo') is not None else self._t_min
+                t_hi = reg_info.get('t_hi') if reg_info.get('t_hi') is not None else self._t_max
+            else:
+                t_lo, t_hi = self._t_min, self._t_max
+            times = rng.uniform(t_lo, t_hi, size=n).astype(np.float32)
+        else:
+            times = np.zeros(n, dtype=np.float32)
+        return np.column_stack([chosen, times])  # (n, 2)
+
     def sample_boundary_bc(self, bc, n_points: int, rng=None) -> np.ndarray:
         """Sample *n_points* for a registered BC term.
 

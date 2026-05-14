@@ -180,6 +180,12 @@ class ModelBase:
         self._coord_transforms: List[Callable] = []
         self._network_losses: List[NetworkLoss] = []
 
+        # Number of time collocation levels to tile over the spatial cubature
+        # each training step.  ModelBase always solves all time at once, so
+        # the trainer tiles the cubature over n_time_collocation levels.
+        # Set to None to disable tiling (e.g. for stationary domains).
+        self.n_time_collocation: int = 10
+
         # Compute initial input_dim from domain
         spatial_dims = domain._spatial_dims
         t_interval = getattr(domain, "t_interval", None)

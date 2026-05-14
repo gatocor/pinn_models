@@ -750,11 +750,48 @@ class ProblemWeak(BaseProblem):
         free_mask = np.ones(n_dofs, dtype=bool)
         self.free_nodes = all_dofs
 
-        # ── Split free nodes into inner and boundary ──────────────────────────
-        # Boundary free nodes: any free node appearing on a non-Dirichlet BC edge.
-        # All BCs now store a region key; edges are looked up from the domain.
+        # Store free_mask in cubature_data for easy access
+        self.cubature_data['free_mask'] = free_mask
+
+        # ── Nodal support volumes (without boundary edge lengths yet) ─────────
+        _elem_areas  = self.cubature_data['weights'].sum(axis=1)   # (n_faces,)
+        _node_ids_np = self.cubature_data['node_ids']              # (n_faces, n_local)
+        _support_vol = np.zeros(n_dofs, dtype=np.float64)
+        for _k in range(len(_elem_areas)):
+            for _a in range(_node_ids_np.shape[1]):
+                _support_vol[_node_ids_np[_k, _a]] += _elem_areas[_k]
+        self._support_vol = _support_vol
+
+        # Placeholder node norm (boundary edge lengths added in _build_boundary_data)
+        self.node_norm = np.where(_support_vol > 0, _support_vol, 1.0).astype(np.float32)
+
+        # Placeholder boundary node partition — filled after BCs are registered
+        self.boundary_free_nodes = np.array([], dtype=np.int64)
+        self.inner_free_nodes    = all_dofs.copy()
+
+        # boundary_fn_data / neumann_data are built lazily in _build_boundary_data()
+        # which is called from make_residual_fn() after all BCs have been added.
+        self._boundary_data_built = False
+
+    def _build_boundary_data(self):
+        """Assemble boundary cubature (Neumann/Robin/custom BCs) and finalise
+        node normalisers.  Must be called after **all** ``add_neumann`` /
+        ``add_dirichlet`` / ``add_boundary`` calls, and before
+        ``make_residual_fn``.  Called automatically (once) from
+        ``make_residual_fn``.
+        """
+        if self._boundary_data_built:
+            return
+
+        import numpy as np
         from .terms import TermDirichletBC as _TDB
-        _boundary_node_set = set()
+        from .terms import TermNeumannBC   as _TermNeumannBC
+
+        verts  = self.domain._vertices
+        n_dofs = self.n_dofs
+
+        # ── Split free nodes into inner and boundary ──────────────────────────
+        _boundary_node_set: set = set()
         for bc in self.boundary_conditions:
             if isinstance(bc, _TDB):
                 continue
@@ -770,37 +807,16 @@ class ProblemWeak(BaseProblem):
                     _boundary_node_set.add(int(_i0))
                     _boundary_node_set.add(int(_i1))
         _free_set = set(self.free_nodes.tolist())
-        _boundary_free = sorted(_free_set & _boundary_node_set)
-        _inner_free    = sorted(_free_set - _boundary_node_set)
-        self.boundary_free_nodes = np.array(_boundary_free, dtype=np.int64)
-        self.inner_free_nodes    = np.array(_inner_free,    dtype=np.int64)
+        self.boundary_free_nodes = np.array(
+            sorted(_free_set & _boundary_node_set), dtype=np.int64)
+        self.inner_free_nodes = np.array(
+            sorted(_free_set - _boundary_node_set), dtype=np.int64)
 
-        # Store free_mask in cubature_data for easy access
-        self.cubature_data['free_mask'] = free_mask
-
-        # ── Nodal support volumes + boundary edge lengths ─────────────────────
-        # For each node j we build a normaliser that makes R̂_j = R_j / norm_j
-        # independent of mesh size h:
-        #
-        #   Volume term:   ∫_Ω σ:∇φ_j dΩ  ~ σ·h²   → normalise by V_j  ~ h²
-        #   Boundary term: ∫_Γ t·φ_j dS   ~ t·h    → normalise by L_j  ~ h
-        #
-        # Boundary nodes receive BOTH contributions, so norm_j = V_j + L_j
-        # keeps both at O(1).  Interior nodes have L_j=0, so norm_j = V_j.
-        _elem_areas  = self.cubature_data['weights'].sum(axis=1)   # (n_faces,)
-        _node_ids_np = self.cubature_data['node_ids']              # (n_faces, n_local)
-        _support_vol = np.zeros(n_dofs, dtype=np.float64)
-        for _k in range(len(_elem_areas)):
-            for _a in range(_node_ids_np.shape[1]):
-                _support_vol[_node_ids_np[_k, _a]] += _elem_areas[_k]
-        # L_j will be filled in after boundary_fn_data is built (below)
-        self._support_vol_tmp = _support_vol   # hold temporarily
-        from .terms import TermNeumannBC as _TermNeumannBC
+        # ── Neumann point data (constant-value BCs for legacy path) ──────────
         self.neumann_data = []
         for bc in self.boundary_conditions:
             if not isinstance(bc, _TermNeumannBC):
                 continue
-            # Look up edges and normals from domain._boundary_regions
             _region = getattr(bc, 'region', None)
             if _region == 'all':
                 _bc_edges = self.domain._bnd_edges
@@ -813,21 +829,19 @@ class ProblemWeak(BaseProblem):
             _bc_normals = (self.domain._infer_edge_outward_normals(_bc_edges)
                            if self.domain._spatial_dims == 2 else None)
             data = _precompute_boundary_edges(
-                verts, _bc_edges, _bc_normals, self.cubature_order
-            )
+                verts, _bc_edges, _bc_normals, self.cubature_order)
             data['bc'] = bc
             self.neumann_data.append(data)
 
-        # ── boundary_fn cubature (weak-form traction RHS terms) ──────────────
-        # TermCustomBC (add_boundary) and TermNeumannBC-with-fn (add_neumann)
-        # both contribute weak-form integrands assembled via boundary_fn_data.
+        # ── boundary_fn cubature (weak-form traction / Robin / Neumann RHS) ──
+        # TermCustomBC (add_boundary), TermNeumannBC-with-fn (add_neumann), and
+        # TermRobinBC all contribute weak-form integrands here.
         self.boundary_fn_data = []
         for bc in self.boundary_conditions:
             if bc.kind not in ('boundary', 'neumann', 'robin'):
                 continue
             if getattr(bc, 'fn', None) is None:
                 continue
-            _fn = bc.fn
             _region = getattr(bc, 'region', None)
             if _region == 'all':
                 _bc_edges = self.domain._bnd_edges
@@ -842,24 +856,32 @@ class ProblemWeak(BaseProblem):
                 )
             edge_normals = self.domain._infer_edge_outward_normals(_bc_edges)
             data = _precompute_boundary_edges(
-                verts, _bc_edges, edge_normals, self.cubature_order
-            )
-            data['fn']   = _fn
+                verts, _bc_edges, edge_normals, self.cubature_order)
+            data['fn']   = bc.fn
             data['name'] = bc.name
+            # Precompute which free nodes lie on this BC's boundary edges.
+            # Used in make_residual_fn to split pde residual into named entries.
+            _bc_node_set: set = set()
+            for _i0, _i1 in data['edge_ids']:
+                if int(_i0) in _free_set:
+                    _bc_node_set.add(int(_i0))
+                if int(_i1) in _free_set:
+                    _bc_node_set.add(int(_i1))
+            data['free_nodes'] = np.array(sorted(_bc_node_set), dtype=np.int64)
             self.boundary_fn_data.append(data)
 
-        # ── Finalise node normaliser: norm_j = V_j + L_j ────────────────────────
-        # L_j = sum of weak-BC edge lengths touching node j (1-D boundary support).
+        # ── Finalise node normaliser: norm_j = V_j + L_j ────────────────────
         _support_len = np.zeros(n_dofs, dtype=np.float64)
         for _bd in self.boundary_fn_data:
-            _edge_lens = _bd['weights'].sum(axis=1)   # (n_edges,)  = edge lengths
+            _edge_lens = _bd['weights'].sum(axis=1)   # (n_edges,)
             for _e, (_i0, _i1) in enumerate(_bd['edge_ids']):
                 _support_len[int(_i0)] += _edge_lens[_e]
                 _support_len[int(_i1)] += _edge_lens[_e]
-        _node_norm = self._support_vol_tmp + _support_len
+        _node_norm = self._support_vol + _support_len
         _node_norm = np.where(_node_norm > 0, _node_norm, 1.0)
         self.node_norm = _node_norm.astype(np.float32)
-        del self._support_vol_tmp   # no longer needed
+
+        self._boundary_data_built = True
 
     # ── Convenience properties ───────────────────────────────────────────
 
@@ -906,16 +928,27 @@ class ProblemWeak(BaseProblem):
             ``self`` for method chaining.
         """
         from .terms import TermNeumannBC
+        import inspect as _inspect
         for out_idx, suffix in self._resolve_outputs(outputs):
             _v = value
+            # Detect if `value` is already a full weak-form integrand
+            # (x, u, params, phi, deriv) → integrand array, i.e. 5 parameters.
+            _n_params = (
+                len(_inspect.signature(_v).parameters)
+                if callable(_v) else 0
+            )
+            _is_full_integrand = callable(_v) and _n_params >= 5
 
-            def _neumann_fn(x, u, params, phi, deriv, _val=_v):
-                """Weak Neumann integrand: g(x) * φ."""
+            def _neumann_fn(x, u, params, phi, deriv, _val=_v,
+                            _full=_is_full_integrand, _np=_n_params):
+                """Weak Neumann integrand: g(x) * φ  OR  full integrand."""
+                if _full:
+                    # User supplied full (x, u, params, phi, deriv) integrand —
+                    # call it directly; it already returns the integrand.
+                    return _val(x, u, params, phi, deriv)
                 if callable(_val):
-                    import inspect as _inspect
-                    g = (_val(x, params)
-                         if len(_inspect.signature(_val).parameters) >= 2
-                         else _val(x))
+                    import jax.numpy as _jnp
+                    g = (_val(x, params) if _np >= 2 else _val(x))
                 else:
                     import jax.numpy as _jnp
                     g = _jnp.full(phi.shape, float(_val))
@@ -995,11 +1028,16 @@ class ProblemWeak(BaseProblem):
         return self
 
     def make_residual_fn(self, network):
-        """Return ``fn(params) -> dict[str, jnp.ndarray]``.
+        """Return ``fn(params, sample_data) -> dict[str, jnp.ndarray]``.
 
         Assembles the per-free-node Galerkin residual for every registered inner
         term, normalised by the nodal measure (support volume + edge length).
         The trainer aggregates these as ``loss = mean(r**2)``.
+
+        The problem is purely responsible for the physics (weak-form assembly).
+        The cubature data (``self.cubature_data``) is used as-is — if the
+        trainer pre-tiled it to include a time column for space-time problems,
+        the assembly works transparently.
 
         Parameters
         ----------
@@ -1009,8 +1047,11 @@ class ProblemWeak(BaseProblem):
         Returns
         -------
         residual_fn : callable
-            ``residual_fn(params) -> dict[str, jnp.ndarray]``
+            ``residual_fn(params, sample_data) -> dict[str, jnp.ndarray]``
         """
+        # Ensure boundary cubature is assembled (idempotent after first call).
+        self._build_boundary_data()
+
         import jax
         import jax.numpy as jnp
         import numpy as _np
@@ -1020,77 +1061,34 @@ class ProblemWeak(BaseProblem):
         _weak_params_dict = self._build_params()
         _n_out = self.n_outputs
 
-        if _n_out == 1:
-            def _u_and_grad(params, xy):
-                def u_single(z):
-                    return network.apply(params, z[None], _weak_params_dict)[0, 0]
-                return jax.value_and_grad(u_single)(xy)
-        else:
-            def _u_and_grad(params, xy):
-                def u_vec(z):
-                    return network.apply(params, z[None], _weak_params_dict)[0]
-                u = u_vec(xy)
-                jac = jax.jacobian(u_vec)(xy)
-                return u, jac
-
         cd            = self.cubature_data
         node_norm_jax = jnp.asarray(self.node_norm, dtype=jnp.float32)
         dof_coords_jax = jnp.asarray(cd['dof_coords'], dtype=jnp.float32)
+        _n_spatial    = cd['dof_coords'].shape[1]   # number of spatial dims
 
-        # ── Space-time cubature for transient problems ─────────────────────
-        # For continuous (non-rollout) transient problems the spatial cubature
-        # points must include a time column so that ∂u/∂t can be computed via
-        # autodiff.  We tile the spatial cubature over n_t_coll uniformly-
-        # spaced time samples, producing (n_t * n_faces, n_qpts, 3) arrays.
-        # The quadrature weights are normalised by n_t so the accumulated
-        # residual is the time-averaged Galerkin residual.
-        _t_min_dom = getattr(self.domain, '_t_min', None)
-        _t_max_dom = getattr(self.domain, '_t_max', None)
+        # Cubature data — used as-is.  If the trainer pre-tiled pts to include a
+        # time column (for all-at-once transient networks), it does so by modifying
+        # self.cubature_data before calling make_residual_fn.  The problem simply
+        # consumes whatever cubature it finds here.
+        pts_jax      = jnp.asarray(cd['pts'],      dtype=jnp.float32)
+        weights_jax  = jnp.asarray(cd['weights'],  dtype=jnp.float32)
+        phi_jax      = jnp.asarray(cd['phi'],      dtype=jnp.float32)
+        grad_phi_jax = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)
+        node_ids_jax = jnp.asarray(cd['node_ids'], dtype=jnp.int32)
+        n_faces      = pts_jax.shape[0]
+        n_qpts       = pts_jax.shape[1]
+        n_pts_dims   = pts_jax.shape[2]      # may be sp or sp+1 after trainer tiling
+        _n_grad_dims = grad_phi_jax.shape[-1]  # always purely spatial (FEM basis)
 
-        if _t_min_dom is not None:
-            _n_t_coll  = getattr(self, 'n_time_collocation', 20)
-            _t_pts_np  = _np.linspace(_t_min_dom, _t_max_dom, _n_t_coll,
-                                      dtype=_np.float32)
-            _pts_np    = cd['pts']       # (n_faces, n_qpts, 2)
-            _wts_np    = cd['weights']   # (n_faces, n_qpts)
-            _phi_np    = cd['phi']       # (n_faces, n_qpts, n_local)
-            _gphi_np   = cd['grad_phi']  # (n_faces, n_qpts, n_local, n_dim)
-            _nids_np   = cd['node_ids']  # (n_faces, n_local)
-            _nf, _nq   = _pts_np.shape[:2]
-
-            # Tile spatial arrays along the face dimension for each time point
-            _pts_tiled  = _np.tile(_pts_np,  (_n_t_coll, 1, 1))   # (nt*nf, nq, 2)
-            _wts_tiled  = _np.tile(_wts_np,  (_n_t_coll, 1))       # (nt*nf, nq)
-            _phi_tiled  = _np.tile(_phi_np,  (_n_t_coll, 1, 1))    # (nt*nf, nq, nl)
-            _gphi_tiled = _np.tile(_gphi_np, (_n_t_coll, 1, 1, 1)) # (nt*nf, nq, nl, nd)
-            _nids_tiled = _np.tile(_nids_np, (_n_t_coll, 1))        # (nt*nf, nl)
-
-            # Append time column: block s → all faces at time _t_pts_np[s]
-            _t_col_np = (_np.repeat(_t_pts_np, _nf)[:, None, None]
-                         * _np.ones((1, _nq, 1), dtype=_np.float32))
-            _pts_xt = _np.concatenate([_pts_tiled, _t_col_np], axis=-1)
-
-            pts_jax      = jnp.asarray(_pts_xt,     dtype=jnp.float32)
-            weights_jax  = jnp.asarray(_wts_tiled / _n_t_coll, dtype=jnp.float32)
-            phi_jax      = jnp.asarray(_phi_tiled,  dtype=jnp.float32)
-            grad_phi_jax = jnp.asarray(_gphi_tiled, dtype=jnp.float32)
-            node_ids_jax = jnp.asarray(_nids_tiled, dtype=jnp.int32)
-        else:
-            pts_jax       = jnp.asarray(cd['pts'],      dtype=jnp.float32)
-            weights_jax   = jnp.asarray(cd['weights'],  dtype=jnp.float32)
-            phi_jax       = jnp.asarray(cd['phi'],      dtype=jnp.float32)
-            grad_phi_jax  = jnp.asarray(cd['grad_phi'], dtype=jnp.float32)
-            node_ids_jax  = jnp.asarray(cd['node_ids'], dtype=jnp.int32)
-
-        # True free nodes: exclude Dirichlet-constrained DOFs from the test space
+        # True free nodes: exclude Dirichlet-constrained DOFs from the test space.
+        # IMPORTANT: only use 'edges' from boundary_regions (not 'node_indices'),
+        # because 'node_indices' can capture interior mesh nodes whose coordinates
+        # happen to satisfy the selector, over-shrinking the free set.
         _dirichlet_set: set = set()
         for _bc in self.boundary_conditions:
             if isinstance(_bc, _TermDirichletBC):
                 _region = getattr(_bc, 'region', None)
                 if _region and _region in self.domain._boundary_regions:
-                    _ni = self.domain._boundary_regions[_region].get('node_indices')
-                    if _ni is not None:
-                        _dirichlet_set.update(int(i) for i in _ni)
                     _edges = self.domain._boundary_regions[_region].get('edges')
                     if _edges is not None:
                         for _i0, _i1 in _edges:
@@ -1103,8 +1101,16 @@ class ProblemWeak(BaseProblem):
 
         n_dofs   = self.n_dofs
         # ── Precompute IC node data (TermInitial soft penalty) ─────────────────
+        # If the cubature pts include a time column (trainer pre-tiled them), the IC
+        # nodes must also include time = t_min.  We detect this purely from the shape
+        # of the cubature pts vs the spatial dof coords — no domain inspection.
+        _sp_dims = cd['dof_coords'].shape[1]  # number of spatial coordinates
+        # Use domain._t_min to detect transient problems (cubature pts are purely spatial
+        # since compile-time tiling was removed; time is injected per-step stochastically).
+        _t_min_domain = getattr(self.domain, '_t_min', None)
+        _has_time_col = (_t_min_domain is not None)
+
         _ic_data: list = []
-        _t_min_ic = getattr(self.domain, '_t_min', None)
         for _ic_bc in self.boundary_conditions:
             if not isinstance(_ic_bc, _TermInitial):
                 continue
@@ -1112,8 +1118,8 @@ class ProblemWeak(BaseProblem):
                 self.domain._boundary_regions[_ic_bc.region]['node_indices'],
                 dtype=_np.int64)
             _ic_xy = dof_coords_jax[jnp.asarray(_ic_ni, dtype=jnp.int32)]  # (n_ic, n_spatial)
-            if _t_min_ic is not None:
-                _t_col = jnp.full((_ic_xy.shape[0], 1), float(_t_min_ic), dtype=jnp.float32)
+            if _has_time_col:
+                _t_col = jnp.full((_ic_xy.shape[0], 1), float(_t_min_domain), dtype=jnp.float32)
                 _ic_pts = jnp.concatenate([_ic_xy, _t_col], axis=-1)
             else:
                 _ic_pts = _ic_xy
@@ -1126,8 +1132,6 @@ class ProblemWeak(BaseProblem):
             if bc.kind not in ('initial', 'periodic', 'inner')
         ]
 
-        n_faces  = pts_jax.shape[0]
-        n_qpts   = pts_jax.shape[1]
         n_local  = phi_jax.shape[2]
         from .terms import TermInner as _TermInner
         from .terms import TermPeriodicBC as _TermPeriodicBC
@@ -1136,134 +1140,348 @@ class ProblemWeak(BaseProblem):
                            if isinstance(bc, _TermPeriodicBC)]
         params_dict = self._build_params()
 
+        # ── Detect multi-component output ONCE at build time (not per step) ──
+        _dummy_n    = n_faces * n_qpts
+        _dummy_pts  = _np.zeros((_dummy_n, n_pts_dims), dtype=_np.float32)
+        _dummy_y    = _np.zeros((_dummy_n, _n_out), dtype=_np.float32)
+        _dummy_phi  = _np.zeros(_dummy_n, dtype=_np.float32)
+        _dummy_gphi = _np.zeros((_dummy_n, _n_grad_dims), dtype=_np.float32)
+        def _dummy_deriv(Y, X, component, order): return _dummy_phi
+        try:
+            _probe = _terms[0].fn(_dummy_pts, _dummy_y, params_dict,
+                                  _dummy_phi, _dummy_deriv)
+        except Exception:
+            _probe = None
+        _multi_output  = isinstance(_probe, (tuple, list))
+        _n_comp: int   = len(_probe) if _multi_output else 1
+
+        # ── Pre-compute node → (face, local_slot) adjacency for stochastic assembly ──
+        # node_to_faces_padded[j, i] = face index  (or -1 for padding)
+        # node_to_local_padded[j, i] = local slot in that face (0..n_local-1)
+        _node_ids_np = cd['node_ids']   # (n_faces, n_local)
+        from collections import defaultdict as _defaultdict
+        _n2fs: dict = _defaultdict(list)
+        for _f in range(_node_ids_np.shape[0]):
+            for _a in range(_node_ids_np.shape[1]):
+                _n2fs[int(_node_ids_np[_f, _a])].append((_f, _a))
+        _max_faces_per_node = max(len(v) for v in _n2fs.values()) if _n2fs else 1
+        _node_to_faces_np = _np.full((n_dofs, _max_faces_per_node), -1, dtype=_np.int32)
+        _node_to_local_np = _np.zeros((n_dofs, _max_faces_per_node), dtype=_np.int32)
+        for _nid, _slots in _n2fs.items():
+            for _i, (_f, _a) in enumerate(_slots):
+                _node_to_faces_np[_nid, _i] = _f
+                _node_to_local_np[_nid, _i] = _a
+        _node_to_faces_jax = jnp.asarray(_node_to_faces_np)
+        _node_to_local_jax = jnp.asarray(_node_to_local_np)
+
         _bdata_jax = []
         for _bd in self.boundary_fn_data:
+            # Build node → boundary-edge adjacency for stochastic assembly.
+            # For each node j, store which boundary edges of this BC touch j and
+            # which local slot (0 or 1) the node occupies in that edge.
+            _beid_np = _np.asarray(_bd['edge_ids'], dtype=_np.int32)  # (n_be, 2)
+            _n_be = _beid_np.shape[0]
+            _bn2e: dict = _defaultdict(list)
+            for _e in range(_n_be):
+                for _p in range(2):
+                    _bn2e[int(_beid_np[_e, _p])].append((_e, _p))
+            _max_be = max((len(v) for v in _bn2e.values()), default=1)
+            _bnode_to_edge_np = _np.full((n_dofs, _max_be), -1, dtype=_np.int32)
+            _bnode_to_slot_np = _np.zeros((n_dofs, _max_be), dtype=_np.int32)
+            for _nid, _eslots in _bn2e.items():
+                for _i, (_e, _p) in enumerate(_eslots):
+                    _bnode_to_edge_np[_nid, _i] = _e
+                    _bnode_to_slot_np[_nid, _i] = _p
             _bdata_jax.append({
-                'pts':      jnp.asarray(_bd['pts'],      dtype=jnp.float32),
-                'weights':  jnp.asarray(_bd['weights'],  dtype=jnp.float32),
-                'phi':      jnp.asarray(_bd['phi'],      dtype=jnp.float32),
-                'edge_ids': jnp.asarray(_bd['edge_ids'], dtype=jnp.int32),
-                'fn':       _bd['fn'],
+                'pts':           jnp.asarray(_bd['pts'],      dtype=jnp.float32),
+                'weights':       jnp.asarray(_bd['weights'],  dtype=jnp.float32),
+                'phi':           jnp.asarray(_bd['phi'],      dtype=jnp.float32),
+                'edge_ids':      jnp.asarray(_beid_np),
+                'fn':            _bd['fn'],
+                'node_to_edge':  jnp.asarray(_bnode_to_edge_np),
+                'node_to_slot':  jnp.asarray(_bnode_to_slot_np),
+                'max_be':        _max_be,
+                'n_bqpts':       int(_bd['pts'].shape[1]),
+                'n_bdims':       int(_bd['pts'].shape[2]),
+                # Per-BC free-node partition (precomputed in _build_boundary_data)
+                'free_nodes':    jnp.asarray(_bd['free_nodes'], dtype=jnp.int32),
+                'name':          _bd['name'],
             })
 
-        _n_pts_dims = pts_jax.shape[-1]
+        # ── Precompute node partition (Python level, before jit tracing) ─────
+        # Maps each Neumann/Robin BC name → jnp.int32 array of free node indices
+        # on that BC's boundary.  The remainder goes into the "pde" entry.
+        _bc_node_arrays: dict = {}   # {name: jnp.int32 array}
+        _all_bc_node_set_static: set = set()
+        for _bj_pre in _bdata_jax:
+            _fn_np = _np.asarray(_bj_pre['free_nodes'])   # concrete numpy
+            _fn_list = _fn_np.tolist()
+            _all_bc_node_set_static.update(_fn_list)
+            if _fn_list:
+                _bc_node_arrays[_bj_pre['name']] = _bj_pre['free_nodes']
+        _pde_nd_static = [n for n in _true_free if n not in _all_bc_node_set_static]
+        _pde_nds_jax = (jnp.asarray(_np.array(_pde_nd_static, dtype=_np.int64),
+                                     dtype=jnp.int32)
+                        if _pde_nd_static else None)
 
         def residual_fn(params, sample_data=None):
-            pts_flat = pts_jax.reshape(-1, _n_pts_dims)
-            u_flat, grad_u_flat = jax.vmap(
-                lambda xy: _u_and_grad(params, xy))(pts_flat)
-
-            if u_flat.ndim == 1:
-                y_flat = u_flat.reshape(-1, 1)
-                def make_deriv(gu, gphi):
-                    def deriv_fn(Y, X, component, order):
-                        dim = order[0] if isinstance(order, (list, tuple)) else order
-                        if Y.ndim == 1: return gphi[:, dim]
-                        return gu[:, dim]
-                    return deriv_fn
-            else:
-                y_flat = u_flat
-                def make_deriv(jac, gphi):
-                    def deriv_fn(Y, X, component, order):
-                        dim = order[0] if isinstance(order, (list, tuple)) else order
-                        if Y.ndim == 1: return gphi[:, dim]
-                        return jac[:, component, dim]
-                    return deriv_fn
-
-            # Probe first term to detect multi-component output
-            _gphi0   = grad_phi_jax[:, :, 0, :].reshape(-1, 2)
-            R_sample = _terms[0].fn(
-                pts_flat, y_flat, params_dict,
-                phi_jax[:, :, 0].reshape(-1),
-                make_deriv(grad_u_flat, _gphi0),
-            )
-            _multi  = isinstance(R_sample, (tuple, list))
-            _n_comp = len(R_sample) if _multi else 1
-
             result = {}
-            for _iterm, _term in enumerate(_terms):
-                _tfn = _term.fn
-                Rs = [jnp.zeros(n_dofs, dtype=jnp.float32) for _ in range(_n_comp)]
 
-                for a in range(n_local):
-                    phi_a       = phi_jax[:, :, a]
-                    gphi_a_flat = grad_phi_jax[:, :, a, :].reshape(-1, 2)
-                    integrand   = _tfn(
-                        pts_flat, y_flat, params_dict,
-                        phi_a.reshape(-1),
-                        make_deriv(grad_u_flat, gphi_a_flat),
-                    )
-                    if _multi:
-                        for k, ig in enumerate(integrand):
+            def _net(x):
+                return network.apply(params, x, _weak_params_dict)
+
+            # ── Assembly mode is selected at build time, not inside jit ──────────
+            # _has_time_col is a Python bool captured from the enclosing scope.
+            # Transient problems (_has_time_col=True) always use stochastic per-node
+            # assembly; pure-spatial problems always use full Galerkin assembly.
+            # This avoids calling np.asarray() on JAX tracers inside jit.
+            if _has_time_col:
+                # ── Stochastic per-node assembly ─────────────────────────────────
+                _samp_raw = (sample_data or {}).get('pde')
+                if _samp_raw is not None:
+                    _samp = jnp.asarray(_samp_raw, dtype=jnp.float32)  # (N, 2)
+                    _node_indices_i = jnp.int32(_samp[:, 0])            # (N,)
+
+                    for _iterm, _term in enumerate(_terms):
+                        _tfn = _term.fn
+                        _is_first_term = (_iterm == 0)
+
+                        def _assemble_node(node_t, _tfn=_tfn,
+                                           _is_first=_is_first_term):
+                            """Return scalar (or (n_comp,)) Galerkin residual for test fn j."""
+                            node_j = jnp.int32(node_t[0])
+                            t_j    = node_t[1]
+
+                            face_indices = _node_to_faces_jax[node_j]  # (max_f,)
+                            local_slots  = _node_to_local_jax[node_j]  # (max_f,)
+                            mask       = face_indices >= 0
+                            safe_faces = jnp.where(mask, face_indices, 0)
+
+                            # Spatial cubature pts for these faces + time column
+                            face_pts_sp = pts_jax[safe_faces]  # (max_f, nq, n_sp)
+                            t_col = jnp.full(
+                                (_max_faces_per_node, n_qpts, 1), t_j, dtype=jnp.float32)
+                            face_pts_eval = jnp.concatenate([face_pts_sp, t_col], axis=-1)
+                            flat_pts   = face_pts_eval.reshape(_max_faces_per_node * n_qpts, -1)
+                            n_eval_dim = flat_pts.shape[-1]
+
+                            y_flat = _net(flat_pts)  # (max_f*nq, n_out)
+                            # JVPs over ALL input dims (spatial + time)
+                            grad_u = jnp.stack([
+                                jax.jvp(_net, (flat_pts,),
+                                         (jnp.zeros_like(flat_pts).at[:, _d].set(1.0),))[1]
+                                for _d in range(n_eval_dim)
+                            ], axis=-1)  # (max_f*nq, n_out, n_eval_dim)
+
+                            # Gather phi and gphi for local slot of node_j in each face
+                            _ridx     = jnp.arange(_max_faces_per_node)
+                            phi_j_2d  = phi_jax[safe_faces][_ridx, :, local_slots]
+                            gphi_j_3d = grad_phi_jax[safe_faces][_ridx, :, local_slots, :]
+                            phi_j_f   = phi_j_2d.reshape(_max_faces_per_node * n_qpts)
+                            gphi_j_f  = gphi_j_3d.reshape(_max_faces_per_node * n_qpts, _n_grad_dims)
+
+                            def _deriv(Y, X, component, order,
+                                       _gphi=gphi_j_f, _grad=grad_u):
+                                dim = order[0] if isinstance(order, (list, tuple)) else order
+                                if Y.ndim == 1:          # Y is phi
+                                    return _gphi[:, dim]
+                                return _grad[:, component, dim]
+
+                            integrand = _tfn(
+                                flat_pts, y_flat, params_dict, phi_j_f, _deriv)
+
+                            if _multi_output:
+                                vol_vals = []
+                                for _ig in integrand:
+                                    _ei = jnp.einsum(
+                                        'fq,fq->f', weights_jax[safe_faces],
+                                        _ig.reshape(_max_faces_per_node, n_qpts))
+                                    vol_vals.append(jnp.sum(jnp.where(mask, _ei, 0.0)))
+                                R_vol = jnp.stack(vol_vals)  # (n_comp,)
+                            else:
+                                _ei = jnp.einsum(
+                                    'fq,fq->f', weights_jax[safe_faces],
+                                    integrand.reshape(_max_faces_per_node, n_qpts))
+                                R_vol = jnp.sum(jnp.where(mask, _ei, 0.0))  # scalar
+
+                            # ── Boundary traction / Robin / Neumann contributions ──
+                            # Only subtracted for the first inner term (same as full assembly).
+                            if _is_first and _bdata_jax:
+                                for _bj in _bdata_jax:
+                                    _max_be  = _bj['max_be']
+                                    _n_bqpts = _bj['n_bqpts']
+                                    _n_bdims = _bj['n_bdims']
+                                    _bfn     = _bj['fn']
+
+                                    be_idx  = _bj['node_to_edge'][node_j]   # (max_be,)
+                                    be_slot = _bj['node_to_slot'][node_j]   # (max_be,)
+                                    be_mask = be_idx >= 0
+                                    safe_be = jnp.where(be_mask, be_idx, 0)
+
+                                    # Boundary pts: spatial only, then append t_j
+                                    bpts_sp = _bj['pts'][safe_be]  # (max_be, n_bqpts, n_bdims)
+                                    if _has_time_col:
+                                        bt_col = jnp.full(
+                                            (_max_be, _n_bqpts, 1), t_j, dtype=jnp.float32)
+                                        bpts_eval = jnp.concatenate([bpts_sp, bt_col], axis=-1)
+                                    else:
+                                        bpts_eval = bpts_sp
+                                    bflat = bpts_eval.reshape(_max_be * _n_bqpts, -1)
+                                    _nb_eval_dim = bflat.shape[-1]
+
+                                    by_flat = _net(bflat)
+                                    bgrad_u = jnp.stack([
+                                        jax.jvp(_net, (bflat,),
+                                                 (jnp.zeros_like(bflat).at[:, _d].set(1.0),))[1]
+                                        for _d in range(_nb_eval_dim)
+                                    ], axis=-1)  # (max_be*n_bqpts, n_out, n_eval_dim)
+
+                                    # phi_j on boundary: select slot for node_j per edge
+                                    _bridx    = jnp.arange(_max_be)
+                                    bphi_j_2d = _bj['phi'][safe_be][_bridx, :, be_slot]  # (max_be, n_bqpts)
+                                    bphi_j_f  = bphi_j_2d.reshape(_max_be * _n_bqpts)
+
+                                    def _bderiv(Y, X, comp, order,
+                                                _bg=bgrad_u):
+                                        dim = order[0] if isinstance(order, (list, tuple)) else order
+                                        if Y.ndim == 1:
+                                            return _bg[:, 0, dim] if _bg.ndim == 3 else _bg[:, dim]
+                                        return _bg[:, comp, dim]
+
+                                    b_intg = _bfn(bflat, by_flat, params_dict, bphi_j_f, _bderiv)
+
+                                    if _multi_output:
+                                        for _k, _big in enumerate(b_intg):
+                                            _be_int = jnp.einsum(
+                                                'eq,eq->e', _bj['weights'][safe_be],
+                                                _big.reshape(_max_be, _n_bqpts))
+                                            R_vol = R_vol.at[_k].add(
+                                                -jnp.sum(jnp.where(be_mask, _be_int, 0.0)))
+                                    else:
+                                        _be_int = jnp.einsum(
+                                            'eq,eq->e', _bj['weights'][safe_be],
+                                            b_intg.reshape(_max_be, _n_bqpts))
+                                        R_vol = R_vol - jnp.sum(jnp.where(be_mask, _be_int, 0.0))
+
+                            return R_vol
+
+                        R_nodes = jax.vmap(_assemble_node)(_samp)  # (N,) or (N, n_comp)
+                        _norm   = node_norm_jax[_node_indices_i]   # (N,)
+                        if R_nodes.ndim == 2:
+                            result[_term.name] = (R_nodes / _norm[:, None]).reshape(-1)
+                        else:
+                            result[_term.name] = R_nodes / _norm
+
+            else:
+                # ── Full Galerkin assembly (pure-spatial problems only) ───────────
+                pts_flat = pts_jax.reshape(-1, n_pts_dims)
+
+                def _net_pts(x): return _net(x)
+
+                y_flat = _net_pts(pts_flat)  # (N, n_out)
+                # Compute spatial Jacobian ∂u/∂x via vmap(jacfwd) so that
+                # per-point intermediates inside feature encoders like
+                # LaplacianFeatures stay at O(n_faces) instead of O(N × n_faces).
+                # This avoids NaN from memory overflow on large meshes.
+                def _net_single(xi):
+                    """xi: (n_pts_dims,) → (n_out,)"""
+                    return _net(xi[None])[0]
+
+                grad_u_flat = jax.vmap(jax.jacfwd(_net_single))(pts_flat)
+                # shape: (N, n_out, n_pts_dims)
+
+                def make_deriv(gphi):
+                    def deriv_fn(Y, X, component, order):
+                        dim = order[0] if isinstance(order, (list, tuple)) else order
+                        if Y.ndim == 1:
+                            return gphi[:, dim]
+                        return grad_u_flat[:, component, dim]
+                    return deriv_fn
+
+                for _iterm, _term in enumerate(_terms):
+                    _tfn = _term.fn
+                    Rs = [jnp.zeros(n_dofs, dtype=jnp.float32) for _ in range(_n_comp)]
+
+                    for a in range(n_local):
+                        phi_a       = phi_jax[:, :, a]
+                        gphi_a_flat = grad_phi_jax[:, :, a, :].reshape(-1, _n_grad_dims)
+                        integrand   = _tfn(
+                            pts_flat, y_flat, params_dict,
+                            phi_a.reshape(-1),
+                            make_deriv(gphi_a_flat),
+                        )
+                        if _multi_output:
+                            for k, ig in enumerate(integrand):
+                                elem_int = jnp.einsum(
+                                    'fq,fq->f', weights_jax,
+                                    ig.reshape(n_faces, n_qpts))
+                                Rs[k] = Rs[k].at[node_ids_jax[:, a]].add(elem_int)
+                        else:
                             elem_int = jnp.einsum(
                                 'fq,fq->f', weights_jax,
-                                ig.reshape(n_faces, n_qpts))
-                            Rs[k] = Rs[k].at[node_ids_jax[:, a]].add(elem_int)
-                    else:
-                        elem_int = jnp.einsum(
-                            'fq,fq->f', weights_jax,
-                            integrand.reshape(n_faces, n_qpts))
-                        Rs[0] = Rs[0].at[node_ids_jax[:, a]].add(elem_int)
+                                integrand.reshape(n_faces, n_qpts))
+                            Rs[0] = Rs[0].at[node_ids_jax[:, a]].add(elem_int)
 
-                # Subtract boundary traction / Robin RHS (only from the first inner term)
-                if _iterm == 0:
-                    for _bj in _bdata_jax:
-                        _bp_ndims  = _bj['pts'].shape[-1]
-                        _bpts_flat = _bj['pts'].reshape(-1, _bp_ndims)
-                        _bw        = _bj['weights']
-                        _bphi_mat  = _bj['phi']
-                        _beid      = _bj['edge_ids']
-                        _bfn       = _bj['fn']
-                        _n_bedges  = _bj['pts'].shape[0]
-                        _n_bqpts   = _bj['pts'].shape[1]
+                    # Subtract boundary traction / Robin RHS (first inner term only)
+                    if _iterm == 0:
+                        for _bj in _bdata_jax:
+                            _bp_ndims  = _bj['pts'].shape[-1]
+                            _bpts_flat = _bj['pts'].reshape(-1, _bp_ndims)
+                            _bw        = _bj['weights']
+                            _bphi_mat  = _bj['phi']
+                            _beid      = _bj['edge_ids']
+                            _bfn       = _bj['fn']
+                            _n_bedges  = _bj['pts'].shape[0]
+                            _n_bqpts   = _bj['pts'].shape[1]
 
-                        _bu_flat, _bgu_flat = jax.vmap(
-                            lambda xy: _u_and_grad(params, xy))(_bpts_flat)
-                        # Normalise shapes: u always (N, n_out), grad always (N, n_out, n_dim) or (N, n_dim)
-                        _by_flat = (_bu_flat.reshape(-1, 1)
-                                    if _bu_flat.ndim == 1 else _bu_flat)
+                            _by_flat  = _net(_bpts_flat)
+                            def _bnet_single(xi):
+                                return _net(xi[None])[0]
+                            _bgu_flat = jax.vmap(jax.jacfwd(_bnet_single))(_bpts_flat)
+                            # shape: (n_bpts, n_out, n_spatial)
 
-                        def _mk_bderiv(bgu):
-                            def _bderiv(Y, X, c, o):
-                                dim = o[0] if isinstance(o, (list, tuple)) else o
-                                return bgu[:, dim] if bgu.ndim == 2 else bgu[:, c, dim]
-                            return _bderiv
+                            def _mk_bderiv(bgu):
+                                def _bderiv(Y, X, c, o):
+                                    dim = o[0] if isinstance(o, (list, tuple)) else o
+                                    if Y.ndim == 1:
+                                        return bgu[:, 0, dim] if bgu.ndim == 3 else bgu[:, dim]
+                                    return bgu[:, c, dim]
+                                return _bderiv
 
-                        _bderiv = _mk_bderiv(_bgu_flat)
+                            _bderiv = _mk_bderiv(_bgu_flat)
 
-                        for _p in range(2):
-                            _bphi_p = _bphi_mat[:, :, _p]
-                            _b_intg = _bfn(
-                                _bpts_flat, _by_flat, params_dict,
-                                _bphi_p.reshape(-1), _bderiv)
-                            if isinstance(_b_intg, (tuple, list)):
-                                for k, ig in enumerate(_b_intg):
+                            for _p in range(2):
+                                _bphi_p = _bphi_mat[:, :, _p]
+                                _b_intg = _bfn(
+                                    _bpts_flat, _by_flat, params_dict,
+                                    _bphi_p.reshape(-1), _bderiv)
+                                if isinstance(_b_intg, (tuple, list)):
+                                    for k, ig in enumerate(_b_intg):
+                                        _belem = jnp.einsum(
+                                            'eq,eq->e', _bw,
+                                            ig.reshape(_n_bedges, _n_bqpts))
+                                        Rs[k] = Rs[k].at[_beid[:, _p]].add(-_belem)
+                                else:
                                     _belem = jnp.einsum(
                                         'eq,eq->e', _bw,
-                                        ig.reshape(_n_bedges, _n_bqpts))
-                                    Rs[k] = Rs[k].at[_beid[:, _p]].add(-_belem)
-                            else:
-                                _belem = jnp.einsum(
-                                    'eq,eq->e', _bw,
-                                    _b_intg.reshape(_n_bedges, _n_bqpts))
-                                Rs[0] = Rs[0].at[_beid[:, _p]].add(-_belem)
+                                        _b_intg.reshape(_n_bedges, _n_bqpts))
+                                    Rs[0] = Rs[0].at[_beid[:, _p]].add(-_belem)
 
-                # Normalise and slice to free nodes (components concatenated)
-                _nodes = (
-                    jnp.asarray(sample_data['free_nodes'], dtype=jnp.int32)
-                    if sample_data is not None and 'free_nodes' in sample_data
-                    else free_nodes_jax
-                )
-                norm = node_norm_jax[_nodes]
-                result[_term.name] = jnp.concatenate([
-                    R[_nodes] / norm for R in Rs
-                ])
+                    # ── Split residual by Neumann/Robin BC name ──────────────
+                    # _bc_node_arrays and _pde_nds_jax are static (built above,
+                    # before tracing), so only JAX indexing runs inside jit.
+                    for _bc_nm, _bc_nds in _bc_node_arrays.items():
+                        _bc_norm = node_norm_jax[_bc_nds]
+                        result[_bc_nm] = jnp.concatenate(
+                            [R[_bc_nds] / _bc_norm for R in Rs])
+                    if _pde_nds_jax is not None:
+                        _pde_norm = node_norm_jax[_pde_nds_jax]
+                        result[_term.name] = jnp.concatenate(
+                            [R[_pde_nds_jax] / _pde_norm for R in Rs])
 
             # ── IC soft penalties (TermInitial) ──────────────────────────────
             for _ic_bc_r, _ic_pts_r in _ic_data:
-                _ic_u_r, _ = jax.vmap(
-                    lambda xy: _u_and_grad(params, xy))(_ic_pts_r)
-                _ic_y_r = _ic_u_r if _ic_u_r.ndim == 2 else _ic_u_r.reshape(-1, 1)
+                _ic_y_r = _net(_ic_pts_r)   # (n_ic, n_out)
                 result[_ic_bc_r.name] = _ic_bc_r.fn(_ic_pts_r, _ic_y_r, params_dict)
 
             # ── Periodic BC soft penalties ────────────────────────────────────
@@ -1275,10 +1493,8 @@ class ProblemWeak(BaseProblem):
                     _pbc_half = _pbc_pts.shape[0] // 2
                     _pbc_xa   = _pbc_pts[:_pbc_half]
                     _pbc_xb   = _pbc_pts[_pbc_half:]
-                    _pbc_ua, _ = jax.vmap(lambda xy: _u_and_grad(params, xy))(_pbc_xa)
-                    _pbc_ub, _ = jax.vmap(lambda xy: _u_and_grad(params, xy))(_pbc_xb)
-                    _pbc_ya = _pbc_ua if _pbc_ua.ndim == 2 else _pbc_ua.reshape(-1, 1)
-                    _pbc_yb = _pbc_ub if _pbc_ub.ndim == 2 else _pbc_ub.reshape(-1, 1)
+                    _pbc_ya = _net(_pbc_xa)   # (n, n_out)
+                    _pbc_yb = _net(_pbc_xb)   # (n, n_out)
                     _pbc_c  = _pbc_t.component
                     if _pbc_c is not None:
                         result[_pbc_t.name] = _pbc_ya[:, _pbc_c] - _pbc_yb[:, _pbc_c]
@@ -1293,9 +1509,14 @@ class ProblemWeak(BaseProblem):
                     if _sbc.name not in sample_data:
                         continue
                     _sbc_pts = jnp.asarray(sample_data[_sbc.name], dtype=jnp.float32)
-                    _sbc_u, _sbc_grad = jax.vmap(
-                        lambda xy: _u_and_grad(params, xy))(_sbc_pts)
-                    _sbc_y = _sbc_u if _sbc_u.ndim == 2 else _sbc_u.reshape(-1, 1)
+                    _sbc_y = _net(_sbc_pts)   # (n, n_out)
+                    # Gradients computed lazily via JVP; XLA DCE removes them for
+                    # plain Dirichlet BCs where _cbc_deriv is never called.
+                    _sbc_grad = jnp.stack([
+                        jax.jvp(_net, (_sbc_pts,),
+                                (jnp.zeros_like(_sbc_pts).at[:, _d].set(1.0),))[1]
+                        for _d in range(_n_spatial)
+                    ], axis=-1)   # (n, n_out, n_spatial)
 
                     if _sbc.kind == 'dirichlet':
                         col = _sbc.component
@@ -1312,8 +1533,9 @@ class ProblemWeak(BaseProblem):
                         def _cbc_deriv(Y, X, comp, order,
                                        _g=_captured_grad):
                             dim = order[0] if isinstance(order, (list, tuple)) else order
-                            return (_g[:, dim] if _g.ndim == 2
-                                    else _g[:, comp, dim])
+                            if Y.ndim == 1:  # phi
+                                return _g[:, 0, dim]  # fallback; custom BCs rarely use phi
+                            return _g[:, comp, dim]
                         raw = _sbc.fn(_sbc_pts, _sbc_y, params_dict, _cbc_deriv)
                         result[_sbc.name] = (
                             raw if not isinstance(raw, (list, tuple))
