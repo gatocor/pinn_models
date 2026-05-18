@@ -41,7 +41,8 @@ from .models.model_stepper import ModelStepper
 # Networks / layers
 from .models.layers import (
     FNN, WFFNN, RandomFourierFeatures, FourierFeatures, DenseRWF,
-    PirateNet, ResNet,
+    PirateNet, ResNet, PeriodicEmbedding,
+    Normalize, Denormalize,
 )
 from .models.layers.gnn import GNNFeatures
 from .models.layers.laplacian import LaplacianFeatures
@@ -55,6 +56,8 @@ from .trainer import (Trainer, TrainPlotter,
                       SchedulerExponentialDecay, SchedulerReduceLROnPlateau,
                       SchedulerResample, SchedulerAdaptiveResample,
                       SchedulerCurriculum, SchedulerLagrange,
+                      SchedulerGradNorm, SchedulerCausal,
+                      SchedulerWarmupDecay, SchedulerNTK,
                       BaseOptimizer,
                       AdamOptimizer, AdamWOptimizer, SGDOptimizer, RMSPropOptimizer,
                       LionOptimizer, LBFGSOptimizer, SOAPOptimizer)
@@ -71,7 +74,8 @@ __all__ = [
     "TermCollection",
     # Interior / initial / data-point PDE terms
     "TermInner", "TermInitial",
-    "FNN", "WFFNN", "PirateNet", "ResNet", "RandomFourierFeatures", "FourierFeatures", "DenseRWF",
+    "FNN", "WFFNN", "PirateNet", "ResNet", "RandomFourierFeatures", "FourierFeatures", "DenseRWF", "PeriodicEmbedding",
+    "Normalize", "Denormalize",
     "GNNFeatures", "LaplacianFeatures",
     "ModelBase", "NetworkLoss", "create_model", "ModelPartitioned", "ModelStepper",
     "PartitionFB", "PartitionX", "StepperStep", "StepperDt", "register_interface_loss",
@@ -82,6 +86,8 @@ __all__ = [
     "SchedulerExponentialDecay", "SchedulerReduceLROnPlateau",
     "SchedulerResample", "SchedulerAdaptiveResample",
     "SchedulerCurriculum", "SchedulerLagrange",
+    "SchedulerGradNorm", "SchedulerCausal",
+    "SchedulerWarmupDecay", "SchedulerNTK",
     "BaseOptimizer",
     "AdamOptimizer", "AdamWOptimizer", "SGDOptimizer", "RMSPropOptimizer",
     "LionOptimizer", "LBFGSOptimizer", "SOAPOptimizer",

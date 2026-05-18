@@ -64,6 +64,16 @@ class Scheduler(ABC):
         new_lr = self.lr(trainer.get_learning_rate(), global_epoch)
         trainer.set_learning_rate(new_lr)
 
+    def needs_epoch_end_at(self, epoch: int) -> bool:
+        """Return True if ``on_epoch_end`` should be called at this epoch.
+
+        The trainer uses this to avoid an unnecessary host-device sync
+        (``float(loss)``) on epochs where no scheduler needs the hook.
+        Override to return ``epoch % N == 0`` for schedulers that only need
+        to act periodically.
+        """
+        return True
+
     def on_epoch_end(self, trainer, epoch: int, loss: float) -> None:
         """Called after each gradient step."""
         pass
@@ -106,6 +116,50 @@ class Scheduler(ABC):
         """
         import jax.numpy as jnp
         return jnp.array(0.0)
+
+    def jit_update(self, jit_state: dict, residuals: dict) -> dict:
+        """Update the scheduler's JIT state *inside* the compiled training step.
+
+        Called by the trainer after each gradient step, fully within JIT.
+        The returned dict becomes the new ``jit_state`` passed to the next
+        step's ``extra_loss`` and ``jit_update`` calls — no Python-level
+        host-device transfer is needed.
+
+        Parameters
+        ----------
+        jit_state : dict
+            Current state as returned by ``get_jit_state()``.
+        residuals : dict[str, jax.Array]
+            Per-term residuals from the current step.
+
+        Returns
+        -------
+        dict – updated state with the same structure as *jit_state*.
+        Default implementation returns *jit_state* unchanged.
+        """
+        return jit_state
+
+    def term_weights(self, residuals: dict, jit_state: dict) -> dict:
+        """Per-sample weight arrays applied *inside* the JIT step as
+        ``mean(w_i * R_i²)`` for each term.
+
+        The trainer multiplies each term's base scalar weight by
+        ``mean(w_i * R_i²)`` instead of the plain ``mean(R_i²)``.  Return an
+        empty dict (default) to use uniform per-sample weights of 1.
+
+        Parameters
+        ----------
+        residuals : dict[str, jax.Array]
+            Per-term residual vectors from the problem's residual function.
+        jit_state : dict
+            The dict returned by ``self.get_jit_state()`` for this scheduler.
+
+        Returns
+        -------
+        dict[str, jax.Array] – per-sample weight array for each term to
+        override.  Shapes must match the corresponding residual array.
+        """
+        return {}
 
 
 __all__ = ["Scheduler", "is_notebook"]

@@ -16,6 +16,7 @@ from .resnet   import ResNet
 from .piratenet import PirateNet
 
 from .fourier   import RandomFourierFeatures, FourierFeatures
+from .periodic  import PeriodicEmbedding
 from .gnn       import GNNFeatures
 from .laplacian import LaplacianFeatures, AlphaTransform
 
@@ -35,6 +36,7 @@ __all__ = [
     # feature encoders
     "RandomFourierFeatures",
     "FourierFeatures",
+    "PeriodicEmbedding",
     "GNNFeatures",
     "LaplacianFeatures",
     "AlphaTransform",

@@ -124,6 +124,9 @@ class DomainMesh:
         # Precompute triangle areas for weighted sampling.
         # Works for both 2-D flat meshes (signed-area formula) and 3-D surface
         # meshes embedded in R³ (cross-product magnitude / 2).
+        self._vertex_normals = None   # populated below for 3-D meshes only
+        self._node_to_face   = None   # populated below for 3-D meshes only (legacy)
+        self._node_to_faces  = None   # (n_verts, max_valence) all adjacent faces, -1 padded
         A = vertices[self._faces[:, 0]]
         B = vertices[self._faces[:, 1]]
         C = vertices[self._faces[:, 2]]
@@ -134,6 +137,33 @@ class DomainMesh:
             # 3-D surface: area = ||(B-A) × (C-A)|| / 2
             cross3 = np.cross(B - A, C - A)                # (n_faces, 3)
             self._tri_areas = 0.5 * np.linalg.norm(cross3, axis=1)  # (n_faces,)
+
+            # Precompute area-weighted vertex normals (once, numpy).
+            face_n = cross3 / (np.linalg.norm(cross3, axis=1, keepdims=True) + 1e-12)
+            vertex_n = np.zeros_like(vertices)             # (n_verts, 3)
+            weights = self._tri_areas[:, None] * face_n    # (n_faces, 3)
+            np.add.at(vertex_n, self._faces[:, 0], weights)
+            np.add.at(vertex_n, self._faces[:, 1], weights)
+            np.add.at(vertex_n, self._faces[:, 2], weights)
+            norms = np.linalg.norm(vertex_n, axis=1, keepdims=True)
+            vertex_n /= np.where(norms > 0, norms, 1.0)
+            self._vertex_normals = vertex_n.astype(np.float32)  # (n_verts, 3)
+
+            # Precompute nearest-vertex → ALL adjacent faces map.
+            # Storing all adjacent faces (not just one) lets _interpolate_mesh
+            # pick the BEST face (highest min barycentric coord) among candidates,
+            # which correctly handles off-vertex query points.
+            _v2f_lists = [[] for _ in range(len(vertices))]
+            for _fi, _face in enumerate(self._faces):
+                for _vi in _face:
+                    _v2f_lists[_vi].append(_fi)
+            _max_val = max(len(fl) for fl in _v2f_lists)
+            _n2fs = np.full((len(vertices), _max_val), -1, dtype=np.int32)
+            for _vi, _fl in enumerate(_v2f_lists):
+                _n2fs[_vi, :len(_fl)] = _fl
+            self._node_to_faces = _n2fs  # (n_verts, max_valence) int32
+            # Keep legacy single-face map for backward compat
+            self._node_to_face = _n2fs[:, 0].copy()  # (n_verts,) int32
         self._tri_probs = self._tri_areas / self._tri_areas.sum()
 
         sp_min = vertices.min(axis=0)
@@ -1066,6 +1096,49 @@ class DomainMesh:
         normals[flip] *= -1
         return normals
 
+    def surface_normal(self, x: "jnp.ndarray") -> "jnp.ndarray":
+        """Interpolate precomputed vertex normals to arbitrary query points.
+
+        Uses barycentric interpolation — the same mechanism as
+        :class:`~pinns.models.layers.LaplacianFeatures`.  Vertex normals are
+        area-weighted averages of adjacent face normals, computed **once** at
+        construction time.
+
+        Only available for 3-D surface meshes (``_spatial_dims == 3``).
+
+        Parameters
+        ----------
+        x : (N, 3) JAX or numpy array
+            Query points on (or near) the surface.
+
+        Returns
+        -------
+        (N, 3) JAX array  — unit normals at each query point.
+        """
+        if self._vertex_normals is None:
+            raise ValueError(
+                "surface_normal() is only available for 3-D surface meshes "
+                "(spatial_dims == 3)."
+            )
+        import jax.numpy as jnp
+        from pinns.models.layers.gnn import _interpolate_mesh
+
+        vn    = jnp.array(self._vertex_normals)          # (n_verts, 3)
+        nodes = jnp.array(self._vertices.astype('float32'))
+        faces = jnp.array(self._faces.astype('int32'))
+        x_sp  = jnp.asarray(x, dtype=jnp.float32)[:, :3]
+
+        node_to_face = (jnp.array(self._node_to_face)
+                        if self._node_to_face is not None else None)
+        node_to_faces = (jnp.array(self._node_to_faces)
+                         if self._node_to_faces is not None else None)
+        n_interp = _interpolate_mesh(vn, nodes, faces, x_sp,
+                                     node_to_faces=node_to_faces,
+                                     node_to_face=node_to_face)  # (N, 3)
+        # Re-normalise after interpolation (barycentric blend may shrink magnitude)
+        n_interp = n_interp / (jnp.linalg.norm(n_interp, axis=1, keepdims=True) + 1e-12)
+        return n_interp
+
     def get_boundary_normals(self, x: np.ndarray, region: str) -> np.ndarray:
         """Return outward unit normals at *x* for the given boundary *region*.
 
@@ -1645,6 +1718,12 @@ class DomainMesh:
             return self._plot_pyvista(show_mesh=show_mesh,
                                        node_size=node_size)
 
+        if self._spatial_dims == 3:
+            return self._plot_3d_matplotlib(
+                show_mesh=show_mesh, boundary=boundary,
+                node_size=node_size, figsize=figsize, points=points,
+            )
+
         if self._spatial_dims not in (2, 3):
             raise NotImplementedError(
                 "DomainMesh.plot() requires a 2-D or 3-D spatial mesh."
@@ -1898,6 +1977,95 @@ class DomainMesh:
                            s=8, color='tomato', alpha=0.5, zorder=5,
                            label='_points')
         return axes[0] if n_panels == 1 else axes
+
+    def _plot_3d_matplotlib(
+        self,
+        show_mesh: bool = True,
+        boundary=None,
+        node_size: float = 30.0,
+        figsize=None,
+        points=None,
+    ):
+        """3-D surface mesh rendered with matplotlib Axes3D (plot_trisurf)."""
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers projection)
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection
+
+        v, f = self._vertices, self._faces  # (N,3), (F,3)
+
+        if figsize is None:
+            figsize = (9, 7)
+
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111, projection='3d')
+
+        # ── surface ─────────────────────────────────────────────────────────
+        ax.plot_trisurf(
+            v[:, 0], v[:, 1], v[:, 2],
+            triangles=f,
+            color='#a8c4e0', alpha=0.35, edgecolor='none', zorder=1,
+        )
+
+        # ── mesh edges ──────────────────────────────────────────────────────
+        if show_mesh:
+            edge_set = set()
+            for tri in f:
+                for i in range(3):
+                    a, b = int(tri[i]), int(tri[(i + 1) % 3])
+                    edge_set.add((min(a, b), max(a, b)))
+            segs = np.array([[v[a], v[b]] for a, b in edge_set])  # (E,2,3)
+            lc = Line3DCollection(segs, colors='#888888', linewidths=0.4,
+                                  alpha=0.5, zorder=2)
+            ax.add_collection3d(lc)
+
+        # ── boundary regions ────────────────────────────────────────────────
+        _cyc = plt.rcParams['axes.prop_cycle'].by_key()['color']
+        if boundary is not None:
+            if boundary in ('all', 'custom', 'inner'):
+                bnd_highlight = list(self._boundary_regions.keys())
+            elif isinstance(boundary, str):
+                bnd_highlight = [boundary]
+            else:
+                bnd_highlight = list(boundary)
+            _bnd_palette = ['#ff7f0e', '#d62728', '#2ca02c', '#9467bd',
+                            '#17becf', '#8c564b', '#e377c2', '#bcbd22']
+            for i, nm in enumerate(bnd_highlight):
+                if nm not in self._boundary_regions:
+                    continue
+                reg = self._boundary_regions[nm]
+                edges = reg['edges']   # (E,2) vertex indices
+                color = _bnd_palette[i % len(_bnd_palette)]
+                segs_b = np.array([[v[e[0]], v[e[1]]] for e in edges])
+                lc_b = Line3DCollection(segs_b, colors=color, linewidths=2.5,
+                                        zorder=5, label=nm)
+                ax.add_collection3d(lc_b)
+                # also scatter the boundary nodes
+                nodes = np.unique(edges)
+                ax.scatter(v[nodes, 0], v[nodes, 1], v[nodes, 2],
+                           s=node_size, color=color, zorder=6,
+                           depthshade=False)
+
+        # ── extra collocation points ─────────────────────────────────────────
+        if points is not None:
+            pts = np.asarray(points)
+            ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
+                       s=8, color='tomato', alpha=0.6, zorder=7,
+                       label='_points')
+
+        ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('z')
+        handles, labels = ax.get_legend_handles_labels()
+        visible = [(h, l) for h, l in zip(handles, labels)
+                   if not l.startswith('_')]
+        if visible:
+            ax.legend(*zip(*visible), fontsize=8, loc='upper left')
+
+        fig.suptitle(
+            f"{type(self).__name__}  |  {len(v)} nodes, {len(f)} triangles  [3D]",
+            fontsize=11,
+        )
+        fig.tight_layout()
+        plt.show()
+        return ax
 
     def _plot_pyvista(
         self,

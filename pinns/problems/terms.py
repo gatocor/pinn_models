@@ -245,8 +245,12 @@ class TermPeriodicBC:
                  node pairs (DomainMesh) or a default count (DomainCubic).
         component: Output component to enforce, or ``None`` for all components.
         name: Base label used in weight dicts.
-        match_x_derivative: If ``True``, also penalise the tangential derivative
-                             mismatch ``|du/ds(x_a) - du/ds(x_b)|^2``.
+        match_x_derivative: Number of spatial-derivative orders to match at the
+                             periodic boundary.  ``0`` matches only field values.
+                             ``1`` additionally matches ``du/dx``, ``2`` matches
+                             ``du/dx`` *and* ``d²u/dx²``, etc.  ``True``/``False``
+                             are accepted for backward compatibility (mapped to
+                             1 and 0 respectively).  Default is ``1``.
         fn: Residual callable for strong-form usage.  ``None`` for weak form.
 
     Example::
@@ -260,7 +264,7 @@ class TermPeriodicBC:
     n_pairs:            Optional[int] = None
     component:          Optional[int] = None
     name:               Optional[str] = None
-    match_x_derivative: bool          = True
+    match_x_derivative: int           = 1
     fn:                 Optional[Callable] = None
 
     kind:      'ClassVar[str]'  = 'periodic'

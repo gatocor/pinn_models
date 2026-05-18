@@ -75,55 +75,71 @@ def _make_derivative_fn_batched(model_apply, params):
     
     This is significantly faster than per-point vmap for typical PINN batch sizes.
     """
-    # Cache for storing wrapped functions for each (component, partial_order) combination
-    # This allows x_tt to reuse the derivative function built for x_t
+    # Cache for storing wrapped functions keyed by partial_order ONLY (not component).
+    # A single JVP pass with tangent e_d produces ∂f/∂x_d for ALL output components
+    # simultaneously — sharing this across components halves the number of passes for
+    # multi-output PDEs (e.g. Grey-Scott: 5 passes instead of 10).
     _fn_cache = {}
-    
-    def deriv_fn(Y, X, component, order, create_graph=True):
-        if len(order) == 0:
-            raise ValueError("order tuple must have at least one element")
-        
-        n_dims = X.shape[1]
-        
-        # Build the base function for this component (cached)
-        cache_key = (component,)
-        if cache_key not in _fn_cache:
+
+    def _build_fn_for_order(order):
+        """Build (and cache) the JVP chain for *order*, return the chain fn."""
+        if () not in _fn_cache:
             def base_fn(x):
-                return model_apply(params, x)[:, component]
-            _fn_cache[cache_key] = base_fn
-        
-        # Build derivative function by chaining, caching each level
-        current_fn = _fn_cache[cache_key]
-        
+                return model_apply(params, x)
+            _fn_cache[()] = base_fn
+
+        current_fn = _fn_cache[()]
         for i, dim in enumerate(order):
-            # Check if we've already built this partial derivative
-            partial_key = (component,) + order[:i+1]
-            
+            partial_key = order[:i + 1]
             if partial_key in _fn_cache:
                 current_fn = _fn_cache[partial_key]
             else:
-                # Create new derivative function using batched JVP
-                prev_fn = current_fn
-                dim_to_diff = dim
-                
                 def make_next_fn(f, d):
                     def next_fn(x):
-                        # Tangent vector: 1.0 in dimension d, 0 elsewhere
-                        # Shape: (batch_size, n_dims)
                         tangent = jnp.zeros_like(x)
                         tangent = tangent.at[:, d].set(1.0)
                         _, deriv = jax.jvp(f, (x,), (tangent,))
                         return deriv
                     return next_fn
-                
-                current_fn = make_next_fn(prev_fn, dim_to_diff)
+                current_fn = make_next_fn(current_fn, dim)
                 _fn_cache[partial_key] = current_fn
-        
-        # Evaluate and return (batch_size, 1) — one scalar per input point,
-        # as a column vector so it broadcasts correctly with (N, 1) network outputs.
-        result = current_fn(X)
-        return result.reshape(-1, 1)
-    
+        return current_fn
+
+    # ── per-call result cache ────────────────────────────────────────────────
+    # Stores the last evaluated (X_id, result) pair per order so that multiple
+    # calls with the same X (within one residual evaluation) share the result.
+    # Under JAX JIT, Python id() is stable per trace, so this works correctly.
+    _result_cache: dict = {}
+
+    def _eval_cached(X, order):
+        key = (id(X), order)
+        if key not in _result_cache:
+            # Prune stale entries whenever a new X is seen (new iteration)
+            x_id = id(X)
+            stale = [k for k in _result_cache if k[0] != x_id]
+            for k in stale:
+                del _result_cache[k]
+            fn = _build_fn_for_order(order)
+            _result_cache[key] = fn(X)
+        return _result_cache[key]
+
+    def deriv_all_fn(X, order):
+        """Return ∂^|order| f / ∂x_{order} for ALL output components.
+
+        Returns shape (N, n_outputs).  Cheaper than calling deriv_fn once per
+        component because the JVP result is evaluated only once and cached for
+        the lifetime of this residual call.
+        """
+        return _eval_cached(X, order)
+
+    # Rebuild deriv_fn to use the shared _eval_cached
+    def deriv_fn(Y, X, component, order, create_graph=True):
+        if len(order) == 0:
+            raise ValueError("order tuple must have at least one element")
+        result = _eval_cached(X, order)     # (N, n_outputs)
+        return result[:, component:component+1]
+
+    deriv_fn.all = deriv_all_fn
     return deriv_fn
 
 

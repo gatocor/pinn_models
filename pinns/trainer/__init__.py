@@ -9,6 +9,8 @@ from .schedulers import (
     SchedulerExponentialDecay, SchedulerReduceLROnPlateau,
     SchedulerResample, SchedulerAdaptiveResample,
     SchedulerCurriculum, SchedulerLagrange,
+    SchedulerGradNorm, SchedulerCausal,
+    SchedulerWarmupDecay, SchedulerNTK,
 )
 from .optimizers import (
     BaseOptimizer,
@@ -24,6 +26,8 @@ __all__ = [
     "SchedulerExponentialDecay", "SchedulerReduceLROnPlateau",
     "SchedulerResample", "SchedulerAdaptiveResample",
     "SchedulerCurriculum", "SchedulerLagrange",
+    "SchedulerGradNorm", "SchedulerCausal",
+    "SchedulerWarmupDecay", "SchedulerNTK",
     "BaseOptimizer",
     "AdamOptimizer", "AdamWOptimizer", "SGDOptimizer", "RMSPropOptimizer", "LionOptimizer",
     "LBFGSOptimizer", "SOAPOptimizer",

@@ -51,31 +51,6 @@ class SubdomainInfo:
         return f"SubdomainInfo(index={self.index}, xmin={self.xmin.tolist()}, xmax={self.xmax.tolist()})"
 
 # ============================================================================
-# Stepper — fixed time partition for state-integrator (MoL / BPTT) problems
-# ============================================================================
-
-# ---------------------------------------------------------------------------
-# Stepper — deprecated.  Use StepperStep from pinns.strategies instead.
-# ---------------------------------------------------------------------------
-
-def Stepper():
-    """Deprecated factory — returns a :class:`~pinns.strategies.StepperStep` instance.
-
-    Use ``StepperStep()`` directly in new code.
-    """
-    import warnings
-    from ..models.stepping import StepperStep
-    warnings.warn(
-        "Stepper() is deprecated and will be removed in a future version. "
-        "Use StepperStep() from pinns.strategies (or pinns) instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return StepperStep()
-
-
-
-# ============================================================================
 # Sampling utilities
 # ============================================================================
 
@@ -489,7 +464,8 @@ class DomainCubic:
         return self.xmax - self.xmin
     
     def sample_interior(self, n_points, region=None, size='equal', rng=None,
-                        method=None, transform=None, params=None, mode='uniform'):
+                        method=None, transform=None, params=None, mode='uniform',
+                        t_interval=None):
         """
         Sample points from the interior of the domain.
 
@@ -559,7 +535,8 @@ class DomainCubic:
                 if n > 0:
                     parts.append(self.sample_interior(
                         n, region=r, rng=rng, method=method,
-                        transform=transform, params=params))
+                        transform=transform, params=params,
+                        t_interval=t_interval))
             return np.vstack(parts)
 
         # ── tuple multi-index: specific sub-partition ─────────────────────
@@ -607,6 +584,13 @@ class DomainCubic:
                     t_hi = float(self.time_grid_positions[t_idx + 1])
                 else:
                     t_lo, t_hi = self._t_min, self._t_max
+                if t_interval is not None:
+                    _ti_lo, _ti_hi = float(t_interval[0]), float(t_interval[1])
+                    if _ti_lo < self._t_min or _ti_hi > self._t_max or _ti_lo >= _ti_hi:
+                        raise ValueError(
+                            f"t_interval [{_ti_lo}, {_ti_hi}] is invalid: must satisfy "
+                            f"[{self._t_min}, {self._t_max}] and lo < hi.")
+                    t_lo, t_hi = _ti_lo, _ti_hi
                 t = rng.uniform(t_lo, t_hi, (len(pts), 1))
                 pts = np.hstack([pts, t])
             return pts
@@ -690,15 +674,67 @@ class DomainCubic:
             raise ValueError(f"Unknown mode: {mode!r}. Use 'uniform' or 'per_partition'.")
 
         # Append time column if domain is time-dependent
+        if t_interval is not None and self._t_min is None:
+            raise ValueError(
+                "t_interval was provided but this domain has no time axis.")
         if self._t_min is not None:
             if rng is None:
                 rng = np.random.default_rng()
-            t = rng.uniform(self._t_min, self._t_max, (len(pts), 1))
+            if t_interval is not None:
+                _ti_lo, _ti_hi = float(t_interval[0]), float(t_interval[1])
+                if _ti_lo < self._t_min or _ti_hi > self._t_max or _ti_lo >= _ti_hi:
+                    raise ValueError(
+                        f"t_interval [{_ti_lo}, {_ti_hi}] is invalid: must satisfy "
+                        f"[{self._t_min}, {self._t_max}] and lo < hi.")
+                _t_lo, _t_hi = _ti_lo, _ti_hi
+            else:
+                _t_lo, _t_hi = self._t_min, self._t_max
+            t = rng.uniform(_t_lo, _t_hi, (len(pts), 1))
             pts = np.hstack([pts, t])
         return pts
-    
+
+    def sample_initial(self, n_points, region=None, size='equal', rng=None,
+                       method=None, transform=None, params=None, mode='uniform'):
+        """Sample points on the initial time slice (``t == t_min``).
+
+        Convenience wrapper around :meth:`sample_interior` that fixes the time
+        column to ``_t_min`` after sampling spatial coordinates.
+
+        Args:
+            n_points (int): Number of points to return.
+            region: Forwarded to :meth:`sample_interior`.
+            size: Forwarded to :meth:`sample_interior`.
+            rng: Random-number generator.
+            method: Sampling method override.
+            transform: Optional inverse-CDF transform.
+            params: Extra keyword arguments forwarded to *transform*.
+            mode: Forwarded to :meth:`sample_interior`.
+
+        Returns:
+            np.ndarray: Shape ``(n_points, n_spatial + 1)`` with the time
+            column set to ``_t_min``.
+
+        Raises:
+            ValueError: If the domain has no time axis.
+        """
+        if self._t_min is None:
+            raise ValueError(
+                "sample_initial requires a time axis. "
+                "Construct DomainCubic with the 'time' argument.")
+        # Sample spatial coords with a degenerate t_interval so no time is
+        # appended by sample_interior, then attach the fixed t_min column.
+        pts = self.sample_interior(
+            n_points, region=region, size=size, rng=rng,
+            method=method, transform=transform, params=params, mode=mode,
+            t_interval=None,
+        )
+        # sample_interior already appended t uniformly; replace it with t_min
+        pts[:, self._spatial_dims] = self._t_min
+        return pts
+
     def sample_boundary(self, n_points, region=None, size='equal', rng=None,
-                        method=None, transform=None, params=None):
+                        method=None, transform=None, params=None,
+                        t_interval=None):
         """
         Sample points on the boundary of the domain.
 
@@ -754,7 +790,8 @@ class DomainCubic:
                 if n > 0:
                     parts.append(self.sample_boundary(
                         n, region=r, rng=rng, method=method,
-                        transform=transform, params=params))
+                        transform=transform, params=params,
+                        t_interval=t_interval))
             return np.vstack(parts)
 
         # ── built-in region names ─────────────────────────────────────────
@@ -769,7 +806,8 @@ class DomainCubic:
                 n_pts = ppp + (1 if i < rem else 0)
                 if n_pts > 0:
                     all_pts.append(self._sample_face(
-                        n_pts, dim, side, rng, method, transform, params))
+                        n_pts, dim, side, rng, method, transform, params,
+                        t_interval=t_interval))
             return np.vstack(all_pts)
 
         if region == 'partition_outer':
@@ -827,7 +865,8 @@ class DomainCubic:
             for dim, side in enumerate(tup):
                 if side is not None:
                     return self._sample_face(
-                        n_points, dim, side, rng, method, transform, params)
+                        n_points, dim, side, rng, method, transform, params,
+                        t_interval=t_interval)
             raise ValueError(f"_parse_boundary_str returned no fixed dim for {region!r}")
 
         # ── periodic region: return stacked pair (side A then side B) ─────
@@ -835,10 +874,16 @@ class DomainCubic:
             _pr = self._periodic_regions[region]
             x_a = self.sample_boundary(n_points, region=_pr['region_a'],
                                        rng=rng, method=method,
-                                       transform=transform, params=params)
-            x_b = self.sample_boundary(n_points, region=_pr['region_b'],
-                                       rng=rng, method=method,
-                                       transform=transform, params=params)
+                                       transform=transform, params=params,
+                                       t_interval=t_interval)
+            x_b = x_a.copy()
+            # Replace the periodic axis column with the B-side value
+            _blm = self._BOUNDARY_LABEL_MAP
+            _rb = _pr['region_b']
+            if _rb in _blm:
+                _dim, _side = _blm[_rb]
+                _val = self.xmax[_dim] if _side == 1 else self.xmin[_dim]
+                x_b[:, _dim] = _val
             return np.concatenate([x_a, x_b], axis=0)
 
         # ── single named custom region ────────────────────────────────────
@@ -912,7 +957,8 @@ class DomainCubic:
             counts[idx] += 1
         return counts.tolist()
 
-    def _sample_face(self, n_points, dim, side, rng, method, transform, params):
+    def _sample_face(self, n_points, dim, side, rng, method, transform, params,
+                     t_interval=None):
         """
         Sample *n_points* on the axis-aligned face ``space[dim] == bound``.
 
@@ -937,8 +983,20 @@ class DomainCubic:
                                    reject_outside=True, rng=rng, method=method,
                                    params=params)
         points[:, dim] = boundary_value
+        if t_interval is not None and self._t_min is None:
+            raise ValueError(
+                "t_interval was provided but this domain has no time axis.")
         if self._t_min is not None:
-            t = rng.uniform(self._t_min, self._t_max, (n_points, 1))
+            if t_interval is not None:
+                _ti_lo, _ti_hi = float(t_interval[0]), float(t_interval[1])
+                if _ti_lo < self._t_min or _ti_hi > self._t_max or _ti_lo >= _ti_hi:
+                    raise ValueError(
+                        f"t_interval [{_ti_lo}, {_ti_hi}] is invalid: must satisfy "
+                        f"[{self._t_min}, {self._t_max}] and lo < hi.")
+                _t_lo, _t_hi = _ti_lo, _ti_hi
+            else:
+                _t_lo, _t_hi = self._t_min, self._t_max
+            t = rng.uniform(_t_lo, _t_hi, (n_points, 1))
             points = np.hstack([points, t])
         return points
 

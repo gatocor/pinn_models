@@ -68,6 +68,8 @@ class TrainPlotter:
         time_points: Optional[List[float]] = None,
         show_prediction: bool = True,
         show_residuals: bool = True,
+        show_loss: bool = True,
+        show_mse_loss: bool = True,
     ) -> None:
         self.save = save
         self.subdomains = subdomains
@@ -80,6 +82,8 @@ class TrainPlotter:
         self.time_points = list(time_points) if time_points is not None else None
         self.show_prediction = show_prediction
         self.show_residuals = show_residuals
+        self.show_loss = show_loss
+        self.show_mse_loss = show_mse_loss
 
         # State (set by _activate / reset on each compile)
         self._trainer = None
@@ -119,6 +123,13 @@ class TrainPlotter:
             domain = self._trainer.problem.domain
             if domain._t_min is not None:
                 self._plot_time_points = [domain._t_min, domain._t_max]
+        elif not self._is_mesh_domain():
+            domain = self._trainer.problem.domain
+            if (getattr(domain, 'has_time', False)
+                    and getattr(domain, '_spatial_dims', 0) >= 2):
+                self._plot_time_points = [domain._t_min, domain._t_max]
+            else:
+                self._plot_time_points = None
         else:
             self._plot_time_points = None
 
@@ -282,36 +293,45 @@ class TrainPlotter:
 
         _show_pred = self.show_prediction
         _show_res  = self.show_residuals
+        _show_loss = self.show_loss
+        _show_mse  = self.show_mse_loss
+        _n_loss_rows = int(_show_loss) + int(_show_mse)
+        _content_row = _n_loss_rows  # first row index after loss panels
 
         if n_dims == 1:
             n_cols = int(_show_pred) + int(_show_res) + int(has_solution)
             if n_cols == 0:
                 n_cols = 1  # at minimum keep the loss rows
 
-            n_rows = 2 + n_outputs + n_regions + n_obs
+            n_rows = _n_loss_rows + n_outputs + n_regions + n_obs
+            if n_rows == 0:
+                n_rows = 1
             fig = plt.figure(figsize=(5 * n_cols, 3.5 * n_rows))
             gs = fig.add_gridspec(n_rows, n_cols)
 
             axes = {}
-            axes['losses'] = fig.add_subplot(gs[0, :])
-            axes['mse_losses'] = fig.add_subplot(gs[1, :])
+            _lr = 0
+            if _show_loss:
+                axes['losses'] = fig.add_subplot(gs[_lr, :]); _lr += 1
+            if _show_mse:
+                axes['mse_losses'] = fig.add_subplot(gs[_lr, :])
 
             for i in range(n_outputs):
                 _col = 0
                 if _show_pred:
-                    axes[f'sol_{i}'] = fig.add_subplot(gs[2 + i, _col]); _col += 1
+                    axes[f'sol_{i}'] = fig.add_subplot(gs[_content_row + i, _col]); _col += 1
                 if _show_res:
-                    axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, _col]); _col += 1
+                    axes[f'res_{i}'] = fig.add_subplot(gs[_content_row + i, _col]); _col += 1
                 if has_solution:
-                    axes[f'err_{i}'] = fig.add_subplot(gs[2 + i, _col])
+                    axes[f'err_{i}'] = fig.add_subplot(gs[_content_row + i, _col])
 
             for r in range(n_regions):
-                axes[f'region_{r}'] = fig.add_subplot(gs[2 + n_outputs + r, :])
+                axes[f'region_{r}'] = fig.add_subplot(gs[_content_row + n_outputs + r, :])
 
             for k, name in enumerate(obs_regular):
-                axes[f'obs_{name}'] = fig.add_subplot(gs[2 + n_outputs + n_regions + k, :])
+                axes[f'obs_{name}'] = fig.add_subplot(gs[_content_row + n_outputs + n_regions + k, :])
             if has_spatial:
-                row_s = 2 + n_outputs + n_regions + len(obs_regular)
+                row_s = _content_row + n_outputs + n_regions + len(obs_regular)
                 axes['obs__deformed_ref'] = fig.add_subplot(gs[row_s, 0])
                 axes['obs__deformed_def'] = fig.add_subplot(gs[row_s, 1])
 
@@ -320,32 +340,37 @@ class TrainPlotter:
             if n_cols == 0:
                 n_cols = 1
 
-            n_rows = 2 + n_outputs + n_regions + n_obs
+            n_rows = _n_loss_rows + n_outputs + n_regions + n_obs
+            if n_rows == 0:
+                n_rows = 1
             fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
             gs = fig.add_gridspec(n_rows, n_cols)
 
             axes = {}
-            axes['losses'] = fig.add_subplot(gs[0, :])
-            axes['mse_losses'] = fig.add_subplot(gs[1, :])
+            _lr = 0
+            if _show_loss:
+                axes['losses'] = fig.add_subplot(gs[_lr, :]); _lr += 1
+            if _show_mse:
+                axes['mse_losses'] = fig.add_subplot(gs[_lr, :])
 
             for i in range(n_outputs):
                 _col = 0
                 if _show_pred:
-                    axes[f'sol_{i}'] = fig.add_subplot(gs[2 + i, _col]); _col += 1
+                    axes[f'sol_{i}'] = fig.add_subplot(gs[_content_row + i, _col]); _col += 1
                 if has_solution:
-                    axes[f'true_{i}'] = fig.add_subplot(gs[2 + i, _col]); _col += 1
+                    axes[f'true_{i}'] = fig.add_subplot(gs[_content_row + i, _col]); _col += 1
                 if _show_res:
-                    axes[f'res_{i}'] = fig.add_subplot(gs[2 + i, _col]); _col += 1
+                    axes[f'res_{i}'] = fig.add_subplot(gs[_content_row + i, _col]); _col += 1
                 if has_solution:
-                    axes[f'err_{i}'] = fig.add_subplot(gs[2 + i, _col])
+                    axes[f'err_{i}'] = fig.add_subplot(gs[_content_row + i, _col])
 
             for r in range(n_regions):
-                axes[f'region_{r}'] = fig.add_subplot(gs[2 + n_outputs + r, :])
+                axes[f'region_{r}'] = fig.add_subplot(gs[_content_row + n_outputs + r, :])
 
             for k, name in enumerate(obs_regular):
-                axes[f'obs_{name}'] = fig.add_subplot(gs[2 + n_outputs + n_regions + k, :2])
+                axes[f'obs_{name}'] = fig.add_subplot(gs[_content_row + n_outputs + n_regions + k, :2])
             if has_spatial:
-                row_s = 2 + n_outputs + n_regions + len(obs_regular)
+                row_s = _content_row + n_outputs + n_regions + len(obs_regular)
                 axes['obs__deformed_ref'] = fig.add_subplot(gs[row_s, 0])
                 axes['obs__deformed_def'] = fig.add_subplot(gs[row_s, 1])
 
@@ -358,15 +383,20 @@ class TrainPlotter:
             if n_cols == 0:
                 n_cols = 1
 
-            n_rows = 2 + n_snap
+            n_rows = _n_loss_rows + n_snap
+            if n_rows == 0:
+                n_rows = 1
             fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
             gs = fig.add_gridspec(n_rows, n_cols)
 
             axes = {}
-            axes['losses'] = fig.add_subplot(gs[0, :])
-            axes['mse_losses'] = fig.add_subplot(gs[1, :])
+            _lr = 0
+            if _show_loss:
+                axes['losses'] = fig.add_subplot(gs[_lr, :]); _lr += 1
+            if _show_mse:
+                axes['mse_losses'] = fig.add_subplot(gs[_lr, :])
 
-            row = 2
+            row = _content_row
             for t_val in ts:
                 for i in range(n_outputs):
                     _col = 0
@@ -379,125 +409,217 @@ class TrainPlotter:
                     if has_solution:
                         axes[f'snap_err_{i}_t{t_val}'] = fig.add_subplot(gs[row, _col])
                     row += 1
+        elif self._is_mesh_domain() and not self._plot_time_points:
+            # Static 3D surface mesh.
+            # Layout: for each content panel (pred/res) we allocate two gridspec
+            # columns — a wide one for the 3D axes and a thin one for its colorbar.
+            # This means the colorbar never steals space from the 3D axes.
+            n_panels = int(_show_pred) + int(_show_res)
+            if n_panels == 0:
+                n_panels = 1
+            # Two gridspec columns per panel per output: [wide, thin, wide, thin, ...]
+            n_gs_cols = 2 * n_panels * n_outputs
+            width_ratios = [5, 0.35] * (n_panels * n_outputs)
+            n_rows = _n_loss_rows + n_outputs
+            if n_rows == 0:
+                n_rows = 1
+            fig = plt.figure(figsize=(5.5 * n_panels * n_outputs, 4.5 * n_rows))
+            gs = fig.add_gridspec(n_rows, n_gs_cols, width_ratios=width_ratios, wspace=0.05)
+
+            axes = {}
+            _lr = 0
+            if _show_loss:
+                axes['losses'] = fig.add_subplot(gs[_lr, :]); _lr += 1
+            if _show_mse:
+                axes['mse_losses'] = fig.add_subplot(gs[_lr, :])
+
+            for i in range(n_outputs):
+                _gs_col = 0  # steps by 2 (wide + thin) per panel
+                if _show_pred:
+                    ax3 = fig.add_subplot(gs[_content_row + i, _gs_col], projection='3d')
+                    axes[f'mesh3d_sol_{i}'] = ax3
+                    axes[f'cax_mesh3d_sol_{i}'] = fig.add_subplot(gs[_content_row + i, _gs_col + 1])
+                    _gs_col += 2
+                if _show_res:
+                    ax3 = fig.add_subplot(gs[_content_row + i, _gs_col], projection='3d')
+                    axes[f'mesh3d_res_{i}'] = ax3
+                    axes[f'cax_mesh3d_res_{i}'] = fig.add_subplot(gs[_content_row + i, _gs_col + 1])
+
+        elif self._plot_time_points and not self._is_mesh_domain():
+            # Cubic 2+1D (e.g. Grey-Scott x,y,t): one row per (time × output)
+            ts = self._plot_time_points
+            n_snap = len(ts) * n_outputs
+            n_cols = int(_show_pred) + int(has_solution) + int(_show_res) + int(has_solution)
+            if n_cols == 0:
+                n_cols = 1
+
+            n_rows = _n_loss_rows + n_snap
+            if n_rows == 0:
+                n_rows = 1
+            fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
+            gs = fig.add_gridspec(n_rows, n_cols)
+
+            axes = {}
+            _lr = 0
+            if _show_loss:
+                axes['losses'] = fig.add_subplot(gs[_lr, :]); _lr += 1
+            if _show_mse:
+                axes['mse_losses'] = fig.add_subplot(gs[_lr, :])
+
+            row = _content_row
+            for t_val in ts:
+                for i in range(n_outputs):
+                    _col = 0
+                    if _show_pred:
+                        axes[f'snap_sol_{i}_t{t_val}'] = fig.add_subplot(gs[row, _col]); _col += 1
+                    if has_solution:
+                        axes[f'snap_true_{i}_t{t_val}'] = fig.add_subplot(gs[row, _col]); _col += 1
+                    if _show_res:
+                        axes[f'snap_res_{i}_t{t_val}'] = fig.add_subplot(gs[row, _col]); _col += 1
+                    if has_solution:
+                        axes[f'snap_err_{i}_t{t_val}'] = fig.add_subplot(gs[row, _col])
+                    row += 1
+
         else:
             # For 3D+: loss plot + region slices for all outputs with residuals
             n_cols = 2 * n_outputs  # Two columns per output (solution + residual)
-            n_rows = 2 + n_regions  # 2 for losses + one row per region
+            n_rows = _n_loss_rows + n_regions  # loss rows + one row per region
+            if n_rows == 0:
+                n_rows = 1
             fig = plt.figure(figsize=(4 * n_cols, 4 * n_rows))
             gs = fig.add_gridspec(n_rows, n_cols)
-            
+
             axes = {}
-            axes['losses'] = fig.add_subplot(gs[0, :])
-            axes['mse_losses'] = fig.add_subplot(gs[1, :])
-            
+            _lr = 0
+            if _show_loss:
+                axes['losses'] = fig.add_subplot(gs[_lr, :]); _lr += 1
+            if _show_mse:
+                axes['mse_losses'] = fig.add_subplot(gs[_lr, :])
+
             for r in range(n_regions):
                 for i in range(n_outputs):
-                    axes[f'region_{r}_{i}'] = fig.add_subplot(gs[2 + r, 2*i])
-                    axes[f'region_res_{r}_{i}'] = fig.add_subplot(gs[2 + r, 2*i + 1])
+                    axes[f'region_{r}_{i}'] = fig.add_subplot(gs[_content_row + r, 2*i])
+                    axes[f'region_res_{r}_{i}'] = fig.add_subplot(gs[_content_row + r, 2*i + 1])
         
         self._colorbars = []
         self._apply_plot_style(fig, axes)
         return fig, axes
     
     def _plot_losses(self, ax):
-        """Plot loss curves on given axes."""
+        """Plot training-objective curves (weighted + Lagrange) on given axes."""
         epochs = self._trainer.history['epoch']
         if not epochs:
             return
-        
-        # Total loss (use 'loss' or 'train_loss')
+
+        # Total training loss (includes weights and Lagrange multiplier terms)
         loss_data = self._trainer.history.get('loss', self._trainer.history.get('train_loss', []))
         if loss_data:
-            ax.semilogy(epochs, loss_data, 'k-', label='Total', linewidth=2)
-        
-        # PDE losses
-        pde_losses = self._trainer.history.get('loss_pde', [])
-        if len(pde_losses) > 0:
-            if isinstance(pde_losses[0], (list, tuple)):
-                pde_array = np.array(pde_losses)
-                for i in range(pde_array.shape[1]):
-                    ax.semilogy(epochs, pde_array[:, i], '--', label=f'PDE eq{i+1}')
-            else:
-                ax.semilogy(epochs, pde_losses, '--', label='PDE')
-        
-        # BC losses with names
-        bc_names = self._trainer._get_bc_plot_names()
-        bc_losses = self._trainer.history.get('loss_bcs', [])
-        if bc_losses and len(bc_losses) > 0:
-            bc_losses_array = np.array(bc_losses)
-            if bc_losses_array.ndim == 2:
-                for i in range(bc_losses_array.shape[1]):
-                    bc_label = bc_names[i] if i < len(bc_names) else f'BC {i+1}'
-                    ax.semilogy(epochs, bc_losses_array[:, i], '--', label=bc_label)
-        
+            ax.semilogy(epochs, loss_data, 'k-', label='Total (train obj)', linewidth=2)
+
+        # Per-term contributions using actual term names
+        mse_terms = self._trainer.history.get('mse_terms', {})
+        if mse_terms:
+            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+                      '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+            weights = self._trainer.weights if hasattr(self._trainer, 'weights') else {}
+            for i, (name, values) in enumerate(mse_terms.items()):
+                if not values:
+                    continue
+                ep = epochs[:len(values)]
+                w = float(weights.get(name, 1.0))
+                weighted_vals = [v * w for v in values]
+                ax.semilogy(ep, weighted_vals, '--', color=colors[i % len(colors)],
+                            label=name, linewidth=1.5)
+        else:
+            # Fallback for old history format
+            pde_losses = self._trainer.history.get('loss_pde', [])
+            if len(pde_losses) > 0:
+                if isinstance(pde_losses[0], (list, tuple)):
+                    pde_array = np.array(pde_losses)
+                    for i in range(pde_array.shape[1]):
+                        ax.semilogy(epochs, pde_array[:, i], '--', label=f'PDE eq{i+1} (w)')
+                else:
+                    ax.semilogy(epochs, pde_losses, '--', label='PDE (weighted)')
+            bc_names = self._trainer._get_bc_plot_names()
+            bc_losses = self._trainer.history.get('loss_bcs', [])
+            if bc_losses and len(bc_losses) > 0:
+                bc_losses_array = np.array(bc_losses)
+                if bc_losses_array.ndim == 2:
+                    for i in range(bc_losses_array.shape[1]):
+                        bc_label = (bc_names[i] if i < len(bc_names) else f'BC {i+1}') + ' (w)'
+                        ax.semilogy(epochs, bc_losses_array[:, i], '--', label=bc_label)
+
         # Test loss if available
         test_loss = self._trainer.history.get('test_loss', [])
         if len(test_loss) > 0:
             n_test = len(test_loss)
             test_epochs = np.linspace(epochs[0], epochs[-1], n_test).astype(int) if n_test > 1 else [epochs[-1]]
             ax.semilogy(test_epochs, test_loss, 'r:', marker='o', markersize=4, label='Test', linewidth=2)
-        
+
         # Solution error if available
         sol_error = self._trainer.history.get('solution_error', [])
         if len(sol_error) > 0:
             n_err = len(sol_error)
             err_epochs = np.linspace(epochs[0], epochs[-1], n_err).astype(int) if n_err > 1 else [epochs[-1]]
             ax.semilogy(err_epochs, sol_error, 'm-', marker='s', markersize=4, label='Solution Error', linewidth=2)
-        
+
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Loss')
-        ax.set_title('Training Losses')
+        ax.set_title('Training Loss (weighted + Lagrange)')
         ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8)
         ax.grid(True, alpha=0.3)
     
     def _plot_mse_losses(self, ax):
-        """Plot MSE loss components on given axes."""
+        """Plot unweighted per-term residual MSE (no weights, no Lagrange)."""
         epochs = self._trainer.history['epoch']
         if not epochs:
             return
-        
-        # Total MSE loss
-        loss_data = self._trainer.history.get('loss', self._trainer.history.get('train_loss', []))
-        if loss_data:
-            ax.semilogy(epochs, loss_data, 'k-', label='MSE Total', linewidth=2)
-        
-        # PDE MSE losses
-        pde_losses = self._trainer.history.get('loss_pde', [])
-        if len(pde_losses) > 0:
-            if isinstance(pde_losses[0], (list, tuple)):
-                pde_array = np.array(pde_losses)
-                for i in range(pde_array.shape[1]):
-                    ax.semilogy(epochs, pde_array[:, i], 'b--', label=f'PDE eq{i+1}')
-            else:
+
+        # Total unweighted MSE
+        mse_total = self._trainer.history.get('mse_loss', [])
+        if mse_total:
+            ax.semilogy(epochs[:len(mse_total)], mse_total, 'k-', label='Total MSE', linewidth=2)
+        else:
+            # Fallback: use 'loss' if mse_loss not yet recorded (older history)
+            loss_data = self._trainer.history.get('loss', self._trainer.history.get('train_loss', []))
+            if loss_data:
+                ax.semilogy(epochs, loss_data, 'k-', label='Total', linewidth=2)
+
+        # Per-term unweighted MSE
+        mse_terms = self._trainer.history.get('mse_terms', {})
+        if mse_terms:
+            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+                      '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+            for i, (name, values) in enumerate(mse_terms.items()):
+                if not values:
+                    continue
+                ep = epochs[:len(values)]
+                ax.semilogy(ep, values, '--', color=colors[i % len(colors)],
+                            label=name, linewidth=1.5)
+        else:
+            # Fallback for old history format
+            pde_losses = self._trainer.history.get('loss_pde', [])
+            if len(pde_losses) > 0:
                 ax.semilogy(epochs, pde_losses, 'b--', label='PDE')
-        
-        # BC MSE losses with names
-        bc_names = self._trainer._get_bc_plot_names()
-        bc_losses = self._trainer.history.get('loss_bcs', [])
-        if bc_losses and len(bc_losses) > 0:
-            bc_losses_array = np.array(bc_losses)
-            if bc_losses_array.ndim == 2:
-                for i in range(bc_losses_array.shape[1]):
-                    bc_label = bc_names[i] if i < len(bc_names) else f'BC {i+1}'
-                    ax.semilogy(epochs, bc_losses_array[:, i], '--', label=bc_label)
-        
-        # Test loss
-        test_loss = self._trainer.history.get('test_loss', [])
-        if len(test_loss) > 0:
-            n_test = len(test_loss)
-            test_epochs = np.linspace(epochs[0], epochs[-1], n_test).astype(int) if n_test > 1 else [epochs[-1]]
-            ax.semilogy(test_epochs, test_loss, 'r:', marker='o', markersize=4, label='Test', linewidth=2)
-        
+            bc_names = self._trainer._get_bc_plot_names()
+            bc_losses = self._trainer.history.get('loss_bcs', [])
+            if bc_losses and len(bc_losses) > 0:
+                bc_losses_array = np.array(bc_losses)
+                if bc_losses_array.ndim == 2:
+                    for i in range(bc_losses_array.shape[1]):
+                        bc_label = bc_names[i] if i < len(bc_names) else f'BC {i+1}'
+                        ax.semilogy(epochs, bc_losses_array[:, i], '--', label=bc_label)
+
         # Solution error
         sol_error = self._trainer.history.get('solution_error', [])
         if len(sol_error) > 0:
             n_err = len(sol_error)
             err_epochs = np.linspace(epochs[0], epochs[-1], n_err).astype(int) if n_err > 1 else [epochs[-1]]
             ax.semilogy(err_epochs, sol_error, 'm-', marker='s', markersize=4, label='Solution Error', linewidth=2)
-        
+
         ax.set_xlabel('Epoch')
-        ax.set_ylabel('MSE Loss')
-        ax.set_title('MSE Losses (Components)')
+        ax.set_ylabel('mean(r²)')
+        ax.set_title('Residual MSE per term (unweighted)')
         ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8)
         ax.grid(True, alpha=0.3)
     
@@ -533,6 +655,14 @@ class TrainPlotter:
             return isinstance(self._trainer.problem.domain, _DomainMesh)
         except ImportError:
             return False
+
+    def _is_3d_mesh_domain(self):
+        """Return True when the domain is a DomainMesh with 3 spatial dimensions (no time)."""
+        if not self._is_mesh_domain():
+            return False
+        dom = self._trainer.problem.domain
+        # spatial_dims == 3 and no time axis
+        return getattr(dom, '_spatial_dims', dom._vertices.shape[1]) == 3
 
     def _plot_mesh_snapshot_base(self, ax, output_idx, t_val, kind='sol'):
         """Plot a spatial snapshot of a transient mesh solution at time t_val.
@@ -653,6 +783,144 @@ class TrainPlotter:
         ax.set_ylabel(self._trainer._get_input_name(spatial_dims[1]) if len(spatial_dims) > 1 else '')
         ax.set_aspect('equal')
 
+    # ------------------------------------------------------------------
+    # Snapshot helpers: 2D spatial heatmap at a fixed time value
+    # Used for DomainCubic with n_spatial=2, has_time=True (e.g. Grey-Scott)
+    # ------------------------------------------------------------------
+
+    def _build_2d_spatial_grid_at_t(self, t_val, n_points):
+        """Return (x0, x1, x_flat) for a spatial meshgrid with t=t_val appended."""
+        x0 = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points)
+        x1 = np.linspace(self._trainer.problem.xmin[1], self._trainer.problem.xmax[1], n_points)
+        X0, X1 = np.meshgrid(x0, x1)
+        x_flat = np.column_stack([X0.ravel(), X1.ravel(), np.full(X0.size, float(t_val))])
+        return x0, x1, X0, x_flat
+
+    def _plot_solution_2d_at_time(self, ax, output_idx, t_val, n_points=50, plot_key='solution'):
+        """Plot predicted 2D spatial snapshot at fixed time t_val as a heatmap."""
+        cmap = self._trainer._get_colormap(output_idx)
+        ikw = {'cmap': cmap}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+
+        x0, x1, X0, x_flat = self._build_2d_spatial_grid_at_t(t_val, n_points)
+        y = self._trainer.eval(x_flat)
+        Y = y[:, output_idx].reshape(X0.shape)
+        extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+        im = ax.imshow(Y, extent=extent, origin='lower', aspect='equal', **ikw)
+        cbar = self._fig.colorbar(im, ax=ax)
+        self._colorbars.append(cbar)
+        output_name = self._trainer._get_output_name(output_idx)
+        ax.set_title(f'Predicted ({output_name}, t={t_val:.3g})')
+        ax.set_xlabel(self._trainer._get_input_name(0))
+        ax.set_ylabel(self._trainer._get_input_name(1))
+
+    def _plot_true_solution_2d_at_time(self, ax, output_idx, t_val, n_points=50, plot_key='solution'):
+        """Plot true 2D spatial snapshot at fixed time t_val as a heatmap."""
+        if self._trainer.problem.solution is None:
+            return
+        cmap = self._trainer._get_colormap(output_idx)
+        ikw = {'cmap': cmap}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+
+        x0, x1, X0, x_flat = self._build_2d_spatial_grid_at_t(t_val, n_points)
+        y_true = self._trainer._call_solution(x_flat)
+        if isinstance(y_true, (list, tuple)):
+            y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
+        elif y_true.ndim == 1:
+            y_true = y_true.reshape(-1, 1)
+        Y_true = y_true[:, output_idx].reshape(X0.shape)
+        extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+        im = ax.imshow(Y_true, extent=extent, origin='lower', aspect='equal', **ikw)
+        cbar = self._fig.colorbar(im, ax=ax)
+        self._colorbars.append(cbar)
+        output_name = self._trainer._get_output_name(output_idx)
+        ax.set_title(f'True ({output_name}, t={t_val:.3g})')
+        ax.set_xlabel(self._trainer._get_input_name(0))
+        ax.set_ylabel(self._trainer._get_input_name(1))
+
+    def _plot_residuals_2d_at_time(self, ax, output_idx, t_val, n_points=50, plot_key='residuals'):
+        """Plot |PDE residual| 2D spatial snapshot at fixed time t_val as a heatmap."""
+        ikw = {'cmap': 'inferno'}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+
+        x0, x1, X0, x_flat = self._build_2d_spatial_grid_at_t(t_val, n_points)
+        residuals = self._trainer._compute_residuals(x_flat)
+        if output_idx < len(residuals):
+            Res = np.abs(residuals[output_idx]).reshape(X0.shape)
+        else:
+            Res = np.zeros(X0.shape)
+        extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+        im = ax.imshow(Res, extent=extent, origin='lower', aspect='equal', **ikw)
+        cbar = self._fig.colorbar(im, ax=ax, label='|Residual|')
+        self._colorbars.append(cbar)
+        output_name = self._trainer._get_output_name(output_idx)
+        ax.set_title(f'PDE Residual ({output_name}, t={t_val:.3g})')
+        ax.set_xlabel(self._trainer._get_input_name(0))
+        ax.set_ylabel(self._trainer._get_input_name(1))
+
+    def _plot_error_2d_at_time(self, ax, output_idx, t_val, n_points=50, plot_key='error'):
+        """Plot |error| 2D spatial snapshot at fixed time t_val as a heatmap."""
+        if self._trainer.problem.solution is None:
+            return
+        ikw = {'cmap': 'Reds'}
+        ikw.update(self._get_imshow_kwargs(plot_key))
+
+        x0, x1, X0, x_flat = self._build_2d_spatial_grid_at_t(t_val, n_points)
+        y = self._trainer.eval(x_flat)
+        y_true = self._trainer._call_solution(x_flat)
+        if isinstance(y_true, (list, tuple)):
+            y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
+        elif y_true.ndim == 1:
+            y_true = y_true.reshape(-1, 1)
+        Err = np.abs(y[:, output_idx] - y_true[:, output_idx]).reshape(X0.shape)
+        extent = [x0.min(), x0.max(), x1.min(), x1.max()]
+        im = ax.imshow(Err, extent=extent, origin='lower', aspect='equal', **ikw)
+        cbar = self._fig.colorbar(im, ax=ax)
+        self._colorbars.append(cbar)
+        output_name = self._trainer._get_output_name(output_idx)
+        ax.set_title(f'|Error| ({output_name}, t={t_val:.3g})')
+        ax.set_xlabel(self._trainer._get_input_name(0))
+        ax.set_ylabel(self._trainer._get_input_name(1))
+
+    # ------------------------------------------------------------------
+    # 1D snapshot helpers: overlaid lines at multiple t values
+    # Used for DomainCubic with n_spatial=1, has_time=True, time_points=[...]
+    # ------------------------------------------------------------------
+
+    def _plot_solution_1d_at_times(self, ax, output_idx, t_vals, n_points=200):
+        """Overlay predicted 1D snapshots u(x) at multiple time values."""
+        x0 = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points)
+        colors = plt.cm.viridis(np.linspace(0, 1, len(t_vals)))
+        for t_val, color in zip(t_vals, colors):
+            x_full = np.column_stack([x0, np.full(n_points, float(t_val))])
+            y = self._trainer.eval(x_full)
+            ax.plot(x0, y[:, output_idx], color=color, linewidth=1.5, label=f't={t_val:.3g}')
+        output_name = self._trainer._get_output_name(output_idx)
+        ax.set_xlabel(self._trainer._get_input_name(0))
+        ax.set_ylabel(output_name)
+        ax.set_title(f'Solution ({output_name}) snapshots')
+        ax.legend(loc='best', fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_residuals_1d_at_times(self, ax, output_idx, t_vals, n_points=200):
+        """Overlay |PDE residual| 1D snapshots at multiple time values."""
+        x0 = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points)
+        colors = plt.cm.inferno(np.linspace(0, 0.9, len(t_vals)))
+        for t_val, color in zip(t_vals, colors):
+            x_full = np.column_stack([x0, np.full(n_points, float(t_val))])
+            residuals = self._trainer._compute_residuals(x_full)
+            if output_idx < len(residuals):
+                res = np.abs(residuals[output_idx]).flatten()
+            else:
+                res = np.zeros(n_points)
+            ax.plot(x0, res, color=color, linewidth=1.5, label=f't={t_val:.3g}')
+        output_name = self._trainer._get_output_name(output_idx)
+        ax.set_xlabel(self._trainer._get_input_name(0))
+        ax.set_ylabel(f'|Residual| ({output_name})')
+        ax.set_title(f'PDE Residual ({output_name}) snapshots')
+        ax.legend(loc='best', fontsize=7)
+        ax.grid(True, alpha=0.3)
+
     def _plot_solution_2d(self, ax, output_idx, n_points=50, plot_key='solution'):
         """Plot 2D solution as heatmap on given axes."""
         cmap = self._trainer._get_colormap(output_idx)
@@ -684,6 +952,88 @@ class TrainPlotter:
         ax.set_xlabel(self._trainer._get_input_name(0))
         ax.set_ylabel(self._trainer._get_input_name(1))
     
+    def _plot_solution_3d(self, ax, output_idx):
+        """Plot predicted solution on a 3D surface mesh using Poly3DCollection."""
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+        import matplotlib.cm as _cm
+        import matplotlib.colors as _mcolors
+
+        dom = self._trainer.problem.domain
+        verts = dom._vertices   # (N, 3)
+        faces = dom._faces      # (F, 3)
+
+        y = self._trainer.eval(verts)
+        vals = np.array(y[:, output_idx], dtype=float)
+        face_vals = vals[faces].mean(axis=1)
+        v_min, v_max = face_vals.min(), face_vals.max()
+        if v_min == v_max:
+            v_max = v_min + 1.0
+
+        cmap = _cm.get_cmap(self._trainer._get_colormap(output_idx))
+        norm = _mcolors.Normalize(vmin=v_min, vmax=v_max)
+        facecolors = cmap(norm(face_vals))
+
+        # Remove only Poly3DCollection objects — never call ax.cla() on a 3D axis
+        # (cla() detaches internal pane objects, breaking get_figure() → dpi_scale_trans)
+        for col in list(ax.collections):
+            col.remove()
+
+        polys = verts[faces]
+        coll = Poly3DCollection(polys, facecolors=facecolors, edgecolors='none', linewidths=0)
+        ax.add_collection3d(coll)
+        for dim, setter in enumerate([ax.set_xlim3d, ax.set_ylim3d, ax.set_zlim3d]):
+            setter(verts[:, dim].min(), verts[:, dim].max())
+
+        output_name = self._trainer._get_output_name(output_idx)
+        ax.set_title(f'Predicted ({output_name})')
+        ax.set_xlabel(self._trainer._get_input_name(0))
+        ax.set_ylabel(self._trainer._get_input_name(1))
+        ax.set_zlabel(self._trainer._get_input_name(2))
+
+    def _plot_residuals_3d(self, ax, output_idx):
+        """Plot PDE residual magnitudes on a 3D surface mesh using Poly3DCollection."""
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+        import matplotlib.cm as _cm
+        import matplotlib.colors as _mcolors
+
+        dom = self._trainer.problem.domain
+        verts = dom._vertices   # (N, 3)
+        faces = dom._faces      # (F, 3)
+
+        try:
+            residuals = self._trainer._compute_residuals(verts)
+            if output_idx < len(residuals):
+                vals = np.abs(np.array(residuals[output_idx], dtype=float)).flatten()
+            else:
+                vals = np.zeros(len(verts))
+        except Exception:
+            vals = np.zeros(len(verts))
+
+        face_vals = vals[faces].mean(axis=1)
+        v_min, v_max = face_vals.min(), face_vals.max()
+        if v_min == v_max:
+            v_max = v_min + 1.0
+
+        cmap = _cm.get_cmap('inferno')
+        norm = _mcolors.Normalize(vmin=v_min, vmax=v_max)
+        facecolors = cmap(norm(face_vals))
+
+        # Remove only Poly3DCollection objects — never call ax.cla() on a 3D axis
+        for col in list(ax.collections):
+            col.remove()
+
+        polys = verts[faces]
+        coll = Poly3DCollection(polys, facecolors=facecolors, edgecolors='none', linewidths=0)
+        ax.add_collection3d(coll)
+        for dim, setter in enumerate([ax.set_xlim3d, ax.set_ylim3d, ax.set_zlim3d]):
+            setter(verts[:, dim].min(), verts[:, dim].max())
+
+        output_name = self._trainer._get_output_name(output_idx)
+        ax.set_title(f'PDE Residual ({output_name})')
+        ax.set_xlabel(self._trainer._get_input_name(0))
+        ax.set_ylabel(self._trainer._get_input_name(1))
+        ax.set_zlabel(self._trainer._get_input_name(2))
+
     def _plot_true_solution_2d(self, ax, output_idx, n_points=50, plot_key='solution'):
         """Plot 2D true solution as heatmap on given axes."""
         if self._trainer.problem.solution is None:
@@ -964,6 +1314,7 @@ class TrainPlotter:
     
     def _update_figure(self, fig, axes, n_points=200):
         """Update existing figure with current data."""
+        self._axes = axes   # make axes accessible to plot helpers (e.g. cax lookup)
         n_dims = self._trainer.problem.n_dims
         n_outputs = self._trainer.problem.n_outputs
         has_solution = self._trainer.problem.solution is not None
@@ -971,13 +1322,17 @@ class TrainPlotter:
         self._clear_colorbars()
         
         for key, ax in axes.items():
+            if key.startswith('cax_'):
+                continue  # colorbar axes — never clear (inset_axes would lose figure ref)
+            if key.startswith('mesh3d_'):
+                continue  # 3-D mesh axes — collection & colorbar updated in-place
             if hasattr(ax, 'clear'):
                 ax.clear()
         
-        self._plot_losses(axes['losses'])
-        self._apply_plot_kwargs(axes['losses'], 'losses')
-        
-        # Plot MSE losses if axis exists
+        if 'losses' in axes:
+            self._plot_losses(axes['losses'])
+            self._apply_plot_kwargs(axes['losses'], 'losses')
+
         if 'mse_losses' in axes:
             self._plot_mse_losses(axes['mse_losses'])
             self._apply_plot_kwargs(axes['mse_losses'], 'mse_losses')
@@ -995,22 +1350,69 @@ class TrainPlotter:
                     self._apply_plot_kwargs(axes[f'err_{i}'], 'error')
         
         elif n_dims == 2:
+            _dom2 = self._trainer.problem.domain
+            _has_time2 = getattr(_dom2, 'has_time', False)
+            _pts2 = self._plot_time_points
+            if _has_time2 and _pts2 is not None:
+                # 1+1D: overlaid 1D snapshots at the requested time values
+                for i in range(n_outputs):
+                    if f'sol_{i}' in axes:
+                        self._plot_solution_1d_at_times(axes[f'sol_{i}'], i, _pts2, n_points)
+                        self._apply_plot_kwargs(axes[f'sol_{i}'], 'solution')
+                    if f'res_{i}' in axes:
+                        self._plot_residuals_1d_at_times(axes[f'res_{i}'], i, _pts2, n_points)
+                        self._apply_plot_kwargs(axes[f'res_{i}'], 'residuals')
+            else:
+                for i in range(n_outputs):
+                    if f'sol_{i}' in axes:
+                        self._plot_solution_2d(axes[f'sol_{i}'], i, n_points, plot_key='solution')
+                        self._apply_plot_kwargs(axes[f'sol_{i}'], 'solution')
+                    if f'true_{i}' in axes and has_solution:
+                        self._plot_true_solution_2d(axes[f'true_{i}'], i, n_points, plot_key='solution')
+                        self._apply_plot_kwargs(axes[f'true_{i}'], 'solution')
+                    if f'res_{i}' in axes:
+                        self._plot_residuals_2d(axes[f'res_{i}'], i, n_points, plot_key='residuals')
+                        self._apply_plot_kwargs(axes[f'res_{i}'], 'residuals')
+                    if f'err_{i}' in axes and has_solution:
+                        self._plot_error_2d(axes[f'err_{i}'], i, n_points, plot_key='error')
+                        self._apply_plot_kwargs(axes[f'err_{i}'], 'error')
+
+        elif self._is_3d_mesh_domain() and not self._plot_time_points:
             for i in range(n_outputs):
-                if f'sol_{i}' in axes:
-                    self._plot_solution_2d(axes[f'sol_{i}'], i, n_points, plot_key='solution')
-                    self._apply_plot_kwargs(axes[f'sol_{i}'], 'solution')
-                if f'true_{i}' in axes and has_solution:
-                    self._plot_true_solution_2d(axes[f'true_{i}'], i, n_points, plot_key='solution')
-                    self._apply_plot_kwargs(axes[f'true_{i}'], 'solution')
-                if f'res_{i}' in axes:
-                    self._plot_residuals_2d(axes[f'res_{i}'], i, n_points, plot_key='residuals')
-                    self._apply_plot_kwargs(axes[f'res_{i}'], 'residuals')
-                if f'err_{i}' in axes and has_solution:
-                    self._plot_error_2d(axes[f'err_{i}'], i, n_points, plot_key='error')
-                    self._apply_plot_kwargs(axes[f'err_{i}'], 'error')
+                if f'mesh3d_sol_{i}' in axes:
+                    self._plot_solution_3d(axes[f'mesh3d_sol_{i}'], i)
+                    self._apply_plot_kwargs(axes[f'mesh3d_sol_{i}'], 'solution')
+                if f'mesh3d_res_{i}' in axes:
+                    self._plot_residuals_3d(axes[f'mesh3d_res_{i}'], i)
+                    self._apply_plot_kwargs(axes[f'mesh3d_res_{i}'], 'residuals')
+
+        # ── Cubic 2+1D spatial snapshots at fixed times (e.g. Grey-Scott) ──────
+        _pts = self._plot_time_points
+        if _pts and not self._is_mesh_domain():
+            _dom_c = self._trainer.problem.domain
+            if (getattr(_dom_c, 'has_time', False)
+                    and getattr(_dom_c, '_spatial_dims', 0) >= 2):
+                _np_snap = max(n_points // 4, 30)
+                for _t_val in _pts:
+                    for _i in range(n_outputs):
+                        _sol_key  = f'snap_sol_{_i}_t{_t_val}'
+                        _true_key = f'snap_true_{_i}_t{_t_val}'
+                        _res_key  = f'snap_res_{_i}_t{_t_val}'
+                        _err_key  = f'snap_err_{_i}_t{_t_val}'
+                        if _sol_key in axes:
+                            self._plot_solution_2d_at_time(axes[_sol_key], _i, _t_val, _np_snap)
+                            self._apply_plot_kwargs(axes[_sol_key], 'solution')
+                        if _true_key in axes and has_solution:
+                            self._plot_true_solution_2d_at_time(axes[_true_key], _i, _t_val, _np_snap)
+                            self._apply_plot_kwargs(axes[_true_key], 'solution')
+                        if _res_key in axes:
+                            self._plot_residuals_2d_at_time(axes[_res_key], _i, _t_val, _np_snap)
+                            self._apply_plot_kwargs(axes[_res_key], 'residuals')
+                        if _err_key in axes and has_solution:
+                            self._plot_error_2d_at_time(axes[_err_key], _i, _t_val, _np_snap)
+                            self._apply_plot_kwargs(axes[_err_key], 'error')
 
         # ── Transient mesh snapshots (works regardless of n_dims) ──────────────
-        _pts = self._plot_time_points
         if _pts and self._is_mesh_domain():
             for _t_val in _pts:
                 for _i in range(n_outputs):

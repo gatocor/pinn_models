@@ -7,42 +7,50 @@ Functions in Low Dimensional Domains" (NeurIPS 2020).
 
 import jax
 import jax.numpy as jnp
-from typing import Optional
+from typing import List, Optional, Sequence
+
 
 class RandomFourierFeatures:
     """
     Random Fourier Feature encoding to mitigate spectral bias in PINNs.
 
-    The encoding maps x to::
+    The encoding maps the input columns to::
 
-        [cos(2 * pi * B @ x_enc), sin(2 * pi * B @ x_enc)]
+        [cos(B @ x_enc), sin(B @ x_enc), x_skip]
 
-    where B ~ N(0, sigma^2) is a fixed random projection matrix.
+    where ``x_enc`` are all non-context columns **except** those listed in
+    ``skip_transform``, ``x_skip`` are those columns passed through unchanged,
+    and ``B ~ N(0, sigma²)`` is a random projection matrix (fixed or trainable).
 
     Like all layers, domain/input information is injected automatically when
-    added to a :class:`~pinns.models.model_base.ModelBase` — no need to pass
-    ``domain`` or ``input_dim``::
+    added to a :class:`~pinns.models.model_base.ModelBase`::
 
-        net.add(RandomFourierFeatures(n_features=64, sigma=5.0, encode_time=False))
+        # encode all incoming columns (e.g. after PeriodicEmbedding)
+        net.add(RandomFourierFeatures(n_features=256, sigma=1.0))
+
+        # keep column 1 (e.g. raw t) unencoded after a spatial embedding
+        net.add(RandomFourierFeatures(n_features=256, sigma=1.0, skip_transform=[1]))
 
     Parameters
     ----------
     n_features : int
-        Number of Fourier features; output width is ``2 * n_features``.
+        Number of Fourier features; output width is ``2 * n_features``
+        (plus any skipped / context columns).
     sigma : float
         Standard deviation for the random projection matrix B.
     seed : int
-        Random seed for reproducible B.
+        Random seed for reproducible B initialisation.
     include_input : bool
-        If True, concatenate the encoded input coordinates before the
-        cos/sin block.
-    encode_time : bool or None
-        How to handle a time column when the domain has a time axis:
-
-        * ``True``  — include time in the Fourier encoding.
-        * ``False`` — encode only spatial coords; raw ``t`` is appended.
-        * ``None``  (default) — raise an error if the domain has time,
-          forcing an explicit choice.
+        If ``True``, also prepend the encoded columns before the cos/sin block.
+    skip_transform : sequence of int
+        0-based column indices (into the layer's input, *before* context
+        columns) that are **not** Fourier-encoded and are instead appended
+        unchanged at the end of the output.  All other non-context columns
+        are encoded together.
+    adaptive : bool
+        If ``True`` (default) the projection matrix ``B`` becomes a **trainable**
+        parameter updated by the optimizer (like jaxpi's ``FourierEmbs``).
+        If ``False`` ``B`` is fixed at initialisation.
     """
 
     def __init__(
@@ -51,85 +59,83 @@ class RandomFourierFeatures:
         sigma: float = 1.0,
         seed: int = 0,
         include_input: bool = False,
-        encode_time: Optional[bool] = None,
+        skip_transform: Sequence[int] = (),
+        adaptive: bool = True,
     ):
-        self.n_features    = n_features
-        self.sigma         = sigma
-        self.seed          = seed
-        self.include_input = include_input
-        self.encode_time   = encode_time
+        self.n_features     = n_features
+        self.sigma          = sigma
+        self.seed           = seed
+        self.include_input  = include_input
+        self.skip_transform = list(skip_transform)
+        self.adaptive       = adaptive
 
         # Set by _configure:
         self.B:                  Optional[jnp.ndarray] = None
         self.output_dim:         Optional[int]         = None
-        self._spatial_dims:      Optional[int]         = None
-        self._has_time:          Optional[bool]        = None
-        self._encode_time:       Optional[bool]        = None
+        self._encode_cols:       Optional[List[int]]   = None
+        self._skip_cols:         Optional[List[int]]   = None
         self._fourier_input_dim: Optional[int]         = None
         self._n_context:         Optional[int]         = None
 
     # ── ModelBase composable protocol ──────────────────────────────────────── #
 
     def _configure(self, network, input_dim: int) -> int:
-        """Called by ModelBase.add(). Derives everything from network.domain."""
-        domain    = network.domain
-        t_interval = getattr(domain, "t_interval", None)
-        has_time  = t_interval is not None
+        """Called by ModelBase.add(). Resolves column splits from input_dim."""
+        n_context     = network.n_context
+        n_non_context = input_dim - n_context
 
-        if has_time and self.encode_time is None:
+        skip_set    = set(self.skip_transform)
+        encode_cols = [i for i in range(n_non_context) if i not in skip_set]
+        skip_cols   = [i for i in range(n_non_context) if i in skip_set]
+
+        if not encode_cols:
             raise ValueError(
-                "RandomFourierFeatures: the domain has a time dimension — "
-                "you must explicitly set encode_time=True or encode_time=False."
+                "RandomFourierFeatures: all non-context columns are in skip_transform; "
+                "nothing left to encode."
             )
 
-        encode_time       = bool(self.encode_time) if self.encode_time is not None else False
-        spatial_dims      = domain._spatial_dims
-        fourier_input_dim = spatial_dims + (1 if (has_time and encode_time) else 0)
-        n_context         = network.n_context
+        fourier_input_dim = len(encode_cols)
 
         key    = jax.random.PRNGKey(self.seed)
         self.B = jax.random.normal(key, (self.n_features, fourier_input_dim)) * self.sigma
 
         fourier_out = 2 * self.n_features + (fourier_input_dim if self.include_input else 0)
-        raw_t_col   = 1 if (has_time and not encode_time) else 0
-        out_dim     = fourier_out + raw_t_col + n_context
+        out_dim     = fourier_out + len(skip_cols) + n_context
 
-        self._spatial_dims      = spatial_dims
-        self._has_time          = has_time
-        self._encode_time       = encode_time
+        self._encode_cols       = encode_cols
+        self._skip_cols         = skip_cols
         self._fourier_input_dim = fourier_input_dim
         self._n_context         = n_context
         self.output_dim         = out_dim
         return out_dim
 
     def init(self, rng) -> dict:
-        """No trainable parameters."""
+        """Returns trainable params: {'B': array} if adaptive, else {}."""
+        if self.adaptive:
+            return {"B": self.B}
         return {}
 
     def apply(self, params: dict, x, params_dict=None):
         """ModelBase-protocol forward pass."""
-        return self._forward(x, params_dict)
+        B = params["B"] if self.adaptive else None
+        return self._forward(x, params_dict, B=B)
 
     # ── Forward pass ───────────────────────────────────────────────────────── #
 
-    def _forward(self, x: jnp.ndarray, params_dict=None) -> jnp.ndarray:
+    def _forward(self, x: jnp.ndarray, params_dict=None, B=None) -> jnp.ndarray:
         assert self.B is not None, "RandomFourierFeatures not configured — add to a ModelBase first"
+        B = B if B is not None else self.B
 
-        if self._has_time and not self._encode_time:
-            x_enc = x[:, :self._spatial_dims]
-            t_col = x[:, self._spatial_dims : self._spatial_dims + 1]
-        else:
-            x_enc = x[:, :self._fourier_input_dim]
-            t_col = None
+        enc_idx = jnp.array(self._encode_cols)
+        x_enc   = x[:, enc_idx]
 
-        Bx       = x_enc @ self.B.T
-        features = jnp.concatenate(
-            [jnp.cos(2 * jnp.pi * Bx), jnp.sin(2 * jnp.pi * Bx)], axis=-1
-        )
+        Bx       = x_enc @ B.T
+        features = jnp.concatenate([jnp.cos(Bx), jnp.sin(Bx)], axis=-1)
         if self.include_input:
             features = jnp.concatenate([x_enc, features], axis=-1)
-        if t_col is not None:
-            features = jnp.concatenate([features, t_col], axis=-1)
+        if self._skip_cols:
+            skip_idx = jnp.array(self._skip_cols)
+            features = jnp.concatenate([features, x[:, skip_idx]], axis=-1)
         if self._n_context and self._n_context > 0:
             ctx      = x[:, -self._n_context:]
             features = jnp.concatenate([features, ctx], axis=-1)
@@ -144,14 +150,14 @@ class RandomFourierFeatures:
 
     def __repr__(self) -> str:
         if self.B is None:
-            return (f"RandomFourierFeatures(n_features={self.n_features}, "
-                    f"sigma={self.sigma}, encode_time={self.encode_time})")
-        inc = ", include_input=True" if self.include_input else ""
-        et  = f", encode_time={self._encode_time}" if self._has_time else ""
-        ctx = f", n_context={self._n_context}" if self._n_context else ""
+            skip = f", skip_transform={self.skip_transform}" if self.skip_transform else ""
+            return f"RandomFourierFeatures(n_features={self.n_features}, sigma={self.sigma}{skip})"
+        skip = f", skip_transform={self._skip_cols}" if self._skip_cols else ""
+        ctx  = f", n_context={self._n_context}" if self._n_context else ""
+        adp  = ", adaptive=True" if self.adaptive else ""
         return (
-            f"RandomFourierFeatures(input_dim={self._fourier_input_dim}, "
-            f"n_features={self.n_features}, sigma={self.sigma}{inc}{et}{ctx})"
+            f"RandomFourierFeatures(fourier_input_dim={self._fourier_input_dim}, "
+            f"n_features={self.n_features}, sigma={self.sigma}{skip}{ctx}{adp})"
         )
 
 

@@ -59,11 +59,14 @@ class SchedulerLagrange(Scheduler):
         self._lagrange_lr = float(lr)
         self.max_val = float(max_val)
 
-        # lam_k vectors -- populated in on_compile, updated in on_epoch_end
+        # lam_k vectors -- populated in on_compile, updated via jit_update inside JIT
         self._lambdas: dict = {}   # {term_name: jnp.ndarray shape (N_k,)}
         # Track JAX array identity per term; reset λ whenever the array is replaced
         # (i.e. after any resample, even same-size, because points have changed)
         self._data_ids: dict = {}  # {term_name: id(jax_array)}
+        # Set by reinitialize_if_needed; tells the training loop to rebuild
+        # _sched_states from get_jit_state() rather than reuse the JIT output.
+        self._needs_state_rebuild: bool = True
 
     # ------------------------------------------------------------------
     # Lifecycle hooks
@@ -96,28 +99,13 @@ class SchedulerLagrange(Scheduler):
             except KeyError:
                 self._lambdas[t] = jnp.zeros(0)
 
+    def needs_epoch_end_at(self, epoch: int) -> bool:
+        """SchedulerLagrange updates λ inside JIT; on_epoch_end is never needed."""
+        return False
+
     def on_epoch_start(self, trainer, epoch: int) -> None:
         """Reset λ whenever the training-data array was replaced (any resample)."""
         self.reinitialize_if_needed(trainer)
-
-    def on_epoch_end(self, trainer, epoch: int, loss: float) -> None:
-        """Dual-ascent update: lam_k <- clip(lam_k + lr * r_k, +/-max_val)."""
-        for t in self.terms:
-            try:
-                r = trainer.eval_term_residuals(t)          # np.ndarray (N_k,)
-            except (KeyError, RuntimeError):
-                continue
-            r_jax = jnp.array(r, dtype=jnp.float32)
-            # Reinitialise λ when the residual size differs from the stored lambda
-            # (e.g. ProblemWeak Galerkin residuals are sized by node count, not
-            # by the training-data sample count used in on_compile).
-            if self._lambdas.get(t, jnp.zeros(0)).shape[0] != r_jax.shape[0]:
-                self._lambdas[t] = jnp.zeros(r_jax.shape[0])
-            self._lambdas[t] = jnp.clip(
-                self._lambdas[t] + self._lagrange_lr * r_jax,
-                -self.max_val,
-                self.max_val,
-            )
 
     # ------------------------------------------------------------------
     # JIT-state protocol
@@ -153,6 +141,26 @@ class SchedulerLagrange(Scheduler):
             total = total + jnp.mean(lam * r)
         return total
 
+    def jit_update(self, jit_state: dict, residuals: dict) -> dict:
+        """Dual-ascent update run *inside* the JIT step — no host sync.
+
+        lam_k <- clip(lam_k + lr * mean(r_k), -max_val, max_val)
+        """
+        new_state = dict(jit_state)
+        for t in self.terms:
+            if t not in jit_state or t not in residuals:
+                continue
+            lam = jit_state[t]
+            r   = residuals[t].flatten()
+            if lam.shape[0] != r.shape[0]:
+                continue
+            new_state[t] = jnp.clip(
+                lam + self._lagrange_lr * r,
+                -self.max_val,
+                self.max_val,
+            )
+        return new_state
+
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
@@ -173,6 +181,7 @@ class SchedulerLagrange(Scheduler):
             if self._data_ids.get(t) != current_id or t not in self._lambdas:
                 self._lambdas[t] = jnp.zeros(arr.shape[0])
                 self._data_ids[t] = current_id
+                self._needs_state_rebuild = True
 
     def reset(self) -> None:
         """Zero all Lagrange multipliers."""

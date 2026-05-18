@@ -59,6 +59,7 @@ def _make_mock_trainer(
     t._schedulers            = []
     t._sample_train_data     = MagicMock()
     t._sample_test_data      = MagicMock()
+    t._init_optimizer_state  = MagicMock()
     return t
 
 
@@ -313,34 +314,36 @@ class TestSchedulerCurriculum:
         t = _make_mock_trainer()
         domain = self._make_domain_mock(xmax0)
         t.problem = self._make_problem_mock(domain)
+        t.t_min = 0.0
+        t.t_max = xmax0
         return t
 
     def test_on_compile_sets_stage0_bound(self):
         s = SchedulerCurriculum(t_ends=[0.5, 1.0], epochs_per_stage=100)
         t = self._make_curriculum_trainer(xmax0=1.0)
         s.on_compile(t)
-        assert t.problem.domain.xmax[0] == pytest.approx(0.5)
+        assert t.t_max == pytest.approx(0.5)
 
     def test_on_epoch_advances_stage(self):
-        s = SchedulerCurriculum(t_ends=[0.5, 1.0], epochs_per_stage=100, dim=0)
+        s = SchedulerCurriculum(t_ends=[0.5, 1.0], epochs_per_stage=100)
         t = self._make_curriculum_trainer(xmax0=2.0)
         s.on_compile(t)
         s.on_epoch_start(t, epoch=100)
-        assert t.problem.domain.xmax[0] == pytest.approx(1.0)
+        assert t.t_max == pytest.approx(1.0)
 
     def test_on_epoch_clamps_to_last_stage(self):
-        s = SchedulerCurriculum(t_ends=[0.5, 1.0], epochs_per_stage=100, dim=0)
+        s = SchedulerCurriculum(t_ends=[0.5, 1.0], epochs_per_stage=100)
         t = self._make_curriculum_trainer(xmax0=2.0)
         s.on_compile(t)
         s.on_epoch_start(t, epoch=9999)
-        assert t.problem.domain.xmax[0] == pytest.approx(1.0)
+        assert t.t_max == pytest.approx(1.0)
 
     def test_on_training_end_restores_original_bound(self):
-        s = SchedulerCurriculum(t_ends=[0.5, 1.0], epochs_per_stage=100, dim=0)
+        s = SchedulerCurriculum(t_ends=[0.5, 1.0], epochs_per_stage=100)
         t = self._make_curriculum_trainer(xmax0=2.0)
         s.on_compile(t)
         s.on_training_end(t)
-        assert t.problem.domain.xmax[0] == pytest.approx(2.0)
+        assert t.t_max == pytest.approx(2.0)
 
     def test_invalid_t_ends(self):
         with pytest.raises(ValueError):

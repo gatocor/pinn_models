@@ -76,6 +76,8 @@ class Trainer:
             'test_loss': [],
             'solution_error': [],
             'epoch_times': [],
+            'mse_loss': [],        # unweighted total mean(r²), no Lagrange
+            'mse_terms': {},       # {term_name: [per-epoch unweighted mean(r²)]}
         }
         
         # Global epoch counter (accumulated across train() calls)
@@ -105,8 +107,9 @@ class Trainer:
                          else (1000 if t.kind == 'inner' else 10))
                 for t in problem._terms
             }
-            self.test_samples  = {t.name: 0 for t in problem._terms}
-            self.weights       = {t.name: 1.0 for t in problem._terms}
+            self.test_samples       = {t.name: 0 for t in problem._terms}
+            self.weights            = {t.name: 1.0 for t in problem._terms}
+            self.relative_weights   = {t.name: 1.0 for t in problem._terms}
         else:
             raise TypeError(
                 f"Unsupported problem type: {type(problem).__name__}. "
@@ -118,6 +121,7 @@ class Trainer:
         if dataset is not None:
             for _dt in dataset._data_terms:
                 self.weights[_dt.name] = 1.0
+                self.relative_weights[_dt.name] = 1.0
 
         self._optimizer_obj = AdamOptimizer()
         self.optimizer_name = self._optimizer_obj.name
@@ -134,6 +138,12 @@ class Trainer:
         self._precomputed_pde = None
         self._precomputed_bcs = {}
         
+        # Curriculum time window — scheduler sets these to narrow/expand sampling
+        # over the time axis.  None means "use the full domain range".
+        domain = problem.domain
+        self.t_min: Optional[float] = getattr(domain, '_t_min', None)
+        self.t_max: Optional[float] = getattr(domain, '_t_max', None)
+
         # Training configuration (set by compile)
         self._epochs = 1000
         self._print_each = 100
@@ -240,6 +250,8 @@ class Trainer:
                 rollout.  ``None`` (default) uses all faces.
         """
         if problem is not None:
+            # Build the set of actual term names so we can do prefix expansion.
+            _all_term_names = {t.name for t in getattr(self.problem, '_terms', [])}
             for _term, _cfg in problem.items():
                 if not isinstance(_cfg, dict):
                     raise ValueError(
@@ -247,12 +259,18 @@ class Trainer:
                         f"got {type(_cfg).__name__!r} for term {_term!r}. "
                         "Expected e.g. {'train': 1000, 'test': 500, 'weight': 1.0}"
                     )
-                if 'train' in _cfg:
-                    self.train_samples[_term] = _cfg['train']
-                if 'test' in _cfg:
-                    self.test_samples[_term] = _cfg['test']
-                if 'weight' in _cfg:
-                    self.weights[_term] = _cfg['weight']
+                # Prefix expansion: "initial" → ["initial_u", "initial_v"] etc.
+                _prefix = _term + '_'
+                _expanded = sorted(n for n in _all_term_names if n.startswith(_prefix))
+                _targets = _expanded if (_expanded and _term not in _all_term_names) else [_term]
+                for _t in _targets:
+                    if 'train' in _cfg:
+                        self.train_samples[_t] = _cfg['train']
+                    if 'test' in _cfg:
+                        self.test_samples[_t] = _cfg['test']
+                    if 'weight' in _cfg:
+                        self.weights[_t] = _cfg['weight']
+                        self.relative_weights[_t] = 1.0   # reset adaptive weight on recompile
 
         # Update schedulers list FIRST so _create_optimizer can inspect it
         new_schedulers = list(schedulers) if schedulers else []
@@ -452,53 +470,24 @@ class Trainer:
         Returns:
             Tuple of (total_loss, losses_dict)
         """
-        from pinns.problems.problem_strong import ProblemStrong as _PSctl
-        if isinstance(self.problem, _PSctl):
-            return self._compute_strong_total_loss(data, params_dict, weights_dict)
-
-        total_loss = None
+        # Delegate entirely to the residual function built by problem.make_residual_fn.
+        # All BC kind dispatch (dirichlet, neumann, periodic, etc.) belongs to the
+        # problem, not the trainer.
+        _eval_fn = getattr(self, '_residual_fn_jit', None) or getattr(self, '_residual_fn', None)
+        if _eval_fn is None:
+            raise RuntimeError(
+                "_compute_total_loss_base called before compile(). "
+                "Call trainer.compile() first."
+            )
+        residuals = _eval_fn(self.network.params, data)
         losses = {}
-        
-        # PDE loss
-        if 'pde' in data:
-            x_pde = data['pde']
-            pde_weights = weights_dict.get('pde') if isinstance(weights_dict.get('pde'), (list, tuple)) else None
-            pde_loss, pde_individual = self._compute_pde_loss(x_pde, params_dict, pde_weights)
-            
-            # Apply scalar weight if not per-equation
-            if not isinstance(weights_dict.get('pde'), (list, tuple)):
-                pde_loss = weights_dict.get('pde', 1.0) * pde_loss
-            
-            losses['pde'] = pde_loss
-            losses['pde_individual'] = pde_individual
-            total_loss = pde_loss
-        
-        # BC losses — delegate sampling and loss to each BC object
-        bc_names = self._get_bc_names()
-        losses['bcs'] = []
-        name_idx = 0
-        for i, bc in enumerate(self.problem.boundary_conditions):
-            if bc.kind == 'periodic':
-                continue   # handled by the JIT train step, not here
-            name = bc_names[name_idx]
-            name_idx += 1
-            if name in data:
-                x_bc = data[name]
-                y_bc = self._call_network(x_bc, params_dict)
-                per_output = self._compute_bc_term_loss_dict(bc, x_bc, y_bc, params_dict)
-                weighted_bc_loss = None
-                for oname, oloss in per_output.items():
-                    w = weights_dict.get(oname, weights_dict.get(name, 1.0))
-                    weighted = w * oloss
-                    losses[oname] = weighted
-                    weighted_bc_loss = (weighted if weighted_bc_loss is None
-                                        else weighted_bc_loss + weighted)
-                if weighted_bc_loss is not None:
-                    losses['bcs'].append(weighted_bc_loss)
-                    total_loss = (weighted_bc_loss if total_loss is None
-                                  else total_loss + weighted_bc_loss)
-
-        # Dataset: evaluate fixed supervised data terms.
+        total_loss = jnp.array(0.0)
+        for name, R in residuals.items():
+            w = weights_dict.get(name, 1.0)
+            term_loss = w * self._mean_squared(R)
+            losses[name] = term_loss
+            total_loss = total_loss + term_loss
+        # Dataset supervised terms (not part of the problem's residual_fn)
         if self.dataset is not None:
             for _dterm in self.dataset._data_terms:
                 _x_d = self._to_tensor(np.asarray(_dterm.inputs, dtype=np.float32))
@@ -507,177 +496,10 @@ class Trainer:
                 _tgt = self._to_tensor(np.asarray(_dterm.outputs[:, 0]).flatten())
                 _res = _y_d[:, _col] - _tgt
                 _loss = self._mean_squared(_res)
-                _w    = weights_dict.get(_dterm.name, 1.0)
-                _wl   = _w * _loss
+                _wl = weights_dict.get(_dterm.name, 1.0) * _loss
                 losses[_dterm.name] = _wl
-                losses['bcs'].append(_wl)
-                total_loss = _wl if total_loss is None else total_loss + _wl
-
+                total_loss = total_loss + _wl
         return total_loss, losses
-
-    def _compute_strong_total_loss(self, data: Dict, params_dict: Dict[str, Any], weights_dict: Dict):
-        """
-        Compute total weighted loss for ProblemStrong problems.
-
-        Each registered term's residual is evaluated via ``term.fn(x, u, pars, derivative)``.
-        Structural BC terms (add_dirichlet, add_neumann) with no callable fn use
-        ``_compute_strong_bc_residual``.
-
-        Returns:
-            Tuple of (total_loss, losses_dict)
-        """
-        total_loss = None
-        losses = {'bcs': []}
-        derivative_fn = self._get_derivative_fn(params_dict)
-
-        for term in self.problem._terms:
-            if term.name not in data:
-                continue
-            x = data[term.name]
-            # PyTorch networks expose .forward(); JAX ModelBase uses .apply(params, x).
-            if hasattr(self.network, 'forward'):
-                y = self.network.forward(x, params_dict)
-            else:
-                y = self.network.apply(self.network.params, x, params_dict)
-
-            if term.kind == 'points':
-                continue  # dataset terms are handled separately
-
-            elif term.kind in ('inner', 'initial', 'boundary'):
-                # User-provided physics / IC residual
-                fn = term.fn
-                import inspect as _inspect
-                if not callable(fn):
-                    # Scalar constant target (e.g. add_initial(1.0, ...))
-                    col = getattr(term, 'output_idx', 0) or 0
-                    residual = y[:, col:col + 1] - float(fn)
-                else:
-                    n_p = len(_inspect.signature(fn).parameters)
-                    if n_p >= 4:
-                        residual = fn(x, y, params_dict, derivative_fn)
-                    elif n_p == 3:
-                        residual = fn(x, y, params_dict)
-                    else:
-                        residual = fn(x, y)
-                eq_idx = getattr(term, 'eq_idx', None)
-                if eq_idx is not None:
-                    if hasattr(residual, 'ndim') and residual.ndim == 2:
-                        residual = residual[:, eq_idx]
-
-            elif term.kind == 'dirichlet':
-                # Structural Dirichlet BC: u_component(x) = value(x)
-                residual = self._compute_strong_bc_residual(term, x, y, params_dict, derivative_fn)
-
-            elif term.kind in ('neumann', 'robin'):
-                # Residual closure pre-built by add_neumann / add_robin
-                fn = getattr(term, 'fn', None)
-                if fn is None:
-                    raise NotImplementedError(
-                        f"No residual function found on term '{term.name}' "
-                        f"(kind='{term.kind}'). Use add_boundary() with a callable fn instead."
-                    )
-                import inspect as _inspect_nr
-                n_p = len(_inspect_nr.signature(fn).parameters)
-                if n_p >= 4:
-                    residual = fn(x, y, params_dict, derivative_fn)
-                elif n_p == 3:
-                    residual = fn(x, y, params_dict)
-                else:
-                    residual = fn(x, y)
-
-            else:
-                continue  # Periodic and other unsupported kinds: skip
-
-            loss = self._mean_squared(residual)
-            w = weights_dict.get(term.name, 1.0)
-            weighted = w * loss
-            losses[term.name] = weighted
-            losses['bcs'].append(weighted)
-
-            if total_loss is None:
-                total_loss = weighted
-            else:
-                total_loss = total_loss + weighted
-
-        # Dataset: evaluate fixed supervised data terms.
-        if self.dataset is not None:
-            for _dterm in self.dataset._data_terms:
-                if _dterm.name not in data:
-                    continue
-                _x_d = data[_dterm.name]
-                _y_d = self.network.apply(self.network.params, _x_d, params_dict)
-                _col = _dterm.components[0]
-                _tgt = self._to_tensor(np.asarray(_dterm.outputs[:, 0]).flatten())
-                _res = _y_d[:, _col] - _tgt
-                _loss = self._mean_squared(_res)
-                _w    = weights_dict.get(_dterm.name, 1.0)
-                _wl   = _w * _loss
-                losses[_dterm.name] = _wl
-                losses['bcs'].append(_wl)
-                total_loss = _wl if total_loss is None else total_loss + _wl
-
-        return total_loss, losses
-
-    def _compute_strong_bc_residual(self, term, x, y, params_dict, derivative_fn):
-        """Compute residual for structural add_dirichlet terms."""
-        col = term.component
-        u = y[:, col:col + 1]
-        target = term.get_value(x, params_dict)
-        if callable(target):
-            target = target(x, params_dict)
-        target = self._to_tensor(np.asarray(target, dtype=np.float32))
-        if hasattr(target, 'ndim') and target.ndim == 2:
-            target = target[:, 0:1]
-        return u - target
-
-    def _compute_bc_term_loss_dict(self, bc, x, y, params_dict):
-        """Compute per-output loss dict for a BC term using kind dispatch."""
-        import inspect as _inspect
-
-        kind = bc.kind
-        if kind == 'dirichlet':
-            col = bc.component
-            target = bc.get_value(x, params_dict)
-            target = self._to_tensor(np.asarray(target, dtype=np.float32))
-            if hasattr(target, 'ndim') and target.ndim == 2:
-                target = target[:, 0:1]
-            residual = y[:, col:col + 1] - target
-            return {bc.name or 'bc': self._mean_squared(residual)}
-
-        elif kind in ('inner', 'initial', 'boundary'):
-            fn = bc.fn
-            n_p = len(_inspect.signature(fn).parameters)
-            if n_p >= 4:
-                derivative_fn = self._get_derivative_fn(params_dict)
-                residual = fn(x, y, params_dict, derivative_fn)
-            elif n_p == 3:
-                residual = fn(x, y, params_dict)
-            else:
-                residual = fn(x, y)
-            eq_idx = getattr(bc, 'eq_idx', None)
-            if eq_idx is not None and hasattr(residual, 'ndim') and residual.ndim == 2:
-                residual = residual[:, eq_idx]
-            if not isinstance(residual, (list, tuple)):
-                residual = [residual]
-            base = bc.name or 'bc'
-            names = bc.output_names or ([base] if len(residual) == 1
-                                         else [f'{base}_{k}' for k in range(len(residual))])
-            return {n: self._mean_squared(r) for n, r in zip(names, residual)}
-
-        elif kind == 'neumann':
-            # ProblemWeak assembles Neumann/traction terms inside the weak-form
-            # residual_fn (boundary integrals are baked into the cubature data).
-            # No separate point-evaluation is needed or possible here.
-            from pinns.problems.problem_weak import ProblemWeak as _PWNeu
-            if isinstance(self.problem, _PWNeu):
-                return {}
-            raise NotImplementedError(
-                f"Neumann BC '{bc.name}' cannot be auto-evaluated. "
-                "Use add_boundary() with a callable fn."
-            )
-
-        else:
-            return {}
 
     def _compute_total_loss_batched_base(self, data: Dict, params_dict: Dict[str, Any], 
                                           weights_dict: Dict, batch_size: int = 1000):
@@ -826,8 +648,9 @@ class Trainer:
             if term is None:
                 raise ValueError(f"Unknown ProblemStrong term: '{name}'")
             region = None if term.region == 'all' else term.region
+            _t_interval = (self.t_min, self.t_max) if self.t_min is not None else None
             if term.kind == 'inner':
-                return domain.sample_interior(n_samples, region=region, rng=rng, params=params)
+                return domain.sample_interior(n_samples, region=region, rng=rng, params=params, t_interval=_t_interval)
             if term.kind == 'initial':
                 pts = domain.sample_interior(n_samples, rng=rng, params=params)
                 t_dim = getattr(domain, '_spatial_dims', 0)
@@ -835,7 +658,7 @@ class Trainer:
                     pts[:, t_dim] = domain.xmin[t_dim]
                 return pts
             # boundary / dirichlet / neumann / robin / periodic
-            return domain.sample_boundary(n_samples, region=region, rng=rng, params=params)
+            return domain.sample_boundary(n_samples, region=region, rng=rng, params=params, t_interval=_t_interval)
 
         # ── ProblemWeak: look up term by kind, route interior vs BC ──
         term = next((t for t in self.problem._terms if t.name == name), None)
@@ -1081,6 +904,8 @@ class Trainer:
             'test_loss': [],
             'solution_error': [],
             'epoch_times': [],
+            'mse_loss': [],        # unweighted total mean(r²), no Lagrange
+            'mse_terms': {},       # {term_name: [per-epoch unweighted mean(r²)]}
         }
         self._global_epoch = 0
         if self._plotter is not None:
@@ -1511,7 +1336,7 @@ class Trainer:
 
     # ==================== JIT Training Step ====================
     
-    def _make_compute_loss_fn(self, weights, params_dict, schedulers=None):
+    def _make_compute_loss_fn(self, weights, relative_weights, params_dict, schedulers=None):
         """Build ``compute_loss(params, train_data, targets_dict, scheduler_states)`` closure.
 
         Both ``ProblemStrong`` and ``ProblemWeak`` expose the same interface:
@@ -1529,31 +1354,62 @@ class Trainer:
         """
         from pinns.problems.problem_weak import ProblemWeak as _ProblemWeak
 
-        _weights    = weights
+        _weights           = weights
+        _relative_weights  = relative_weights
         _net_losses = list(getattr(self.network, 'network_losses', []))
         _residual_fn = self.problem.make_residual_fn(self.network)
         self._residual_fn = _residual_fn
         self._residual_fn_jit = jax.jit(_residual_fn)
         _schedulers = list(schedulers) if schedulers else []
 
+        def _resolve_weight(name):
+            """Effective weight = static priority * adaptive relative weight.
+            Falls back to the base name (strip trailing _N suffix)."""
+            def _lookup(d, n):
+                if n in d:
+                    return d[n]
+                parts = n.rsplit('_', 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    return d.get(parts[0], 1.0)
+                return 1.0
+            return _lookup(_weights, name) * _lookup(_relative_weights, name)
+
         def compute_loss(params, train_data, targets_dict, scheduler_states=None):
             residuals  = _residual_fn(params, train_data)
+            # Collect per-sample term weights and extra losses from schedulers
+            _term_weights = {}
+            extra_loss_sum = jnp.array(0.0)
+            new_sched_states = {}
+            if scheduler_states:
+                for idx, s in enumerate(_schedulers):
+                    s_state = scheduler_states.get(idx, {})
+                    if s_state:
+                        # Per-sample weights: mean(w_i * R_i^2) per term
+                        tw = s.term_weights(residuals, s_state)
+                        for tname, w in tw.items():
+                            if tname in _term_weights:
+                                _term_weights[tname] = _term_weights[tname] * w
+                            else:
+                                _term_weights[tname] = w
+                        # Extra scalar loss (e.g. Lagrange)
+                        extra_loss_sum = extra_loss_sum + s.extra_loss(residuals, s_state)
+                        new_sched_states[idx] = s.jit_update(s_state, residuals)
             total_loss = jnp.array(0.0)
             for name, R in residuals.items():
-                total_loss = total_loss + _weights.get(name, 1.0) * jnp.mean(R ** 2)
+                base_w = _resolve_weight(name)
+                if name in _term_weights:
+                    w_i = _term_weights[name]
+                    total_loss = total_loss + base_w * jnp.mean(w_i * R.flatten() ** 2)
+                else:
+                    total_loss = total_loss + base_w * jnp.mean(R ** 2)
+            total_loss = total_loss + extra_loss_sum
             for nloss in _net_losses:
                 x_nl = nloss.x if nloss.x is not None else (train_data or {}).get('pde')
                 if x_nl is not None:
                     total_loss = (total_loss
                                   + _weights.get(nloss.name, nloss.weight)
                                   * nloss.fn(params, x_nl))
-            # Scheduler extra-loss contributions (e.g. Lagrange terms λᵀr)
-            if scheduler_states:
-                for idx, s in enumerate(_schedulers):
-                    s_state = scheduler_states.get(idx, {})
-                    if s_state:
-                        total_loss = total_loss + s.extra_loss(residuals, s_state)
-            return total_loss, residuals
+            return total_loss, (residuals, new_sched_states)
 
         return compute_loss, True
     
@@ -1568,17 +1424,17 @@ class Trainer:
         """
         _schedulers = list(getattr(self, '_schedulers', []))
         compute_loss, pde_accepts_derivative = self._make_compute_loss_fn(
-            weights, params_dict, schedulers=_schedulers)
+            weights, self.relative_weights, params_dict, schedulers=_schedulers)
         optim = self.optimizer
         if pde_accepts_derivative:
             @jax.jit
             def train_step(params, opt_state, train_data, targets_dict, scheduler_states):
-                (loss, residuals), grads = jax.value_and_grad(
+                (loss, (residuals, new_sched_states)), grads = jax.value_and_grad(
                     compute_loss, has_aux=True
                 )(params, train_data, targets_dict, scheduler_states)
                 updates, new_opt_state = optim.update(grads, opt_state, params)
                 new_params = optax.apply_updates(params, updates)
-                return new_params, new_opt_state, loss, residuals
+                return new_params, new_opt_state, loss, residuals, new_sched_states
             return train_step, True, False
         else:
             grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
@@ -1735,23 +1591,38 @@ class Trainer:
         full_train_loss, individual_losses = self._compute_total_loss_batched(
             self._train_data, params_dict, weights, batch_size=metrics_batch_size
         )
-        pde_loss = float(individual_losses.get('pde', 0.0))
-        bc_losses = [
-            float(individual_losses.get(name, 0.0))
-            for name in self._train_data.keys()
-            if name != 'pde' and not name.startswith('_')
-        ]
-        bc_names = self._get_soft_bc_names()
-        bc_losses_str = ", ".join(
-            f"{name}: {individual_losses.get(name, 0.0):.2e}" for name in bc_names
-        )
+
+        # ── Unweighted per-term MSE (no Lagrange, no weights) ─────────────
+        _dataset_names = {dt.name for dt in self.dataset._data_terms} if self.dataset else set()
+        _mse_terms = {}
+        for _mn, _mwl in individual_losses.items():
+            if _mn in ('bcs', 'pde_individual'):
+                continue
+            _mw = float(weights.get(_mn, 1.0))
+            _mse_terms[_mn] = float(_mwl) / max(_mw, 1e-30)
+        _mse_total = sum(_mse_terms.values())
+
+        # Split into problem terms vs dataset terms for display
+        _problem_terms = {k: v for k, v in _mse_terms.items() if k not in _dataset_names}
+        _data_terms    = {k: v for k, v in _mse_terms.items() if k in _dataset_names}
+
+        terms_str = ", ".join(f"{k}: {v:.2e}" for k, v in _problem_terms.items())
+        data_str  = ", ".join(f"{k}: {v:.2e}" for k, v in _data_terms.items())
+
+        # Keep history keys for backward-compat (pde + everything-else)
+        _pde_loss = _mse_terms.get('pde', 0.0)
+        _bc_losses = [v for k, v in _mse_terms.items() if k != 'pde']
 
         _loss_to_record = float(reported_loss) if reported_loss is not None else float(full_train_loss)
+
         self.history['epoch'].append(epoch_key)
         self.history['train_loss'].append(_loss_to_record)
         self.history['loss'].append(_loss_to_record)
-        self.history['loss_pde'].append(pde_loss)
-        self.history['loss_bcs'].append(bc_losses)
+        self.history['loss_pde'].append(_pde_loss)
+        self.history['loss_bcs'].append(_bc_losses)
+        self.history['mse_loss'].append(_mse_total)
+        for _mn, _mv in _mse_terms.items():
+            self.history['mse_terms'].setdefault(_mn, []).append(_mv)
 
         _has_test = (
             (any(v > 0 for v in (self.test_samples.values() if isinstance(self.test_samples, dict) else self.test_samples))
@@ -1772,14 +1643,15 @@ class Trainer:
         msg = (stage_prefix +
                f"Epoch {epoch_display}/{ep_total} | "
                f"Loss: {_loss_to_record:.2e} | "
-               f"MSE Loss: {full_train_loss:.2e} | "
-               f"PDE: {pde_loss:.2e} | "
-               f"BCs: [{bc_losses_str}] | "
-               f"Time: {elapsed:.1f}s")
+               f"MSE: {_mse_total:.2e} | "
+               f"Terms: [{terms_str}]")
+        if data_str:
+            msg += f" | Data: [{data_str}]"
         if self.history['test_loss']:
             msg += f" | Test Loss: {self.history['test_loss'][-1]:.2e}"
         if self.problem.solution is not None:
             msg += f" | Error: {self.history['solution_error'][-1]:.2e}"
+        msg += f" | Time: {elapsed:.1f}s"
         print(msg)
 
         if callback is not None:
@@ -1935,14 +1807,22 @@ class Trainer:
         return np.asarray(residuals_dict[term]).flatten()
 
     def set_weights(self, weights: Dict[str, float]):
-        """Update loss weights for one or more terms.
+        """Update adaptive (relative) loss weights for one or more terms.
+
+        These are the weights that schedulers such as :class:`SchedulerGradNorm`
+        modify at runtime.  The effective weight in the loss is::
+
+            effective = self.weights[term] * self.relative_weights[term]
+
+        The user-set ``self.weights`` (set via ``compile(problem={..., 'weight': ...})``)
+        are never modified by this method.
 
         Parameters
         ----------
         weights : dict[str, float]
-            Mapping of term name → new weight.  Unspecified terms are unchanged.
+            Mapping of term name → new relative weight.  Unspecified terms are unchanged.
         """
-        self.weights.update(weights)
+        self.relative_weights.update(weights)
 
     def set_learning_rate(self, lr: float):
         """Update the optimizer learning rate in-place.
@@ -2158,6 +2038,13 @@ class Trainer:
         _train_targets     = getattr(self, '_train_targets', {})
 
         self._current_epoch = 0
+        # Initialise scheduler JIT states once; they are updated from the JIT
+        # output each step, avoiding any Python-side host-device sync.
+        _sched_states: dict = (
+            {i: s.get_jit_state() for i, s in enumerate(_schedulers_list)}
+            if _has_schedulers else {}
+        )
+
         for epoch in range(epochs):
             self._current_epoch = epoch
             global_epoch = start_epoch + epoch
@@ -2167,14 +2054,13 @@ class Trainer:
                 for _s in _schedulers_list:
                     _s.on_epoch_start(self, epoch)
 
-            # Collect per-scheduler JIT states (e.g. Lagrange multipliers)
+            # Rebuild JIT states for any scheduler that signals a reset
+            # (e.g. SchedulerLagrange after a resample resets λ to zero).
             if _has_schedulers:
-                _sched_states = {
-                    i: s.get_jit_state()
-                    for i, s in enumerate(_schedulers_list)
-                }
-            else:
-                _sched_states = {}
+                for i, s in enumerate(_schedulers_list):
+                    if getattr(s, '_needs_state_rebuild', False):
+                        _sched_states[i] = s.get_jit_state()
+                        s._needs_state_rebuild = False
 
             # ── Rollout face mini-batching: sample fresh indices each epoch ──────────
             if _has_rollout_faces:
@@ -2226,14 +2112,16 @@ class Trainer:
                             batch_targets[name] = shuffled_train_targets[name][start_idx:end_idx]
                     
                     if is_full_jit:
-                        self.network.params, self.opt_state, loss, _step_res = train_step(
+                        self.network.params, self.opt_state, loss, _step_res, _new_ss = train_step(
                                 self.network.params, self.opt_state, batch_data, batch_targets,
                                 _sched_states,
                             )
                         self._last_residuals = _step_res
+                        _sched_states = {**_sched_states, **_new_ss}
                     else:
-                        (loss, _step_res), grads = grad_fn(self.network.params, batch_data, batch_targets, _sched_states)
+                        (loss, (_step_res, _new_ss)), grads = grad_fn(self.network.params, batch_data, batch_targets, _sched_states)
                         self._last_residuals = _step_res
+                        _sched_states = {**_sched_states, **_new_ss}
                         self.network.params, self.opt_state = apply_updates(self.network.params, grads, self.opt_state)
                     
                     epoch_loss += float(loss)
@@ -2252,21 +2140,25 @@ class Trainer:
                         # loss fn, so the update is scale-free w.r.t. mesh size.
                         self._rollout_lambdas = self._rollout_lambdas + self.lagrange_lr * _step_res
                     else:
-                        self.network.params, self.opt_state, loss, _step_res = train_step(
+                        self.network.params, self.opt_state, loss, _step_res, _new_ss = train_step(
                                 self.network.params, self.opt_state, self._train_data, _train_targets,
                                 _sched_states,
                             )
                         self._last_residuals = _step_res
+                        _sched_states = {**_sched_states, **_new_ss}
                 else:
-                    (loss, _step_res), grads = grad_fn(self.network.params, self._train_data, _train_targets, _sched_states)
+                    (loss, (_step_res, _new_ss)), grads = grad_fn(self.network.params, self._train_data, _train_targets, _sched_states)
                     self._last_residuals = _step_res
+                    _sched_states = {**_sched_states, **_new_ss}
                     self.network.params, self.opt_state = apply_updates(self.network.params, grads, self.opt_state)
 
             # Scheduler on_epoch_end hooks (lr plateau detection, etc.)
             if _has_schedulers:
-                _loss_float = float(loss)  # one host-device sync when schedulers need it
-                for _s in _schedulers_list:
-                    _s.on_epoch_end(self, epoch, _loss_float)
+                _active = [_s for _s in _schedulers_list if _s.needs_epoch_end_at(epoch)]
+                if _active:
+                    _loss_float = float(loss)  # host-device sync only when needed
+                    for _s in _active:
+                        _s.on_epoch_end(self, epoch, _loss_float)
 
             if print_each > 0 and ((global_epoch + 1) % print_each == 0 or epoch == epochs - 1):
                 elapsed = time.time() - start_time
@@ -2277,7 +2169,7 @@ class Trainer:
                 _stage_pfx  = f"Stage {_cur_stage}/{_n_stages} | " if _cur_stage is not None else ""
                 _ep_total   = _tot_epochs if _tot_epochs is not None else epochs + start_epoch
                 self._log_epoch(
-                    global_epoch, global_epoch + 1, _ep_total, None, elapsed,
+                    global_epoch, global_epoch + 1, _ep_total, float(loss), elapsed,
                     weights, params_dict, show_plots, save_plots, auto_save_path,
                     metrics_batch_size=metrics_batch_size, stage_prefix=_stage_pfx,
 callback=self._plotter.callback if self._plotter else None,
@@ -2285,6 +2177,13 @@ callback=self._plotter.callback if self._plotter else None,
         
         self._global_epoch += epochs
         _total_elapsed = time.time() - start_time
+        # Sync Python-side scheduler state from the final JIT state so that
+        # post-training queries (e.g. SchedulerLagrange.get_statistics()) are
+        # up to date.
+        if _has_schedulers and _sched_states:
+            for i, s in enumerate(_schedulers_list):
+                if hasattr(s, '_lambdas') and i in _sched_states:
+                    s._lambdas = dict(_sched_states[i])
         # Record per-epoch average time so get_time() stays accurate
         _avg_epoch_time = _total_elapsed / epochs if epochs > 0 else 0.0
         self.history['epoch_times'].extend([_avg_epoch_time] * epochs)

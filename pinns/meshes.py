@@ -56,6 +56,8 @@ __all__ = [
     "sphere",
     "open_sphere",
     "cylinder",
+    # 3-D coil
+    "coil_tube",
     # remote
     "get_mesh",
 ]
@@ -959,3 +961,190 @@ def get_mesh(
 
     filename, _size, _description, _citation = entry
     return _load_remote_mesh(_JACOBSON_BASE + filename, filename, cache_dir)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3-D coil tube mesh
+# ──────────────────────────────────────────────────────────────────────────────
+
+def coil_tube(
+    coil_radius: float = 1.0,
+    tube_radius: float = 0.18,
+    n_turns: int = 3,
+    pitch: float = 0.4,
+    n_coil: int = 120,
+    mesh_size: float = 0.15,
+    open_ends: bool = True,
+    random_factor: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """3-D surface mesh of a helical coil tube.
+
+    The centreline follows a helix:
+
+        c(t) = (R·cos t,  R·sin t,  pitch·t / (2π)),  t ∈ [0, 2π·n_turns]
+
+    A circle of radius ``tube_radius`` is swept along the helix using the
+    Frenet–Serret frame.  The structured ring mesh is fed into **gmsh** as a
+    discrete surface, which produces an unstructured Delaunay triangulation.
+    Requires **gmsh** (``pip install gmsh``).
+
+    Parameters
+    ----------
+    coil_radius : float
+        Radius of the helix centreline.
+    tube_radius : float
+        Radius of the circular cross-section.
+    n_turns : int
+        Number of full helical turns.
+    pitch : float
+        Axial rise per turn.
+    n_coil : int
+        Number of cross-section rings along the centreline used as the
+        structured seed for gmsh (resolution along the helix axis).
+    mesh_size : float
+        Target element size.
+    open_ends : bool
+        When ``True`` (default) end caps are omitted (open tube).
+        When ``False`` flat end caps are added.
+    random_factor : float
+        Mesh.RandomFactor passed to gmsh (default 0.1).  Increase for a more
+        irregular triangulation.
+
+    Returns
+    -------
+    verts : ndarray, shape (N, 3)
+    faces : ndarray, shape (F, 3), dtype int64
+    """
+    R = float(coil_radius)
+    r = float(tube_radius)
+    h = float(pitch)
+    n_tube = max(6, int(round(2.0 * np.pi * r / mesh_size)))
+
+    # ── centreline ──────────────────────────────────────────────────────────
+    t = np.linspace(0.0, 2.0 * np.pi * n_turns, n_coil + 1, endpoint=True)
+    cx = R * np.cos(t)
+    cy = R * np.sin(t)
+    cz = h * t / (2.0 * np.pi)
+
+    # ── Frenet–Serret frame ──────────────────────────────────────────────────
+    dcx = -R * np.sin(t)
+    dcy =  R * np.cos(t)
+    dcz =  np.full_like(t, h / (2.0 * np.pi))
+    tang = np.stack([dcx, dcy, dcz], axis=1)
+    tang /= np.linalg.norm(tang, axis=1, keepdims=True)
+
+    dnorm = np.gradient(tang, axis=0)
+    nlen  = np.linalg.norm(dnorm, axis=1, keepdims=True)
+    norm  = np.where(nlen > 1e-12, dnorm / (nlen + 1e-30), np.zeros_like(dnorm))
+    for i in np.where(nlen.ravel() < 1e-12)[0]:
+        arb = np.array([0.0, 0.0, 1.0])
+        v   = arb - np.dot(arb, tang[i]) * tang[i]
+        vl  = np.linalg.norm(v)
+        norm[i] = v / vl if vl > 1e-12 else np.array([1.0, 0.0, 0.0])
+
+    binom = np.cross(tang, norm)
+    binom /= np.linalg.norm(binom, axis=1, keepdims=True) + 1e-30
+
+    # ── tube rings ───────────────────────────────────────────────────────────
+    theta = np.linspace(0.0, 2.0 * np.pi, n_tube, endpoint=False)
+    centres  = np.stack([cx, cy, cz], axis=1)[:, np.newaxis, :]
+    offsets  = r * (np.cos(theta)[np.newaxis, :, np.newaxis] * norm[:, np.newaxis, :]
+                  + np.sin(theta)[np.newaxis, :, np.newaxis] * binom[:, np.newaxis, :])
+    ring_verts = centres + offsets          # (n_coil+1, n_tube, 3)
+    verts_init = ring_verts.reshape(-1, 3)
+
+    # ── structured triangles ─────────────────────────────────────────────────
+    faces_list = []
+    for i in range(n_coil):
+        for j in range(n_tube):
+            jn = (j + 1) % n_tube
+            a, b = i * n_tube + j,  i * n_tube + jn
+            c, d = (i+1)*n_tube + j, (i+1)*n_tube + jn
+            faces_list.append([a, b, d])
+            faces_list.append([a, d, c])
+
+    verts_struct = verts_init.copy()
+
+    # ── optional end caps (structured) ──────────────────────────────────────
+    if not open_ends:
+        cap0 = verts_struct[:n_tube].mean(axis=0)
+        ci0  = len(verts_struct)
+        verts_struct = np.vstack([verts_struct, cap0[np.newaxis, :]])
+        for j in range(n_tube):
+            faces_list.append([ci0, j, (j+1) % n_tube])
+        cap1 = ring_verts[-1].mean(axis=0)
+        ci1  = len(verts_struct)
+        verts_struct = np.vstack([verts_struct, cap1[np.newaxis, :]])
+        base = n_coil * n_tube
+        for j in range(n_tube):
+            faces_list.append([ci1, base + (j+1) % n_tube, base + j])
+
+    faces_struct = np.array(faces_list, dtype=np.int64)
+
+    # ── gmsh remesh: discrete surface → unstructured Delaunay ────────────────
+    try:
+        import gmsh
+    except ImportError as e:
+        raise ImportError("gmsh is required for coil_tube: pip install gmsh") from e
+
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Verbosity", 0)
+    gmsh.model.add("coil_tube")
+
+    try:
+        # Create a discrete surface entity
+        gmsh.model.addDiscreteEntity(2, 1)
+
+        # Inject the structured nodes (1-based tags)
+        n_verts = len(verts_struct)
+        node_tags = np.arange(1, n_verts + 1, dtype=np.uint64)
+        gmsh.model.mesh.addNodes(2, 1,
+                                  node_tags,
+                                  verts_struct.flatten())
+
+        # Inject structured triangles (1-based node refs)
+        n_faces = len(faces_struct)
+        elem_tags = np.arange(1, n_faces + 1, dtype=np.uint64)
+        conn = (faces_struct + 1).flatten().astype(np.uint64)
+        gmsh.model.mesh.addElements(2, 1, [2], [elem_tags], [conn])
+
+        # Classify surfaces: detect feature edges (angle threshold = π → no
+        # feature splitting), create boundary curves, then geometry
+        gmsh.model.mesh.classifySurfaces(
+            np.pi,        # angle: no feature edges on smooth tube
+            True,         # boundary
+            True,         # forReparametrization
+            np.pi,        # curveAngle
+        )
+        gmsh.model.mesh.createGeometry()
+
+        # Remesh with unstructured Delaunay
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
+        gmsh.option.setNumber("Mesh.Algorithm", 5)   # Delaunay
+        gmsh.option.setNumber("Mesh.RandomFactor", random_factor)
+        gmsh.model.mesh.generate(2)
+        gmsh.model.mesh.optimize("Laplace2D")
+
+        # Extract result
+        node_tags_out, coords_out, _ = gmsh.model.mesh.getNodes()
+        verts_out = coords_out.reshape(-1, 3).astype(np.float64)
+        tag_to_idx = np.empty(int(node_tags_out.max()) + 1, dtype=np.int64)
+        tag_to_idx[node_tags_out.astype(np.int64)] = np.arange(len(node_tags_out))
+
+        faces_out = []
+        for dim_tag in gmsh.model.getEntities(2):
+            etypes, _, enodes = gmsh.model.mesh.getElements(dim=2, tag=dim_tag[1])
+            for et, en in zip(etypes, enodes):
+                if et == 2:  # 3-node triangle
+                    faces_out.append(tag_to_idx[en.astype(np.int64)].reshape(-1, 3))
+
+        if not faces_out:
+            raise RuntimeError("gmsh produced no triangles; falling back is not done")
+
+        faces_final = np.vstack(faces_out).astype(np.int64)
+
+    finally:
+        gmsh.finalize()
+
+    return _reindex(verts_out, faces_final)
+    coil_radius: float = 1.0,

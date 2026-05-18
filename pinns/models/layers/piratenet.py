@@ -4,7 +4,6 @@ Composable PirateNet layer for use inside :class:`~pinns.modelbase.ModelBase`.
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from typing import Dict, Optional
@@ -22,13 +21,17 @@ class PirateNetBlock(nn.Module):
     @nn.compact
     def __call__(self, x, U, V):
         act_fn = get_activation(self.activation)
-        alpha = self.param("alpha", nn.initializers.zeros, ())
-        f  = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="dense1")(x))
-        z1 = f * U + (1 - f) * V
-        g  = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="dense2")(z1))
-        z2 = g * U + (1 - g) * V
-        h  = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="dense3")(z2))
-        return alpha * h + (1 - alpha) * x
+        identity = x
+        output_dim = x.shape[-1]  # residual stream keeps embedding dimension
+
+        h = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="dense1")(x))
+        h = h * U + (1 - h) * V
+        h = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="dense2")(h))
+        h = h * U + (1 - h) * V
+        h = act_fn(DenseRWF(output_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="dense3")(h))
+
+        alpha = self.param("alpha", nn.initializers.zeros, (1,))
+        return alpha * h + (1 - alpha) * identity
 
 
 class PirateNetModule(nn.Module):
@@ -38,6 +41,7 @@ class PirateNetModule(nn.Module):
     hidden_dim: int
     n_blocks: int = 3
     activation: str = "tanh"
+    output_activation: Optional[str] = None
     rwf_mu: float = 0.5
     rwf_sigma: float = 0.1
     output_projection: bool = True
@@ -47,18 +51,20 @@ class PirateNetModule(nn.Module):
         act_fn = get_activation(self.activation)
         U = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="U_layer")(x))
         V = act_fn(DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="V_layer")(x))
-        h = DenseRWF(self.hidden_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="input_projection")(x)
+        # No input projection: residual stream starts directly from embedding x
         for i in range(self.n_blocks):
-            h = PirateNetBlock(
+            x = PirateNetBlock(
                 hidden_dim=self.hidden_dim,
                 activation=self.activation,
                 rwf_mu=self.rwf_mu,
                 rwf_sigma=self.rwf_sigma,
                 name=f"block_{i}",
-            )(h, U, V)
+            )(x, U, V)
         if self.output_projection:
-            return DenseRWF(self.output_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="output")(h)
-        return h
+            x = DenseRWF(self.output_dim, rwf_mu=self.rwf_mu, rwf_sigma=self.rwf_sigma, name="output")(x)
+        if self.output_activation is not None:
+            x = get_activation(self.output_activation)(x)
+        return x
 
 
 class PirateNet:
@@ -77,6 +83,9 @@ class PirateNet:
         Number of residual blocks (default 3).
     activation : str
         Activation function name (default ``'tanh'``).
+    output_activation : str or None, optional
+        Activation applied to the final output (e.g. ``'tanh'`` to bound
+        outputs to (-1, 1)).  ``None`` (default) means linear output.
     rwf_mu, rwf_sigma : float
         Random Weight Factorisation parameters.
     output_dim : int or None, optional
@@ -89,15 +98,17 @@ class PirateNet:
         hidden_dim: int,
         n_blocks: int = 3,
         activation: str = "tanh",
+        output_activation: Optional[str] = None,
         rwf_mu: float = 0.5,
         rwf_sigma: float = 0.1,
         output_dim: Optional[int] = None,
     ):
-        self.hidden_dim = hidden_dim
-        self.n_blocks   = n_blocks
-        self.activation = activation
-        self.rwf_mu     = rwf_mu
-        self.rwf_sigma  = rwf_sigma
+        self.hidden_dim        = hidden_dim
+        self.n_blocks          = n_blocks
+        self.activation        = activation
+        self.output_activation = output_activation
+        self.rwf_mu            = rwf_mu
+        self.rwf_sigma         = rwf_sigma
         self._output_dim_override = output_dim
         self._module: Optional[PirateNetModule] = None
         self._input_dim: Optional[int] = None
@@ -113,6 +124,7 @@ class PirateNet:
             hidden_dim=self.hidden_dim,
             n_blocks=self.n_blocks,
             activation=self.activation,
+            output_activation=self.output_activation,
             rwf_mu=self.rwf_mu,
             rwf_sigma=self.rwf_sigma,
             output_projection=output_projection,
@@ -128,9 +140,10 @@ class PirateNet:
         return self._module.apply(params, x)
 
     def __repr__(self) -> str:
+        out_act = f", output_activation={self.output_activation!r}" if self.output_activation else ""
         return (
             f"PirateNet(input_dim={self._input_dim}, hidden_dim={self.hidden_dim}, "
-            f"n_blocks={self.n_blocks}, output_dim={self._output_dim})"
+            f"n_blocks={self.n_blocks}, output_dim={self._output_dim}{out_act})"
         )
 
 

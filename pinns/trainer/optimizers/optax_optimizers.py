@@ -25,7 +25,7 @@ class AdamOptimizer(BaseOptimizer):
     b1:
         Exponential decay for the 1st moment (default 0.9).
     b2:
-        Exponential decay for the 2nd moment (default 0.999).
+        Exponential decay for the 2nd moment (default 0.99).
     eps:
         Numerical stability constant (default 1e-8).
     """
@@ -36,7 +36,7 @@ class AdamOptimizer(BaseOptimizer):
         self,
         learning_rate: float = 1e-3,
         b1: float = 0.9,
-        b2: float = 0.999,
+        b2: float = 0.99,
         eps: float = 1e-8,
         **kwargs,
     ) -> None:

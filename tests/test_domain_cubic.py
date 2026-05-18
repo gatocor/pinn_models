@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 from pinns.domain import DomainCubic
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -301,6 +300,60 @@ class TestSampleInterior:
         pts = self.dp.sample_interior(100, mode='per_partition', rng=RNG)
         assert pts.shape == (100, 2)
 
+    def test_t_interval_restricts_time(self):
+        d = DomainCubic([(0, 1)], time=[0, 1])
+        pts = d.sample_interior(200, t_interval=[0.2, 0.5], rng=RNG)
+        assert pts.shape == (200, 2)
+        assert np.all(pts[:, 1] >= 0.2)
+        assert np.all(pts[:, 1] <= 0.5)
+
+    def test_t_interval_no_time_raises(self):
+        d = DomainCubic([(0, 1)])
+        with pytest.raises(ValueError):
+            d.sample_interior(100, t_interval=[0.0, 0.5], rng=RNG)
+
+    def test_t_interval_out_of_bounds_raises(self):
+        d = DomainCubic([(0, 1)], time=[0, 1])
+        with pytest.raises(ValueError):
+            d.sample_interior(100, t_interval=[-0.1, 0.5], rng=RNG)
+        with pytest.raises(ValueError):
+            d.sample_interior(100, t_interval=[0.5, 1.5], rng=RNG)
+
+    def test_t_interval_lo_ge_hi_raises(self):
+        d = DomainCubic([(0, 1)], time=[0, 1])
+        with pytest.raises(ValueError):
+            d.sample_interior(100, t_interval=[0.6, 0.3], rng=RNG)
+
+# ===========================================================================
+# sample_initial
+# ===========================================================================
+
+class TestSampleInitial:
+    def test_shape(self):
+        d = DomainCubic([(0, 1)], time=[0, 1])
+        pts = d.sample_initial(100, rng=RNG)
+        assert pts.shape == (100, 2)
+
+    def test_time_column_is_t_min(self):
+        d = DomainCubic([(0, 1)], time=[0.5, 1.0])
+        pts = d.sample_initial(200, rng=RNG)
+        np.testing.assert_allclose(pts[:, 1], 0.5)
+
+    def test_spatial_in_bounds(self):
+        d = DomainCubic([(-1, 1), (0, 2)], time=[0, 1])
+        pts = d.sample_initial(300, rng=RNG)
+        assert _in_box(pts[:, :2], [-1, 0], [1, 2])
+
+    def test_2d_space_shape(self):
+        d = DomainCubic([(-1, 1), (0, 2)], time=[0, 1])
+        pts = d.sample_initial(100, rng=RNG)
+        assert pts.shape == (100, 3)
+        np.testing.assert_allclose(pts[:, 2], 0.0)
+
+    def test_no_time_raises(self):
+        d = DomainCubic([(0, 1)])
+        with pytest.raises(ValueError):
+            d.sample_initial(100, rng=RNG)
 
 # ===========================================================================
 # sample_boundary — basic shapes and bounds
@@ -376,6 +429,45 @@ class TestSampleBoundary:
         pts = self.dt.sample_boundary(100, rng=RNG)
         assert pts.shape == (100, 3)
 
+    def test_periodic_boundary(self):
+        d = DomainCubic([(0, 1), (0, 1)])
+        d.add_periodic('x', name='x_periodic')
+        pts = d.sample_boundary(100, region='x_periodic', rng=RNG)
+        assert pts.shape == (200, 2)
+        assert all(pts[:100,0] == pts[100:,0] - 1.0)
+        assert all(pts[:100,1] == pts[100:,1])
+
+    def test_t_interval_restricts_time(self):
+        d = DomainCubic([(0, 1)], time=[0, 1])
+        pts = d.sample_boundary(200, t_interval=[0.3, 0.7], rng=RNG)
+        assert pts.shape == (200, 2)
+        assert np.all(pts[:, 1] >= 0.3)
+        assert np.all(pts[:, 1] <= 0.7)
+
+    def test_t_interval_named_face(self):
+        d = DomainCubic([(0, 1)], time=[0, 1])
+        pts = d.sample_boundary(200, region='xmin', t_interval=[0.0, 0.4], rng=RNG)
+        assert pts.shape == (200, 2)
+        np.testing.assert_allclose(pts[:, 0], 0.0)
+        assert np.all(pts[:, 1] >= 0.0)
+        assert np.all(pts[:, 1] <= 0.4)
+
+    def test_t_interval_no_time_raises(self):
+        d = DomainCubic([(0, 1)])
+        with pytest.raises(ValueError):
+            d.sample_boundary(100, t_interval=[0.0, 0.5], rng=RNG)
+
+    def test_t_interval_out_of_bounds_raises(self):
+        d = DomainCubic([(0, 1)], time=[0, 1])
+        with pytest.raises(ValueError):
+            d.sample_boundary(100, t_interval=[-0.1, 0.5], rng=RNG)
+        with pytest.raises(ValueError):
+            d.sample_boundary(100, t_interval=[0.5, 1.5], rng=RNG)
+
+    def test_t_interval_lo_ge_hi_raises(self):
+        d = DomainCubic([(0, 1)], time=[0, 1])
+        with pytest.raises(ValueError):
+            d.sample_boundary(100, t_interval=[0.6, 0.3], rng=RNG)
 
 # ===========================================================================
 # add_inner

@@ -9,10 +9,16 @@ from .scheduler_resample import SchedulerResample
 from .scheduler_adaptive_resample import SchedulerAdaptiveResample
 from .scheduler_curriculum import SchedulerCurriculum
 from .scheduler_lagrange import SchedulerLagrange
+from .scheduler_grad_norm import SchedulerGradNorm
+from .scheduler_causal import SchedulerCausal
+from .scheduler_warmup_decay import SchedulerWarmupDecay
+from .scheduler_ntk import SchedulerNTK
 
 __all__ = [
     "Scheduler", "is_notebook",
     "SchedulerExponentialDecay", "SchedulerReduceLROnPlateau",
     "SchedulerResample", "SchedulerAdaptiveResample",
     "SchedulerCurriculum", "SchedulerLagrange",
+    "SchedulerGradNorm", "SchedulerCausal",
+    "SchedulerWarmupDecay", "SchedulerNTK",
 ]

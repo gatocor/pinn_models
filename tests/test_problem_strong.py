@@ -1,6 +1,7 @@
 """Test suite for ProblemStrong."""
 import numpy as np
 import pytest
+import jax.numpy as jnp
 
 from pinns.domain import DomainCubic
 from pinns.problems.problem_strong import ProblemStrong
@@ -387,3 +388,240 @@ class TestResolveOutputs:
         p = ProblemStrong(_domain_1d(), ['u'])
         with pytest.raises(ValueError, match="out of range"):
             p._resolve_outputs(5)
+
+
+# ---------------------------------------------------------------------------
+# Periodic residual — functional correctness
+# ---------------------------------------------------------------------------
+
+class _FakeNet:
+    """Minimal JAX-traceable network whose output is defined by *fn*.
+
+    ``apply(params, x, pdict)`` ignores *params* and *pdict* and simply
+    evaluates ``fn(x)`` as a JAX array with shape ``(n, 1)``.
+    """
+    def __init__(self, fn):
+        self.fn = fn
+        self.params = {}
+
+    def apply(self, params, x, pdict=None):
+        return self.fn(x).reshape(-1, 1)
+
+
+class TestPeriodicResidual:
+    """Verify that the periodic residual is zero for a truly periodic function
+    and non-zero for a non-periodic one, for both value and derivative matching.
+
+    Domain: x ∈ [-1, 1], t ∈ [0, 1].
+    Periodic axis: x  →  pairs (-1, t) ↔ (+1, t).
+
+    Periodic function  :  u(x, t) = cos(π x)
+        u(-1) = cos(-π) = -1,  u(1) = cos(π) = -1   → diff = 0 ✓
+        u_x(-1) = -π sin(-π) = 0,  u_x(1) = -π sin(π) = 0  → diff = 0 ✓
+
+    Non-periodic function:  u(x, t) = x² + x
+        u(-1) = 0,  u(1) = 2          → diff = -2 ✗
+        u_x(-1) = -1,  u_x(1) = 3     → diff = -4 ✗
+    """
+
+    RNG = np.random.default_rng(42)
+    N = 50  # number of paired samples
+
+    def _setup(self, net_fn, match_x_derivative=1):
+        """Build domain, problem, network and return (residual_fn, data)."""
+        d = DomainCubic(space=[(-1.0, 1.0)], time=(0.0, 1.0))
+        d.add_periodic('x', name='per')
+        p = ProblemStrong(d, ['u'])
+        p.add_periodic('per', name='per', component=0,
+                        match_x_derivative=match_x_derivative)
+        net = _FakeNet(net_fn)
+        res_fn = p.make_residual_fn(net)
+
+        # Build paired data: x_a at x=-1, x_b at x=+1, same t
+        t = self.RNG.uniform(0, 1, (self.N, 1))
+        x_a = np.hstack([np.full((self.N, 1), -1.0), t])
+        x_b = np.hstack([np.full((self.N, 1),  1.0), t])
+        data = {'per': np.vstack([x_a, x_b]).astype(np.float32)}
+        return res_fn, data
+
+    # -- periodic function: u = cos(π x) ------------------------------------
+
+    def test_periodic_value_residual_is_zero(self):
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0])
+        res_fn, data = self._setup(net_fn, match_x_derivative=0)
+        R = res_fn({}, data)['per']
+        np.testing.assert_allclose(np.array(R), 0.0, atol=1e-5)
+
+    def test_periodic_value_and_deriv_residual_is_zero(self):
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0])
+        res_fn, data = self._setup(net_fn, match_x_derivative=1)
+        R = res_fn({}, data)['per']
+        np.testing.assert_allclose(np.array(R), 0.0, atol=1e-5)
+
+    def test_periodic_second_deriv_residual_is_zero(self):
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0])
+        res_fn, data = self._setup(net_fn, match_x_derivative=2)
+        R = res_fn({}, data)['per']
+        np.testing.assert_allclose(np.array(R), 0.0, atol=1e-5)
+
+    # -- non-periodic function: u = x² + x ----------------------------------
+
+    def test_non_periodic_value_residual_nonzero(self):
+        # u(-1)=0, u(1)=2  → residual = -2
+        net_fn = lambda x: x[:, 0] ** 2 + x[:, 0]
+        res_fn, data = self._setup(net_fn, match_x_derivative=0)
+        R = np.array(res_fn({}, data)['per'][:, 0])
+        np.testing.assert_allclose(R, -2.0, atol=1e-5)
+
+    def test_non_periodic_deriv_residual_nonzero(self):
+        # u_x(-1)=-1, u_x(1)=3  → derivative residual column = -4
+        net_fn = lambda x: x[:, 0] ** 2 + x[:, 0]
+        res_fn, data = self._setup(net_fn, match_x_derivative=1)
+        R = np.array(res_fn({}, data)['per'][:, 1])
+        np.testing.assert_allclose(R, -4.0, atol=1e-5)
+
+    # -- residual shape checks -----------------------------------------------
+
+    def test_residual_shape_value_only(self):
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0])
+        res_fn, data = self._setup(net_fn, match_x_derivative=0)
+        R = res_fn({}, data)['per']
+        assert R.shape == (self.N, 1)
+
+    def test_residual_shape_with_first_deriv(self):
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0])
+        res_fn, data = self._setup(net_fn, match_x_derivative=1)
+        R = res_fn({}, data)['per']
+        assert R.shape == (self.N, 2)  # value + 1st deriv
+
+    def test_residual_shape_with_second_deriv(self):
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0])
+        res_fn, data = self._setup(net_fn, match_x_derivative=2)
+        R = res_fn({}, data)['per']
+        assert R.shape == (self.N, 3)  # value + 1st + 2nd deriv
+
+
+# ---------------------------------------------------------------------------
+# Periodic residual — 2-D spatial + time
+# ---------------------------------------------------------------------------
+
+class TestPeriodicResidual2D:
+    """
+    Domain: x ∈ [-1, 1], y ∈ [0, 1], t ∈ [0, 1].
+    Columns: [x, y, t]  (col 0 = x, col 1 = y, col 2 = t).
+    Periodic BC on the x-axis pairs (-1, y, t) ↔ (+1, y, t).
+
+    Time- and y-varying functions are used deliberately so that any
+    mis-alignment of the non-periodic coordinates (y, t) between the two
+    sides of a pair would produce a non-zero residual — exposing incorrect
+    point pairing in the sampling code.
+    """
+
+    RNG = np.random.default_rng(7)
+    N = 60
+
+    def _setup(self, net_fn, match_x_derivative=1):
+        """Build 2-D+time domain/problem, return (residual_fn, network)."""
+        d = DomainCubic(space=[(-1.0, 1.0), (0.0, 1.0)], time=(0.0, 1.0))
+        d.add_periodic('x', name='per_x')
+        p = ProblemStrong(d, ['u'])
+        p.add_periodic('per_x', name='per_x', component=0,
+                        match_x_derivative=match_x_derivative)
+        net = _FakeNet(net_fn)
+        res_fn = p.make_residual_fn(net)
+        return res_fn, net
+
+    def _make_data(self, y=None, t=None, t_b_override=None, y_b_override=None):
+        """Build (2N, 3) paired array; optionally override y/t on the b side."""
+        rng = self.RNG
+        _y = rng.uniform(0, 1, (self.N, 1)) if y is None else y
+        _t = rng.uniform(0, 1, (self.N, 1)) if t is None else t
+        x_a = np.hstack([np.full((self.N, 1), -1.0), _y, _t])
+        _y_b = _y if y_b_override is None else y_b_override
+        _t_b = _t if t_b_override is None else t_b_override
+        x_b = np.hstack([np.full((self.N, 1), 1.0), _y_b, _t_b])
+        return {'per_x': np.vstack([x_a, x_b]).astype(np.float32)}
+
+    # -- periodic in x, time-varying: u = cos(πx) · t² ----------------------
+
+    def test_time_varying_periodic_zero_residual(self):
+        """cos(πx)·t² is periodic in x at any t; value residual must be zero."""
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0]) * x[:, 2] ** 2
+        res_fn, net = self._setup(net_fn, match_x_derivative=0)
+        R = res_fn(net.params, self._make_data())['per_x']
+        np.testing.assert_allclose(np.array(R), 0.0, atol=1e-5)
+
+    def test_time_varying_periodic_deriv_zero_residual(self):
+        """cos(πx)·t² is periodic including its x-derivative at any t."""
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0]) * x[:, 2] ** 2
+        res_fn, net = self._setup(net_fn, match_x_derivative=1)
+        R = res_fn(net.params, self._make_data())['per_x']
+        np.testing.assert_allclose(np.array(R), 0.0, atol=1e-4)
+
+    def test_time_misaligned_gives_nonzero(self):
+        """Mismatched t between a/b sides turns a spatially-periodic function
+        into a nonzero residual, proving t alignment is required.
+
+        u = cos(πx)·t²:
+          u_a = cos(-π)·t_a² = -t_a²
+          u_b = cos(+π)·t_b² = -t_b²
+          residual = u_a - u_b = t_b² - t_a²  (non-zero when t_b ≠ t_a)
+        """
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0]) * x[:, 2] ** 2
+        res_fn, net = self._setup(net_fn, match_x_derivative=0)
+        t_a = self.RNG.uniform(0, 0.7, (self.N, 1)).astype(np.float32)
+        t_b = (t_a + 0.3).astype(np.float32)   # constant offset guarantees t_a ≠ t_b
+        data = self._make_data(t=t_a, t_b_override=t_b)
+        R = np.array(res_fn(net.params, data)['per_x'][:, 0])
+        expected = (t_b ** 2 - t_a ** 2).ravel()
+        np.testing.assert_allclose(R, expected, atol=1e-5)
+
+    # -- periodic in x with y and t: u = cos(πx) · sin(πy) · t --------------
+
+    def test_y_t_periodic_zero_residual(self):
+        """cos(πx)·sin(πy)·t is periodic in x for any aligned (y, t) pair."""
+        net_fn = (lambda x:
+                  jnp.cos(jnp.pi * x[:, 0]) * jnp.sin(jnp.pi * x[:, 1]) * x[:, 2])
+        res_fn, net = self._setup(net_fn, match_x_derivative=0)
+        R = res_fn(net.params, self._make_data())['per_x']
+        np.testing.assert_allclose(np.array(R), 0.0, atol=1e-5)
+
+    def test_y_misaligned_gives_nonzero(self):
+        """Mismatched y between a/b sides makes residual nonzero when u depends on y.
+
+        u = cos(πx) + y:
+          u(-1, y_a, t) = -1 + y_a,  u(+1, y_b, t) = -1 + y_b
+          residual = (y_a - y_b) = -0.3  for all points.
+        """
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0]) + x[:, 1]
+        res_fn, net = self._setup(net_fn, match_x_derivative=0)
+        y_a = self.RNG.uniform(0, 0.7, (self.N, 1)).astype(np.float32)
+        y_b = (y_a + 0.3).astype(np.float32)
+        data = self._make_data(y=y_a, y_b_override=y_b)
+        R = np.array(res_fn(net.params, data)['per_x'][:, 0])
+        np.testing.assert_allclose(R, -0.3, atol=1e-5)
+
+    def test_y_aligned_periodic_plus_y_zero(self):
+        """cos(πx) + y is periodic when y is aligned between pairs."""
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0]) + x[:, 1]
+        res_fn, net = self._setup(net_fn, match_x_derivative=0)
+        R = res_fn(net.params, self._make_data())['per_x']
+        np.testing.assert_allclose(np.array(R), 0.0, atol=1e-5)
+
+    # -- non-periodic in x: u = x + y · t -----------------------------------
+
+    def test_non_periodic_2d_value_residual(self):
+        """u = x + y·t: u(-1, y, t) = -1+yt, u(+1, y, t) = 1+yt → diff = -2."""
+        net_fn = lambda x: x[:, 0] + x[:, 1] * x[:, 2]
+        res_fn, net = self._setup(net_fn, match_x_derivative=0)
+        R = np.array(res_fn(net.params, self._make_data())['per_x'][:, 0])
+        np.testing.assert_allclose(R, -2.0, atol=1e-5)
+
+    # -- output shape --------------------------------------------------------
+
+    def test_residual_shape_2d_with_deriv(self):
+        """With match_x_derivative=1 the output has 2 columns (value + 1st deriv)."""
+        net_fn = lambda x: jnp.cos(jnp.pi * x[:, 0]) * x[:, 2]
+        res_fn, net = self._setup(net_fn, match_x_derivative=1)
+        R = res_fn(net.params, self._make_data())['per_x']
+        assert R.shape == (self.N, 2)

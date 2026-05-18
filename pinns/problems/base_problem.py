@@ -83,6 +83,16 @@ class BaseProblem:
         """Alias for :attr:`fixed_params` (backward compat with ProblemWeak API)."""
         return self.fixed_params
 
+    @property
+    def xmin(self):
+        """Lower bounds of the domain — proxy for ``domain.xmin``."""
+        return self.domain.xmin
+
+    @property
+    def xmax(self):
+        """Upper bounds of the domain — proxy for ``domain.xmax``."""
+        return self.domain.xmax
+
     @params.setter
     def params(self, value: Dict[str, Any]) -> None:
         self.fixed_params = value
@@ -286,11 +296,19 @@ class BaseProblem:
         Collocation points are sampled at ``t = t_min`` from the domain
         interior.  Requires the domain to have a time axis.
 
+        For multi-output problems *outputs* must be specified to select which
+        components to enforce and determine the per-component term names.
+        Passing ``outputs=['u', 'v']`` registers terms ``'ic_u'`` and
+        ``'ic_v'``.  In the compile dict the **base** name ``'ic'`` may be
+        used as a shorthand and will automatically expand to every term whose
+        name starts with ``'ic_'``, applying the same train/test/weight config
+        to all of them.
+
         Args:
             fn_or_value: Callable ``fn(x, u, pars, *args) -> residual`` **or**
                 a scalar/array constant ``u0`` (creates residual
                 ``u[:, out] - u0`` automatically).
-            name: Unique label.  Default ``'ic'``.
+            name: Base label.  Default ``'ic'``.
             outputs: Which output(s) this term applies to.  ``None`` is only
                 allowed when ``n_outputs == 1``.
 
@@ -351,6 +369,7 @@ class BaseProblem:
         region: str,
         name: str,
         component=None,
+        match_x_derivative: int = 1,
     ) -> 'BaseProblem':
         """Register a **periodic** BC using a pre-registered domain pairing.
 
@@ -362,6 +381,9 @@ class BaseProblem:
             region: Key in ``domain._periodic_regions`` identifying the pairing.
             name: Unique label for this term.
             component: Network output component to enforce, or ``None`` for all.
+            match_x_derivative: Number of spatial-derivative orders to match.
+                ``0`` — field values only; ``1`` — also ``du/dx``;
+                ``2`` — also ``d²u/dx²``; etc.  Default ``1``.
 
         Returns:
             ``self`` for method chaining.
@@ -378,7 +400,12 @@ class BaseProblem:
                 f"Registered: {list(periodic_regions.keys())}"
             )
         self._terms.append(
-            TermPeriodicBC(region=region, component=component, name=name)
+            TermPeriodicBC(
+                region=region,
+                component=component,
+                name=name,
+                match_x_derivative=int(match_x_derivative),
+            )
         )
         return self
 
@@ -559,7 +586,8 @@ class BaseProblem:
         """Return the params dict passed to ``term.fn(x, u, params, deriv)``.
 
         Returns:
-            ``{"fixed": fixed_params, "infer": {}, "internal": {...}}``
+            ``{"fixed": fixed_params, "infer": {}, "internal": {...},
+               "domain": domain}``
         """
         if internal is None:
             internal = {'global_step': 0, 'step': 0}
@@ -567,6 +595,7 @@ class BaseProblem:
             "fixed":    self.fixed_params,
             "infer":    {},
             "internal": internal,
+            "domain":   self.domain,
         }
 
     # ──────────────────────────────────────────────────────────────────── #

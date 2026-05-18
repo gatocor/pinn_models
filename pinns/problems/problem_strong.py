@@ -226,7 +226,7 @@ class ProblemStrong(BaseProblem):
     # Sampling interface
     # ------------------------------------------------------------------
 
-    def sample(self, train_samples=None, rng=None):
+    def sample(self, train_samples=None, t_interval=None, rng=None):
         """Sample collocation points for every registered term.
 
         Args:
@@ -243,25 +243,23 @@ class ProblemStrong(BaseProblem):
         if rng is None:
             rng = _np.random.default_rng()
         if train_samples is None:
-            train_samples = {}
+            raise ValueError("train_samples dict is required for ProblemStrong sampling.")
         domain = self.domain
         params = self._build_params()
         data = {}
         for term in self._terms:
-            n = train_samples.get(term.name,
-                                  1000 if term.kind in ('inner', 'initial') else 10)
+            n = train_samples.get(term.name)
+            if n is None:
+                raise ValueError(f"Number of samples for term '{term.name}' is not specified in train_samples.")
             if n <= 0:
                 continue
             region = None if term.region == 'all' else term.region
             if term.kind == 'inner':
-                pts = domain.sample_interior(n, region=region, rng=rng, params=params)
+                pts = domain.sample_interior(n, region=region, t_interval=t_interval, rng=rng, params=params)
             elif term.kind == 'initial':
-                pts = domain.sample_interior(n, rng=rng, params=params)
-                t_dim = getattr(domain, '_spatial_dims', 0)
-                if t_dim < pts.shape[1]:
-                    pts[:, t_dim] = domain.xmin[t_dim]
+                pts = domain.sample_initial(n, region=region, t_interval=t_interval, rng=rng, params=params)
             else:
-                pts = domain.sample_boundary(n, region=region, rng=rng, params=params)
+                pts = domain.sample_boundary(n, region=region, t_interval=t_interval, rng=rng, params=params)
             data[term.name] = pts
         return data
 
@@ -304,6 +302,7 @@ class ProblemStrong(BaseProblem):
             ``residual_fn(params, data) -> dict[str, jnp.ndarray]``
         """
         import inspect as _inspect
+        import jax
         import jax.numpy as jnp
         from pinns.functional import make_derivative_fn
 
@@ -314,21 +313,78 @@ class ProblemStrong(BaseProblem):
         def _model_apply(params, x):
             return network.apply(params, x, _params_dict)
 
-        def _call_fn(fn, x, u, deriv_fn):
-            """Dispatch fn(x,u[,params_dict[,deriv_fn]]) → tuple of residuals."""
+        def _call_fn(fn, x, u, deriv_fn, _p):
+            """Dispatch fn(x,u[,params_dict[,deriv_fn]]) → tuple of residuals.
+
+            Single-argument callables ``fn(x)`` are treated as value functions
+            returning target arrays; the caller is responsible for forming
+            ``u - target``.  A None sentinel is returned in that case so the
+            caller can detect it via ``raw is None``.
+            """
             if not callable(fn):
                 # Scalar constant target — caller uses output_idx to pick component
                 return (fn,)
             n_p = len(_inspect.signature(fn).parameters)
             if n_p >= 4:
-                raw = fn(x, u, _params_dict, deriv_fn)
+                raw = fn(x, u, _p, deriv_fn)
             elif n_p == 3:
-                raw = fn(x, u, _params_dict)
-            else:
+                raw = fn(x, u, _p)
+            elif n_p == 2:
                 raw = fn(x, u)
+            else:
+                # fn(x) -> target values (value function, not residual)
+                return None, fn(x)
             return raw if isinstance(raw, (list, tuple)) else (raw,)
 
+        def _split_residual(name, x, residual):
+            """Validate shape and split multi-column residuals into named sub-terms.
+
+            Returns
+            -------
+            dict[str, jnp.ndarray]
+                * Single-column ``(N,)`` or ``(N,1)``  → ``{name: (N,1)}``
+                * Multi-column  ``(N, K)`` with K > 1  → ``{name_0: (N,1), ..., name_{K-1}: (N,1)}``
+
+            Raises
+            ------
+            ValueError
+                If the residual is square ``(N, N)`` — the classic broadcast bug
+                from mixing ``(N,)`` with ``(N,1)`` derivative outputs.
+            """
+            if not hasattr(residual, 'shape'):
+                return {name: residual}
+            N = x.shape[0]
+            r = residual
+            if r.ndim == 1:
+                r = r[:, None]
+            # Catch (N, N) — the classic broadcast from mixing (N,) and (N,1)
+            if r.ndim == 2 and r.shape[0] == N and r.shape[1] == N and N > 1:
+                raise ValueError(
+                    f"Term '{name}': residual has square shape {r.shape} matching "
+                    f"N_samples={N}. This is almost certainly a broadcasting error. "
+                    "Make sure arrays in your residual function use consistent shapes: "
+                    "use U[:, 0:1] (shape (N,1)) instead of U[:, 0] (shape (N,)) "
+                    "so that arithmetic with derivative outputs (N,1) does not broadcast "
+                    "to (N,N)."
+                )
+            K = r.shape[1]
+            if K == 1:
+                return {name: r}
+            # Multi-column: split into name_0, name_1, ..., name_{K-1}
+            return {f"{name}_{i}": r[:, i:i+1] for i in range(K)}
+
         def residual_fn(params, data):
+            # Merge any dynamic fixed-param overrides passed through train_data.
+            # Keys prefixed '__fixed__' carry per-sample arrays (e.g. resampled
+            # surface normals) that must be explicit JIT arguments so JAX sees
+            # their updated values after every SchedulerResample refresh.
+            _dyn_fixed = {k[len('__fixed__'):]: data[k]
+                          for k in data if k.startswith('__fixed__')}
+            if _dyn_fixed:
+                _p = {**_params_dict, 'fixed': {**_params_dict['fixed'], **_dyn_fixed}}
+            else:
+                _p = _params_dict
+
             result = {}
             deriv_fn = make_derivative_fn(_model_apply, params)
             for term in _terms:
@@ -340,8 +396,20 @@ class ProblemStrong(BaseProblem):
 
                 if kind in ('inner', 'initial', 'boundary'):
                     fn = term.fn
-                    raw = _call_fn(fn, x, u, deriv_fn)
-                    if len(raw) == 1 and not callable(fn):
+                    raw = _call_fn(fn, x, u, deriv_fn, _p)
+                    if isinstance(raw, tuple) and len(raw) == 2 and raw[0] is None:
+                        # fn(x) -> target values
+                        col = getattr(term, 'output_idx', 0) or 0
+                        target = jnp.asarray(raw[1])
+                        if target.ndim == 1:
+                            target = target[:, None]
+                        # If the target function returns multiple columns (e.g. a
+                        # multi-output IC returning all species at once), slice to
+                        # only the column this term is responsible for.
+                        if target.ndim == 2 and target.shape[1] > 1:
+                            target = target[:, col:col + 1]
+                        residual = u[:, col:col + 1] - target
+                    elif len(raw) == 1 and not callable(fn):
                         # Scalar constant target
                         col = getattr(term, 'output_idx', 0) or 0
                         residual = u[:, col:col + 1] - float(raw[0])
@@ -353,7 +421,7 @@ class ProblemStrong(BaseProblem):
 
                 elif kind == 'dirichlet':
                     col = term.component
-                    target = jnp.asarray(term.get_value(x, _params_dict))
+                    target = jnp.asarray(term.get_value(x, _p))
                     if hasattr(target, 'ndim') and target.ndim == 2:
                         target = target[:, 0:1]
                     residual = u[:, col:col + 1] - target
@@ -364,41 +432,50 @@ class ProblemStrong(BaseProblem):
                             f"{kind.capitalize()} BC '{term.name}' has no pre-built fn. "
                             "Use add_neumann / add_robin to register it."
                         )
-                    raw = _call_fn(term.fn, x, u, deriv_fn)
+                    raw = _call_fn(term.fn, x, u, deriv_fn, _p)
                     residual = raw[0] if len(raw) == 1 else jnp.stack(raw, axis=-1)
 
                 elif kind == 'periodic':
                     _pts_p = jnp.asarray(x, dtype=jnp.float32)
                     _half  = _pts_p.shape[0] // 2
                     x_a, x_b = _pts_p[:_half], _pts_p[_half:]
-                    u_a = _model_apply(params, x_a)
-                    u_b = _model_apply(params, x_b)
-                    _n_out_p = u_a.shape[1]
+                    # One forward pass for both halves — halves model evals per term.
+                    _u_ab = _model_apply(params, _pts_p)
+                    u_a, u_b = _u_ab[:_half], _u_ab[_half:]
                     _comps_p = ([term.component] if term.component is not None
-                                else list(range(_n_out_p)))
+                                else list(range(u_a.shape[1])))
                     residual = jnp.concatenate(
                         [u_a[:, c:c+1] - u_b[:, c:c+1] for c in _comps_p], axis=1)
-                    if getattr(term, 'match_x_derivative', False):
-                        _dim_p = 1
-                        _ta = jnp.zeros_like(u_a[:, :1]).at[:, 0].set(0.0)  # placeholder
-                        _ta = jnp.zeros((u_a.shape[0], x_a.shape[-1] if hasattr(x_a, '__len__') else jnp.asarray(x_a).shape[-1])).at[:, _dim_p].set(1.0)
-                        _tb = jnp.zeros_like(_ta).at[:, _dim_p].set(1.0)
-                        _c0 = _comps_p[0]
-                        _xa_j = jnp.asarray(x_a, dtype=jnp.float32)
-                        _xb_j = jnp.asarray(x_b, dtype=jnp.float32)
-                        def _fa(xin): return _model_apply(params, xin)[:, _c0]
-                        def _fb(xin): return _model_apply(params, xin)[:, _c0]
-                        _, _ua_d = jax.jvp(_fa, (_xa_j,), (_ta,))
-                        _, _ub_d = jax.jvp(_fb, (_xb_j,), (_tb,))
-                        residual = jnp.concatenate(
-                            [residual, (_ua_d - _ub_d).reshape(-1, 1)], axis=1)
-                    result[term.name] = residual
+                    _n_derivs = int(getattr(term, 'match_x_derivative', 0))
+                    if _n_derivs > 0:
+                        _pinfo = getattr(_problem.domain, '_periodic_regions', {}).get(term.region, {})
+                        _axis  = _pinfo.get('axis', 'x')
+                        _ALBL  = getattr(_problem.domain, '_BOUNDARY_LABEL_MAP', {})
+                        _albl_key = f'{_axis}min'
+                        _dim_p = (_ALBL[_albl_key][0] if _albl_key in _ALBL
+                                  else {'x': 0, 'y': 1, 'z': 2, 't': -1}.get(_axis, 0))
+                        _tangent = jnp.zeros_like(x_a).at[:, _dim_p].set(1.0)
+
+                        def _nth_deriv(c, order, xi, tangent=_tangent):
+                            """Compute the *order*-th JVP of model[:,c] at xi."""
+                            f = lambda xin: _model_apply(params, xin)[:, c]
+                            for _ in range(order):
+                                f = lambda xin, _f=f: jax.jvp(_f, (xin,), (tangent,))[1]
+                            return f(xi)
+
+                        for _c in _comps_p:
+                            for _ord in range(1, _n_derivs + 1):
+                                _diff = _nth_deriv(_c, _ord, x_a) - _nth_deriv(_c, _ord, x_b)
+                                residual = jnp.concatenate(
+                                    [residual, _diff.reshape(-1, 1)], axis=1)
+                    result.update(_split_residual(term.name, x, residual))
                     continue
 
                 else:
                     continue
 
-                result[term.name] = _problem.assemble(term, residual)
+                for _key, _r in _split_residual(term.name, x, residual).items():
+                    result[_key] = _problem.assemble(term, _r)
             return result
 
         return residual_fn

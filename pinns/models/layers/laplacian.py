@@ -21,44 +21,100 @@ from .gnn import _interpolate_mesh
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_laplace_eigenvectors(
-    verts: np.ndarray,   # (n_nodes, 2)
+    verts: np.ndarray,   # (n_nodes, D)  — 2-D or 3-D vertex positions
     faces: np.ndarray,   # (n_faces, 3)  int
     K: int,
 ) -> np.ndarray:
     """
-    Compute the K eigenvectors of the normalised symmetric graph Laplacian
-    L_sym = D^{-1/2} (D - A) D^{-1/2} with the smallest eigenvalues.
+    Compute the K eigenvectors of the Laplace–Beltrami operator via the FEM
+    cotangent discretisation, solving the generalised eigenproblem:
+
+        A u = λ M u
+
+    where A is the cotangent stiffness matrix and M is the lumped mass matrix.
+    This is geometry-aware and mesh-size-independent, unlike the graph Laplacian.
 
     Returns
     -------
-    Phi : (n_nodes, K) float32, columns are L2-normalised eigenvectors.
-        The first column corresponds to the constant (λ=0) mode.
+    Phi : (n_nodes, K) float32, columns are mass-orthonormal eigenvectors
+        (φ_i^T M φ_j = δ_ij).  The first column is the constant (λ≈0) mode.
     """
     n = len(verts)
+    v = verts.astype(np.float64)
 
-    # Build adjacency from triangle edges
-    rows, cols = [], []
-    for face in faces:
-        for j in range(3):
-            v0, v1 = int(face[j]), int(face[(j + 1) % 3])
-            rows.extend([v0, v1])
-            cols.extend([v1, v0])
-    data = np.ones(len(rows), dtype=np.float64)
-    A = sp.csr_matrix((data, (rows, cols)), shape=(n, n))
-    # Cap at 1 (remove duplicate entries)
-    A.data = np.ones_like(A.data)
+    # Triangle vertex indices
+    i0, i1, i2 = faces[:, 0], faces[:, 1], faces[:, 2]
 
-    # Degree matrix
-    degree = np.array(A.sum(axis=1)).ravel()
-    d_inv_sqrt = 1.0 / np.sqrt(np.maximum(degree, 1.0))
-    D_inv_sqrt = sp.diags(d_inv_sqrt)
+    # Edge vectors within each triangle
+    e0 = v[i2] - v[i1]   # edge opposite vertex 0
+    e1 = v[i0] - v[i2]   # edge opposite vertex 1
+    e2 = v[i1] - v[i0]   # edge opposite vertex 2
 
-    # Normalised Laplacian: L_sym = I - D^{-1/2} A D^{-1/2}
-    L_sym = sp.eye(n, format='csr') - D_inv_sqrt @ A @ D_inv_sqrt
+    # Triangle areas (half the cross-product norm)
+    if v.shape[1] == 3:
+        cross = np.cross(e0, -e2)
+        areas = 0.5 * np.linalg.norm(cross, axis=1)  # (n_faces,)
+    else:
+        areas = 0.5 * np.abs(e0[:, 0] * (-e2[:, 1]) - e0[:, 1] * (-e2[:, 0]))
+    areas = np.maximum(areas, 1e-14)
 
-    # K smallest eigenpairs (including λ≈0 constant mode)
+    # Cotangent weights: cot(angle at vertex k) = (a · b) / (2 * area)
+    # where a, b are the two edge vectors FROM that vertex.
+    # At i0: edges from i0 are e2 (i0→i1) and -e1 (i0→i2)
+    # At i1: edges from i1 are e0 (i1→i2) and -e2 (i1→i0)
+    # At i2: edges from i2 are e1 (i2→i0) and -e0 (i2→i1)
+    cot0 = 0.5 * np.einsum('ij,ij->i',  e2, -e1) / areas   # cot(angle at i0)
+    cot1 = 0.5 * np.einsum('ij,ij->i',  e0, -e2) / areas   # cot(angle at i1)
+    cot2 = 0.5 * np.einsum('ij,ij->i',  e1, -e0) / areas   # cot(angle at i2)
+
+    # Clamp to avoid negative weights from obtuse triangles
+    cot0 = np.maximum(cot0, 0.0)
+    cot1 = np.maximum(cot1, 0.0)
+    cot2 = np.maximum(cot2, 0.0)
+
+    # Assemble stiffness matrix A (cotangent Laplacian).
+    # Edge (i1,i2) opposite i0: weight cot0/2  →  off-diag -cot0/2, diag +cot0/2
+    # Edge (i0,i2) opposite i1: weight cot1/2  →  off-diag -cot1/2, diag +cot1/2
+    # Edge (i0,i1) opposite i2: weight cot2/2  →  off-diag -cot2/2, diag +cot2/2
+    # 6 off-diagonal + 6 diagonal = 12 triplets per triangle
+    rows = np.concatenate([i1, i2, i0, i2, i0, i1,      # off-diag
+                            i1, i2, i0, i2, i0, i1])     # diagonal (same row)
+    cols = np.concatenate([i2, i1, i2, i0, i1, i0,      # off-diag (swapped)
+                            i1, i2, i0, i2, i0, i1])     # diagonal (same col)
+    data = np.concatenate([-0.5*cot0, -0.5*cot0,
+                            -0.5*cot1, -0.5*cot1,
+                            -0.5*cot2, -0.5*cot2,
+                             0.5*cot0,  0.5*cot0,
+                             0.5*cot1,  0.5*cot1,
+                             0.5*cot2,  0.5*cot2])
+    A_coo = sp.coo_matrix((data, (rows, cols)), shape=(n, n))
+    A_mat = A_coo.tocsr()
+
+    # Assemble lumped mass matrix M (one-third of surrounding triangle areas)
+    mass = np.zeros(n, dtype=np.float64)
+    np.add.at(mass, i0, areas / 3.0)
+    np.add.at(mass, i1, areas / 3.0)
+    np.add.at(mass, i2, areas / 3.0)
+    mass = np.maximum(mass, 1e-14)
+    M_mat = sp.diags(mass, format='csr')
+
+    # Solve generalised eigenproblem A u = λ M u.
+    # Since M is diagonal (lumped), transform to the equivalent standard form:
+    #   L_sym = M^{-1/2} A M^{-1/2},  u = M^{-1/2} v
+    # This avoids the slow shift-invert LU factorisation needed when passing M
+    # to eigsh.  We add a tiny diagonal shift so the null-space mode (λ≈0)
+    # doesn't cause convergence issues in ARPACK.
+    m_invsqrt = 1.0 / np.sqrt(mass)
+    M_invsqrt = sp.diags(m_invsqrt, format='csr')
+    L_sym = M_invsqrt @ A_mat @ M_invsqrt          # standard symmetric problem
+    L_reg = L_sym + 1e-8 * sp.eye(n, format='csr') # shift null-space away from 0
+
     K_req = min(K, n - 2)
-    eigenvalues, eigenvectors = spla.eigsh(L_sym, k=K_req, which='SM')
+    eigenvalues, vecs = spla.eigsh(L_reg, k=K_req, which='LM', sigma=0.0)
+    eigenvalues -= 1e-8   # undo shift
+
+    # Transform eigenvectors back: u = M^{-1/2} v, then mass-orthonormalise
+    eigenvectors = M_invsqrt @ vecs   # (n, K_req)
 
     # Sort by eigenvalue (ascending)
     order = np.argsort(eigenvalues)
@@ -145,6 +201,9 @@ class LaplacianFeatures:
         self._nodes_np    = None
         self._faces_np    = None
         self._Phi         = None
+        self._face_tree    = None
+        self._node_to_face = None
+        self._node_to_faces = None  # (n_verts, max_valence) all adjacent faces
 
         if domain is not None:
             self._build_from_domain(domain)
@@ -182,13 +241,33 @@ class LaplacianFeatures:
             )
 
         print(
-            f"LaplacianFeatures: computing {self.n_eig} Laplace eigenvectors "
-            f"for mesh with {len(verts)} nodes … ",
+            f"LaplacianFeatures: computing {self.n_eig + 1} Laplace eigenvectors "
+            f"for mesh with {len(verts)} nodes (dropping constant mode 0) … ",
             end="",
             flush=True,
         )
-        _Phi = _compute_laplace_eigenvectors(verts, faces, self.n_eig)
-        self._Phi = jnp.array(_Phi, dtype=jnp.float32)  # (n_nodes, n_eig)
+        _Phi = _compute_laplace_eigenvectors(verts, faces, self.n_eig + 1)
+        phi = jnp.array(_Phi[:, 1:], dtype=jnp.float32)  # drop mode 0, keep (n_nodes, n_eig)
+        phi = phi / jnp.abs(phi).max(axis=0, keepdims=True)  # normalize each mode to [-1, 1]
+        self._Phi = phi
+
+        # Precompute vertex→all-adjacent-faces map for 3-D meshes so
+        # _interpolate_mesh can find the BEST containing face (highest
+        # min barycentric coord) rather than one arbitrary adjacent face.
+        self._face_tree    = None   # kept for API compat, no longer used
+        self._node_to_face = None
+        self._node_to_faces = None
+        if verts.shape[1] == 3:
+            _v2f_lists = [[] for _ in range(len(verts))]
+            for _fi, _face in enumerate(faces):
+                for _vi in _face:
+                    _v2f_lists[_vi].append(_fi)
+            _max_val = max(len(fl) for fl in _v2f_lists)
+            _n2fs = np.full((len(verts), _max_val), -1, dtype=np.int32)
+            for _vi, _fl in enumerate(_v2f_lists):
+                _n2fs[_vi, :len(_fl)] = _fl
+            self._node_to_faces = jnp.array(_n2fs)  # (n_verts, max_valence)
+            self._node_to_face  = self._node_to_faces[:, 0]  # legacy compat
         print("done.")
 
     # ── ModelBase composable protocol ───────────────────────────────────── #
@@ -238,7 +317,8 @@ class LaplacianFeatures:
         nodes = jnp.array(self._nodes_np)
         faces = jnp.array(self._faces_np)
         x_spatial = x[:, : self.spatial_dims]
-        phi_x = _interpolate_mesh(self._Phi, nodes, faces, x_spatial)  # (n_pts, n_eig)
+        phi_x = _interpolate_mesh(self._Phi, nodes, faces, x_spatial,
+                                   node_to_faces=self._node_to_faces)  # (n_pts, n_eig)
 
         if self.n_context > 0:
             ctx = x[:, -self.n_context:]   # (n_pts, n_context)

@@ -219,40 +219,52 @@ class _MLPDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _barycentric_coords_all_triangles(
-    nodes: jnp.ndarray,    # (n_nodes, 2)
+    nodes: jnp.ndarray,    # (n_nodes, D)  D=2 or D=3
     faces: jnp.ndarray,    # (n_faces, 3)  int
-    query_x: jnp.ndarray,  # (n_query, 2)
+    query_x: jnp.ndarray,  # (n_query, D)
 ) -> tuple:
     """
-    Compute barycentric coordinates of every query point
-    w.r.t. every triangle.
+    Compute barycentric coordinates of every query point w.r.t. every triangle.
+
+    Works for both 2-D flat meshes (D=2) and 3-D surface meshes (D=3).
+    For 3-D meshes the query point is first projected onto the triangle plane
+    using the Gram-matrix formulation, which is equivalent to a least-squares
+    solution of the overdetermined system  [T0 | T1] [u; v] = (q - A).
 
     Returns
     -------
     u, v, w : each of shape (n_query, n_faces)
         Barycentric coords (v1, v2, v0 weight respectively).
     """
-    v0 = nodes[faces[:, 0]]   # (n_faces, 2)
+    v0 = nodes[faces[:, 0]]   # (n_faces, D)
     v1 = nodes[faces[:, 1]]
     v2 = nodes[faces[:, 2]]
 
-    # Broadcast: (n_query, n_faces, 2)
-    q  = query_x[:, None, :]   # (n_query, 1, 2)
-    A  = v0[None, :, :]        # (1, n_faces, 2)
+    # Broadcast: shapes become (n_query, n_faces, D)
+    q  = query_x[:, None, :]   # (n_query, 1, D)
+    A  = v0[None, :, :]        # (1, n_faces, D)
     B  = v1[None, :, :]
     C  = v2[None, :, :]
 
-    # Vectors from A
-    T0 = B - A   # (1, n_faces, 2)  edge AB
-    T1 = C - A   # (1, n_faces, 2)  edge AC
-    dX = q - A   # (n_query, n_faces, 2)
+    T0 = B - A   # (1, n_faces, D)  edge AB
+    T1 = C - A   # (1, n_faces, D)  edge AC
+    dX = q - A   # (n_query, n_faces, D)
 
-    # 2x2 linear system: [T0, T1] [u; v] = dX
-    det = T0[..., 0] * T1[..., 1] - T0[..., 1] * T1[..., 0]  # (1, n_faces)
+    # Gram matrix entries: Gij = Ti · Tj  (dot along last axis)
+    G00 = jnp.sum(T0 * T0, axis=-1)   # (1, n_faces)
+    G01 = jnp.sum(T0 * T1, axis=-1)
+    G11 = jnp.sum(T1 * T1, axis=-1)
+
+    # RHS: bi = Ti · dX
+    b0  = jnp.sum(T0 * dX, axis=-1)   # (n_query, n_faces)
+    b1  = jnp.sum(T1 * dX, axis=-1)
+
+    # Cramer's rule on the 2×2 Gram system
+    det = G00 * G11 - G01 * G01        # (1, n_faces)
     safe_det = jnp.where(jnp.abs(det) < 1e-15, 1e-15, det)
 
-    u = (dX[..., 0] * T1[..., 1] - dX[..., 1] * T1[..., 0]) / safe_det
-    v = (T0[..., 0] * dX[..., 1] - T0[..., 1] * dX[..., 0]) / safe_det
+    u = (G11 * b0 - G01 * b1) / safe_det   # (n_query, n_faces)
+    v = (G00 * b1 - G01 * b0) / safe_det
     w = 1.0 - u - v
 
     return u, v, w   # (n_query, n_faces) each
@@ -260,42 +272,133 @@ def _barycentric_coords_all_triangles(
 
 def _interpolate_mesh(
     node_coeffs: jnp.ndarray,   # (n_nodes, n_outputs)
-    nodes: jnp.ndarray,          # (n_nodes, 2)
+    nodes: jnp.ndarray,          # (n_nodes, D)
     faces: jnp.ndarray,          # (n_faces, 3)
-    query_x: jnp.ndarray,        # (n_query, 2)  [spatial only]
+    query_x: jnp.ndarray,        # (n_query, D)
+    face_tree=None,              # unused, kept for API compat
+    node_to_face=None,           # legacy (n_nodes,) int32 — ignored if node_to_faces given
+    node_to_faces=None,          # (n_nodes, K) int32 — all adjacent faces, -1 padded
 ) -> jnp.ndarray:                # (n_query, n_outputs)
     """
     Barycentric interpolation of nodal values at arbitrary query points.
 
-    The containing triangle is found by argmax of the minimum barycentric
-    coordinate (all-positive ↔ inside).  Triangle selection is discrete
-    (no gradient), but the barycentric weights *are* differentiable w.r.t.
-    ``query_x``, so spatial derivatives of the output are well-defined.
+    For 2-D meshes, all triangle candidates are tested and the best is
+    selected by argmax of the minimum barycentric coordinate.
+
+    For 3-D surface meshes with ``node_to_faces`` (n_nodes, K):
+      1. Find the nearest mesh vertex by L2 distance (stop_gradient).
+      2. Gather all K adjacent faces of that vertex.
+      3. Compute differentiable barycentric weights for each candidate face.
+      4. Select the face with the highest minimum barycentric coordinate
+         (i.e., the face that best contains the query point).
+
+    This correctly handles off-vertex query points where a single fixed
+    face-per-vertex would give wrong extrapolated barycentric coordinates.
     """
-    u, v, w = _barycentric_coords_all_triangles(nodes, faces, query_x)
-    # (n_query, n_faces)
+    D = nodes.shape[1]
 
-    # "Insideness" score: higher when all coords are positive
-    min_coord = jnp.minimum(jnp.minimum(u, v), w)    # (n_query, n_faces)
+    if D == 3 and node_to_faces is not None:
+        # Step 1: nearest vertex — discrete, stop_gradient so JVP sees zero tangent
+        diff  = nodes[None, :, :] - query_x[:, None, :]   # (n_q, n_nodes, D)
+        dist2 = jnp.sum(diff ** 2, axis=-1)               # (n_q, n_nodes)
+        nearest = jax.lax.stop_gradient(jnp.argmin(dist2, axis=-1))  # (n_q,)
 
-    # Containing triangle: argmax of min_coord  (discrete, no grad needed)
-    tri_idx = jnp.argmax(min_coord, axis=-1)           # (n_query,)
+        # Step 2: all K adjacent faces of nearest vertex — shape (n_q, K)
+        K = node_to_faces.shape[1]
+        cand_faces = jax.lax.stop_gradient(node_to_faces[nearest])  # (n_q, K)
+        # Clamp -1 padding to 0 (will be masked out by score below)
+        cand_faces_safe = jnp.where(cand_faces >= 0, cand_faces, 0)
 
-    n_query = query_x.shape[0]
-    row = jnp.arange(n_query)
+        # Step 3: compute barycentric weights for each candidate face
+        n0 = faces[cand_faces_safe, 0]   # (n_q, K)
+        n1 = faces[cand_faces_safe, 1]
+        n2 = faces[cand_faces_safe, 2]
+        v0 = nodes[n0]   # (n_q, K, D)
+        v1 = nodes[n1]
+        v2 = nodes[n2]
 
-    # Barycentric coords for the selected triangle (differentiable w.r.t. query_x)
-    u_sel = u[row, tri_idx]   # (n_query,)
-    v_sel = v[row, tri_idx]
-    w_sel = w[row, tri_idx]
+        T0 = v1 - v0
+        T1 = v2 - v0
+        dX = query_x[:, None, :] - v0   # (n_q, K, D)
 
-    # Node indices for selected triangles
-    n0 = faces[tri_idx, 0]   # (n_query,)
-    n1 = faces[tri_idx, 1]
-    n2 = faces[tri_idx, 2]
+        G00 = jnp.sum(T0 * T0, axis=-1)   # (n_q, K)
+        G01 = jnp.sum(T0 * T1, axis=-1)
+        G11 = jnp.sum(T1 * T1, axis=-1)
+        b0  = jnp.sum(T0 * dX, axis=-1)
+        b1  = jnp.sum(T1 * dX, axis=-1)
 
-    # Interpolate: w*c(v0) + u*c(v1) + v*c(v2)
-    c0 = node_coeffs[n0]     # (n_query, n_outputs)
+        det = G00 * G11 - G01 * G01
+        safe_det = jnp.where(jnp.abs(det) < 1e-15, 1e-15, det)
+        u_cand = (G11 * b0 - G01 * b1) / safe_det   # (n_q, K)
+        v_cand = (G00 * b1 - G01 * b0) / safe_det
+        w_cand = 1.0 - u_cand - v_cand
+
+        # Step 4: pick the face with highest min barycentric coord
+        # (i.e., the face best containing the query point).
+        # Mask padded slots with -inf so they are never selected.
+        min_coord = jnp.minimum(jnp.minimum(u_cand, v_cand), w_cand)  # (n_q, K)
+        min_coord = jnp.where(cand_faces >= 0, min_coord, -jnp.inf)
+        best_k = jax.lax.stop_gradient(jnp.argmax(min_coord, axis=-1))  # (n_q,)
+
+        n_q = query_x.shape[0]
+        row = jnp.arange(n_q)
+        u_sel = u_cand[row, best_k]
+        v_sel = v_cand[row, best_k]
+        w_sel = w_cand[row, best_k]
+        tri_global = cand_faces_safe[row, best_k]
+        n0 = faces[tri_global, 0]
+        n1 = faces[tri_global, 1]
+        n2 = faces[tri_global, 2]
+
+    elif D == 3 and node_to_face is not None:
+        # Legacy path: single face per vertex (less accurate for off-vertex points)
+        diff  = nodes[None, :, :] - query_x[:, None, :]   # (n_q, n_nodes, D)
+        dist2 = jnp.sum(diff ** 2, axis=-1)               # (n_q, n_nodes)
+        nearest = jax.lax.stop_gradient(jnp.argmin(dist2, axis=-1))  # (n_q,)
+
+        # Step 2: face from precomputed map
+        tri_global = node_to_face[nearest]   # (n_q,)
+
+        # Step 3: differentiable barycentric weights for the selected face
+        n0 = faces[tri_global, 0]
+        n1 = faces[tri_global, 1]
+        n2 = faces[tri_global, 2]
+        v0 = nodes[n0]    # (n_q, D)
+        v1 = nodes[n1]
+        v2 = nodes[n2]
+
+        T0 = v1 - v0
+        T1 = v2 - v0
+        dX = query_x - v0
+
+        G00 = jnp.sum(T0 * T0, axis=-1)
+        G01 = jnp.sum(T0 * T1, axis=-1)
+        G11 = jnp.sum(T1 * T1, axis=-1)
+        b0  = jnp.sum(T0 * dX, axis=-1)
+        b1  = jnp.sum(T1 * dX, axis=-1)
+
+        det      = G00 * G11 - G01 * G01
+        safe_det = jnp.where(jnp.abs(det) < 1e-15, 1e-15, det)
+        u_sel = (G11 * b0 - G01 * b1) / safe_det
+        v_sel = (G00 * b1 - G01 * b0) / safe_det
+        w_sel = 1.0 - u_sel - v_sel
+
+    else:
+        # 2-D or fallback: test all triangles
+        u, v, w = _barycentric_coords_all_triangles(nodes, faces, query_x)
+        min_coord  = jnp.minimum(jnp.minimum(u, v), w)
+        tri_global = jnp.argmax(min_coord, axis=-1)
+
+        n_query = query_x.shape[0]
+        row    = jnp.arange(n_query)
+        u_sel  = u[row, tri_global]
+        v_sel  = v[row, tri_global]
+        w_sel  = w[row, tri_global]
+        n0 = faces[tri_global, 0]
+        n1 = faces[tri_global, 1]
+        n2 = faces[tri_global, 2]
+
+    c0 = node_coeffs[n0]
     c1 = node_coeffs[n1]
     c2 = node_coeffs[n2]
 

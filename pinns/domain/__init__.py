@@ -14,7 +14,6 @@ All public names are re-exported here so existing code that does
 from .domain_cubic import (
     SubdomainInfo,
     DomainCubic,
-    Stepper,
     bump,
     bump_vectorized,
     sample_unit_hypercube,
