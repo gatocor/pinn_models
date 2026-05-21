@@ -12,7 +12,6 @@ All public names are re-exported here so existing code that does
 """
 
 from .domain_cubic import (
-    SubdomainInfo,
     DomainCubic,
     bump,
     bump_vectorized,
@@ -23,7 +22,6 @@ from .domain_cubic import (
 from .domain_mesh import DomainMesh
 
 __all__ = [
-    "SubdomainInfo",
     "DomainCubic",
     "DomainMesh",
     "Stepper",

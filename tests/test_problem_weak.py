@@ -135,46 +135,22 @@ class TestAddInner:
 
 
 # ---------------------------------------------------------------------------
-# add_solution
+# add_parameter
 # ---------------------------------------------------------------------------
 
-class TestAddSolution:
-    def test_sets_solution(self):
-        d = _domain()
-        p = ProblemWeak(d, output_names=["u"])
-        sol = lambda xy, params=None: np.zeros(len(xy))
-        p.add_solution(sol)
-        assert p.solution is sol
-
-    def test_returns_self(self):
-        d = _domain()
-        p = ProblemWeak(d, output_names=["u"])
-        ret = p.add_solution(lambda xy: np.zeros(len(xy)))
-        assert ret is p
-
-    def test_constructor_solution(self):
-        sol = lambda xy, params=None: np.zeros(len(xy))
-        d = _domain()
-        p = ProblemWeak(d, output_names=["u"], solution=sol)
-        assert p.solution is sol
-
-
-# ---------------------------------------------------------------------------
-# add_fixed
-# ---------------------------------------------------------------------------
-
-class TestAddFixed:
+class TestAddParameter:
     def test_adds_params(self):
         d = _domain()
         p = ProblemWeak(d, output_names=["u"])
-        p.add_fixed(kappa=1.0, alpha=0.5)
+        p.add_parameter("kappa", 1.0)
+        p.add_parameter("alpha", 0.5)
         assert p.params["kappa"] == 1.0
         assert p.params["alpha"] == 0.5
 
     def test_returns_self(self):
         d = _domain()
         p = ProblemWeak(d, output_names=["u"])
-        ret = p.add_fixed(k=2.0)
+        ret = p.add_parameter("k", 2.0)
         assert ret is p
 
     def test_constructor_params(self):
@@ -274,7 +250,6 @@ class TestAddNeumann:
 class TestChaining:
     def test_full_chain(self):
         d = _domain()
-        sol = lambda xy, params=None: np.sin(np.pi * xy[:, 0]) * np.sin(np.pi * xy[:, 1])
         p = (
             ProblemWeak(d, output_names=["u"])
             .add_inner(_volume_fn_poisson, name="pde")
@@ -282,12 +257,10 @@ class TestChaining:
             .add_dirichlet(0.0, name="bc_right",  region="right")
             .add_dirichlet(0.0, name="bc_top",    region="top")
             .add_dirichlet(0.0, name="bc_left",   region="left")
-            .add_solution(sol)
-            .add_fixed(dummy=1.0)
+            .add_parameter("dummy", 1.0)
         )
         assert p.volume_fn is _volume_fn_poisson
         assert len(p.boundary_conditions) == 4
-        assert p.solution is sol
         assert p.params["dummy"] == 1.0
 
 

@@ -274,20 +274,20 @@ class TestModelNetworkLosses:
 
     def test_network_losses_empty_by_default(self, domain):
         m = Model(domain, output_dim=1)
-        assert m.network_losses == []
+        assert m.model_losses == []
 
     def test_add_network_loss(self, domain):
         m = Model(domain, output_dim=1)
         loss = NetworkLoss('reg', lambda p, x: jnp.mean(x ** 2), weight=1e-4)
         m.add_network_loss(loss)
-        assert len(m.network_losses) == 1
+        assert len(m.model_losses) == 1
 
     def test_network_loss_callable(self, domain, xy):
         m = Model(domain, output_dim=1)
         params = m.init(RNG)
         loss = NetworkLoss('test', lambda p, x: jnp.mean(x ** 2))
         m.add_network_loss(loss)
-        val = m.network_losses[0].fn(params, xy)
+        val = m.model_losses[0].fn(params, xy)
         assert jnp.isfinite(val)
 
 

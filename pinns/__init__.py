@@ -5,7 +5,7 @@ PINNS - Physics-Informed Neural Networks (JAX/Flax/Optax)
 __version__ = "0.1.0"
 
 # Domain
-from .domain import DomainCubic, DomainMesh, SubdomainInfo, bump
+from .domain import DomainCubic, DomainMesh, bump
 
 # Residual terms (boundary conditions + interior / initial / data-point terms)
 from .problems.terms import (
@@ -29,6 +29,23 @@ from .models.stepping import StepperStep, StepperDt
 from .problems.problem_strong import ProblemStrong
 from .problems.problem_weak import ProblemWeak
 
+# Integrators
+from .models.integrators import (
+    Integrator,
+    IntegratorETD2RK,
+    AdaptiveIntegrator,
+    IntegratorRK4,
+    IntegratorRK45,
+    IntegratorIMEX,
+    IntegratorDiffrax,
+    IntegratorEuler,
+    IntegratorDopri5,
+    IntegratorTsit5,
+    StepsizeController,
+    PIDController,
+    ConstantStepController,
+)
+
 # Utilities
 from . import meshes
 from .models import layers
@@ -37,6 +54,7 @@ from .models.model_base import ModelBase, NetworkLoss
 from .models.model_utilities import create_model
 from .models.model_partitioned import ModelPartitioned
 from .models.model_stepper import ModelStepper
+from .models.model_solver import ModelSolver
 
 # Networks / layers
 from .models.layers import (
@@ -58,6 +76,7 @@ from .trainer import (Trainer, TrainPlotter,
                       SchedulerCurriculum, SchedulerLagrange,
                       SchedulerGradNorm, SchedulerCausal,
                       SchedulerWarmupDecay, SchedulerNTK,
+                      SchedulerPartition, MaskedState, make_masked_optimizer,
                       BaseOptimizer,
                       AdamOptimizer, AdamWOptimizer, SGDOptimizer, RMSPropOptimizer,
                       LionOptimizer, LBFGSOptimizer, SOAPOptimizer)
@@ -65,7 +84,7 @@ from .trainer import (Trainer, TrainPlotter,
 __all__ = [
     "__version__",
     "meshes",
-    "DomainCubic", "DomainMesh", "SubdomainInfo", "bump",
+    "DomainCubic", "DomainMesh", "bump",
     # BC classes
     "TermDirichletBC", "TermNeumannBC", "TermRobinBC",
     "TermCustomBC",
@@ -77,9 +96,12 @@ __all__ = [
     "FNN", "WFFNN", "PirateNet", "ResNet", "RandomFourierFeatures", "FourierFeatures", "DenseRWF", "PeriodicEmbedding",
     "Normalize", "Denormalize",
     "GNNFeatures", "LaplacianFeatures",
-    "ModelBase", "NetworkLoss", "create_model", "ModelPartitioned", "ModelStepper",
+    "ModelBase", "NetworkLoss", "create_model", "ModelPartitioned", "ModelStepper", "ModelSolver",
     "PartitionFB", "PartitionX", "StepperStep", "StepperDt", "register_interface_loss",
     "ProblemStrong", "ProblemWeak",
+    "Integrator", "IntegratorETD2RK", "AdaptiveIntegrator",
+    "IntegratorRK4", "IntegratorRK45", "IntegratorIMEX", "IntegratorDiffrax",
+    "IntegratorEuler", "IntegratorDopri5", "IntegratorTsit5",
     "derivative", "gradient", "laplacian", "divergence",
     "Trainer", "TrainPlotter",
     "Scheduler", "is_notebook",
@@ -88,6 +110,7 @@ __all__ = [
     "SchedulerCurriculum", "SchedulerLagrange",
     "SchedulerGradNorm", "SchedulerCausal",
     "SchedulerWarmupDecay", "SchedulerNTK",
+    "SchedulerPartition", "MaskedState", "make_masked_optimizer",
     "BaseOptimizer",
     "AdamOptimizer", "AdamWOptimizer", "SGDOptimizer", "RMSPropOptimizer",
     "LionOptimizer", "LBFGSOptimizer", "SOAPOptimizer",

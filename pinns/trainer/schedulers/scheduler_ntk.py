@@ -99,7 +99,7 @@ class SchedulerNTK(Scheduler):
         if residual_fn is None:
             return
         train_data = trainer._train_data
-        params     = trainer.network.params
+        params     = trainer.model.params
 
         traces = {}
         for name in self._term_names:

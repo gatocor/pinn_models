@@ -123,7 +123,7 @@ lap_u = pinns.laplacian(Y, X, component=0)
 
 # Poisson equation: ∇²u = f
 def poisson(X, V, params):
-    f = params["fixed"]["source"](X)
+    f = params["parameter"]["source"](X)
     return pinns.laplacian(V, X, 0) - f
 ```
 
@@ -174,7 +174,7 @@ $$\frac{\partial^2 u}{\partial t^2} = c^2 \frac{\partial^2 u}{\partial x^2}$$
 
 ```python
 def wave_equation(X, V, params):
-    c = params["fixed"]["c"]
+    c = params["parameter"]["c"]
     
     u_tt = pinns.derivative(V, X, 0, (1, 1))  # ∂²u/∂t²
     u_xx = pinns.derivative(V, X, 0, (0, 0))  # ∂²u/∂x²
@@ -188,7 +188,7 @@ $$\frac{\partial u}{\partial t} + u \frac{\partial u}{\partial x} = \nu \frac{\p
 
 ```python
 def burgers(X, V, params):
-    nu = params["fixed"]["nu"]
+    nu = params["parameter"]["nu"]
     
     u = V[:, 0:1]
     u_t = pinns.derivative(V, X, 0, (1,))
@@ -205,9 +205,9 @@ $$i\hbar \frac{\partial \psi}{\partial t} = -\frac{\hbar^2}{2m} \nabla^2 \psi + 
 ```python
 def schrodinger(X, V, params):
     # V has real and imaginary parts: [psi_r, psi_i]
-    hbar = params["fixed"]["hbar"]
-    m = params["fixed"]["m"]
-    potential = params["fixed"]["V"](X)
+    hbar = params["parameter"]["hbar"]
+    m = params["parameter"]["m"]
+    potential = params["parameter"]["V"](X)
     
     psi_r = V[:, 0:1]
     psi_i = V[:, 1:2]

@@ -80,7 +80,7 @@ lap_u = pinns.laplacian(V, X, component=0)
 
 ```python
 # Standard Trainer
-trainer = pinns.Trainer(problem, network)
+trainer = pinns.Trainer(network, problem=problem)
 
 trainer.compile(
     train_samples={"pde": 1000, "bc1": 100},
@@ -94,7 +94,7 @@ trainer.compile(
 trainer.train()
 
 # ALTrainer (Augmented Lagrangian) for better constraint satisfaction
-trainer = pinns.ALTrainer(problem, network)
+trainer = pinns.ALTrainer(network, problem=problem)
 
 trainer.compile(
     train_samples={"pde": 1000, "bc1": 100},

@@ -243,7 +243,7 @@ def input_transform(X: torch.Tensor, params: dict) -> torch.Tensor:
     
     Args:
         X: Input tensor of shape (batch_size, n_dims)
-        params: Dictionary with 'fixed', 'infer', 'internal' keys
+        params: Dictionary with flat params + 'internal' keys
         
     Returns:
         Transformed tensor of shape (batch_size, n_dims)
@@ -261,7 +261,7 @@ def output_transform(X: torch.Tensor, V: torch.Tensor, params: dict) -> torch.Te
     Args:
         X: Original input tensor (before input_transform)
         V: Network output tensor of shape (batch_size, n_outputs)
-        params: Dictionary with 'fixed', 'infer', 'internal' keys
+        params: Dictionary with flat params + 'internal' keys
         
     Returns:
         Transformed output tensor of shape (batch_size, n_outputs)
@@ -274,7 +274,7 @@ def output_transform(X: torch.Tensor, V: torch.Tensor, params: dict) -> torch.Te
 ```python
 def output_transform(X, V, params):
     # Access user-defined parameters
-    alpha = params["fixed"]["alpha"]
+    alpha = params["parameter"]["alpha"]
     
     # Access training state (for curriculum learning)
     step = params["internal"]["global_step"]

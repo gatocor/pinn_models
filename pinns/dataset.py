@@ -15,7 +15,7 @@ Example::
     dataset.add_points(x_obs, u_obs, name='sensors', component=0)
     dataset.add_points(x_wall, u_wall, name='wall_data', component=0)
 
-    trainer = Trainer(problem, network, dataset=dataset)
+    trainer = Trainer(network, problem=problem, dataset=dataset)
 """
 
 from __future__ import annotations
@@ -111,7 +111,7 @@ class Dataset:
         ds.add_points(x_sensors, u_sensors, name='sensors', component=0)
         ds.add_points(x_wall,    u_wall,    name='wall',    component=0)
 
-        trainer = Trainer(problem, network, dataset=ds)
+        trainer = Trainer(network, problem=problem, dataset=ds)
         trainer.compile(weights={'sensors': 2.0, 'wall': 1.0})
         trainer.train()
     """

@@ -36,12 +36,10 @@ class DomainMesh:
               ``(vertices, faces)`` tuple).
         time: Time specification — ``None``, a 2-tuple ``(t_min, t_max)``, or
               a 1-D array/list of time-point values.
-        t_sampling_method: How to place time quadrature points (continuous
+        sampling_method: How to place time quadrature points (continuous
               mode only).  One of ``"uniform"`` *(default)*, ``"midpoint"``,
               ``"latin_hypercube"``, ``"sobol"``, ``"halton"``, or a callable
               ``(n, rng) -> ndarray`` in ``[0, 1]``.
-        n_time_points: Default number of time levels per epoch (continuous
-              mode only, default 10).
 
     Examples::
 
@@ -99,8 +97,7 @@ class DomainMesh:
             "Provide a pymesh, trimesh, meshio, or (vertices, faces) object."
         )
 
-    def __init__(self, mesh, time=None, t_sampling_method="uniform",
-                 n_time_points=10):
+    def __init__(self, mesh, time=None, sampling_method="uniform"):
         vertices, faces = self._extract_vertices_faces(mesh)
         self._vertices = vertices
         self._spatial_dims = vertices.shape[1]
@@ -169,8 +166,7 @@ class DomainMesh:
         sp_min = vertices.min(axis=0)
         sp_max = vertices.max(axis=0)
 
-        self._t_sampling_method = t_sampling_method
-        self.n_time_points = n_time_points
+        self.sampling_method = sampling_method
 
         # ── Interpret the `time` argument ────────────────────────────────
         # None                  → stationary
@@ -225,7 +221,7 @@ class DomainMesh:
                 self.n_steps = len(tp) - 1
                 self._t_min  = float(tp[0])
                 self._t_max  = float(tp[-1])
-                self._t_sampling_method = 'midpoint'
+                self.sampling_method = 'midpoint'
 
             self.t_interval = [self._t_min, self._t_max]
             self.xmin = np.append(sp_min, self._t_min)

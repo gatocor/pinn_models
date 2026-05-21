@@ -48,8 +48,8 @@ def _make_ode_problem():
     problem = ProblemStrong(domain=domain, output_names=["x"])
 
     def residual(X, U, params, derivative):
-        beta  = params["fixed"]["beta"]
-        omega = params["fixed"]["omega"]
+        beta  = params["parameter"]["beta"]
+        omega = params["parameter"]["omega"]
         x     = U[:, 0:1]
         x_t   = derivative(x, X, 0, (0,))
         x_tt  = derivative(x, X, 0, (0, 0))
@@ -65,8 +65,8 @@ def _make_ode_problem():
 
     problem.add_initial(ic_velocity, outputs="x", name="Ivx")
 
-    problem.add_fixed("beta",  0.1)
-    problem.add_fixed("omega", 10.0)
+    problem.add_parameter("beta",  0.1)
+    problem.add_parameter("omega", 10.0)
     return domain, problem
 
 
@@ -123,20 +123,20 @@ class TestTrainerConstruction:
         """ModelBase has no .to() — must not raise AttributeError."""
         domain, problem = _make_ode_problem()
         network = create_model(domain, output_dim=1, hidden_dims=(16,), activation="tanh")
-        trainer = Trainer(problem, network)   # should not raise
+        trainer = Trainer(network, problem=problem)   # should not raise
         assert trainer.problem is problem
-        assert trainer.network is network
+        assert trainer.model is network
 
     def test_1d_pde_construction(self):
         domain, problem = _make_1d_pde_problem()
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
-        trainer = Trainer(problem, network)
+        trainer = Trainer(network, problem=problem)
         assert trainer is not None
 
     def test_multiout_construction(self):
         domain, problem = _make_multiout_problem()
         network = create_model(domain, output_dim=2, hidden_dims=(16,))
-        Trainer(problem, network)
+        Trainer(network, problem=problem)
 
     def test_fb_construction(self):
         domain, problem = _make_ode_problem()
@@ -145,7 +145,7 @@ class TestTrainerConstruction:
             domain, output_dim=1, hidden_dims=(8,),
             partition=PartitionFB(overlap=0.5),
         )
-        Trainer(problem, network)
+        Trainer(network, problem=problem)
 
 
 # ===========================================================================
@@ -156,7 +156,7 @@ class TestCompile:
     def test_basic_compile(self):
         domain, problem = _make_ode_problem()
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
-        trainer = Trainer(problem, network)
+        trainer = Trainer(network, problem=problem)
         trainer.compile(
             problem={
                 "ode": {"train": 50, "test": 50, "weight": 1.0},
@@ -171,14 +171,14 @@ class TestCompile:
     def test_compile_sets_epochs(self):
         domain, problem = _make_ode_problem()
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
-        trainer = Trainer(problem, network)
+        trainer = Trainer(network, problem=problem)
         trainer.compile(epochs=42, print_each=_PRINT_EACH)
         assert trainer._epochs == 42
 
     def test_compile_pde(self):
         domain, problem = _make_1d_pde_problem()
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
-        trainer = Trainer(problem, network)
+        trainer = Trainer(network, problem=problem)
         trainer.compile(
             problem={
                 "pde": {"train": 30, "test": 30, "weight": 1.0},
@@ -198,7 +198,7 @@ class TestTrainSmoke:
     """train() runs end-to-end without exception."""
 
     def _run(self, problem, network, term_names, n_train=30, n_test=30):
-        trainer = Trainer(problem, network)
+        trainer = Trainer(network, problem=problem)
         trainer.compile(
             problem={k: {"train": n_train, "test": n_test, "weight": 1.0} for k in term_names},
             epochs=_FAST_EPOCHS,
@@ -241,7 +241,7 @@ class TestHistory:
     def _trained_trainer(self):
         domain, problem = _make_ode_problem()
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
-        trainer = Trainer(problem, network)
+        trainer = Trainer(network, problem=problem)
         trainer.compile(
             problem={
                 "ode": {"train": 50, "test": 50, "weight": 1.0},
@@ -288,7 +288,7 @@ class TestPredict:
     def _trained_trainer(self):
         domain, problem = _make_ode_problem()
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
-        trainer = Trainer(problem, network)
+        trainer = Trainer(network, problem=problem)
         trainer.compile(
             problem={
                 "ode": {"train": 50},
@@ -326,7 +326,7 @@ class TestALMode:
         """AL mode with lagrange_constraints trains without error."""
         domain, problem = _make_ode_problem()
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
-        trainer = Trainer(problem, network)
+        trainer = Trainer(network, problem=problem)
         trainer.compile(
             problem={
                 "ode": {"train": 50},
@@ -335,7 +335,7 @@ class TestALMode:
             },
             epochs=_FAST_EPOCHS,
             print_each=_PRINT_EACH,
-            schedulers=[SchedulerLagrange(constraints=["Ix", "Ivx"])],
+            schedulers=[SchedulerLagrange(terms=["Ix", "Ivx"])],  
             show=None,
         )
         trainer.train()   # must not raise
@@ -345,7 +345,7 @@ class TestALMode:
         """Explicitly disabling AL mode still trains without error."""
         domain, problem = _make_ode_problem()
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
-        trainer = Trainer(problem, network)
+        trainer = Trainer(network, problem=problem)
         trainer.compile(
             problem={
                 "ode": {"train": 50},
@@ -367,7 +367,7 @@ class TestRetrain:
     def test_retrain_accumulates_epochs(self):
         domain, problem = _make_ode_problem()
         network = create_model(domain, output_dim=1, hidden_dims=(16,))
-        trainer = Trainer(problem, network)
+        trainer = Trainer(network, problem=problem)
         trainer.compile(
             problem={
                 "ode": {"train": 50},

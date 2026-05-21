@@ -98,13 +98,13 @@ def pde_residual(X, V, params):
     Args:
         X: Inputs (batch, n_dims) - e.g., (x, t)
         V: Outputs (batch, n_outputs) - e.g., (u,)
-        params: Dictionary with 'fixed', 'infer', 'internal'
+        params: Dictionary with flat params + 'internal'
     
     Returns:
         Residual that should be zero
     """
     # Get parameters
-    alpha = params["fixed"]["alpha"]
+    alpha = params["parameter"]["alpha"]
     
     # Get output
     u = V[:, 0:1]

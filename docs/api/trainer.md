@@ -25,7 +25,7 @@ import pinns
 problem = pinns.Problem(...)
 network = pinns.FNN([2, 64, 64, 1])
 
-trainer = pinns.Trainer(problem, network)
+trainer = pinns.Trainer(network, problem=problem)
 ```
 
 ---
@@ -255,7 +255,7 @@ problem = pinns.Problem(
 network = pinns.FNN([2, 64, 64, 64, 1])
 
 # Create trainer
-trainer = pinns.Trainer(problem, network)
+trainer = pinns.Trainer(network, problem=problem)
 
 # Phase 1: Adam training
 trainer.compile(
@@ -356,7 +356,7 @@ x_test = torch.tensor([[0.5, 0.0], [0.5, 0.5], [0.5, 1.0]], requires_grad=True)
 
 # Evaluate network
 with torch.no_grad():
-    u_pred = trainer.network(x_test)
+    u_pred = trainer.model(x_test)
     
 print("Predictions:", u_pred)
 ```
@@ -366,7 +366,7 @@ print("Predictions:", u_pred)
 ```python
 # Compute PDE residual at test points
 x_test = torch.tensor([[0.5, 0.5]], requires_grad=True)
-y_pred = trainer.network(x_test)
+y_pred = trainer.model(x_test)
 params = trainer._build_params()
 residual = trainer.problem.pde_fn(x_test, y_pred, params)
 print("Residual:", residual.item())
@@ -410,7 +410,7 @@ import pinns
 problem = pinns.Problem(...)
 network = pinns.FNN([2, 64, 64, 1])
 
-trainer = pinns.ALTrainer(problem, network)
+trainer = pinns.ALTrainer(network, problem=problem)
 ```
 
 ---
@@ -546,7 +546,7 @@ domain.add_dirichlet((None, 1), value=0.0, component=0, name="right")
 def burgers_residual(X, U, params, derivative=None):
     if derivative is None:
         derivative = pinns.derivative
-    nu = params['fixed']['nu']
+    nu = params['parameter']['nu']
     u = U[:, 0:1]
     u_t = derivative(u, X, 0, (0,))
     u_x = derivative(u, X, 0, (1,))
@@ -563,7 +563,7 @@ problem = pinns.Problem(
 
 # Create network and ALTrainer
 network = pinns.FNN([2, 256, 256, 1], activation="tanh")
-trainer = pinns.ALTrainer(problem, network)
+trainer = pinns.ALTrainer(network, problem=problem)
 
 # Compile with AL settings
 trainer.compile(

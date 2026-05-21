@@ -47,24 +47,32 @@ class Trainer:
     - _compute_pde_loss, _compute_bc_loss: Loss computation
     """
     
-    def __init__(self, problem, network, dataset=None, device=None):
+    def __init__(self, model, problem=None, dataset=None, device=None):
         """
         Initialize common trainer attributes.
         
         Args:
-            problem: Problem instance defining PDE and boundary conditions.
-            network: Neural network to train.
+            model: Neural network or :class:`~pinns.ModelSolver` to train.
+                   This is the mandatory first argument (formerly ``network``).
+            problem: Optional problem instance defining PDE and boundary conditions
+                     (:class:`~pinns.ProblemStrong` or :class:`~pinns.ProblemWeak`).
+                     Pass ``None`` for dataset-only training (e.g. with ModelSolver).
             dataset: Optional :class:`~pinns.Dataset` of fixed observation data.
                      Each registered point set is evaluated every training step
                      as a supervised MSE loss (no domain-based sampling).
             device: Device to use. If None, auto-detect using backend.
         """
-        # Reset network parameters so fresh init always starts clean
-        if hasattr(network, 'params'):
-            network.params = None
+        # Reset network parameters so fresh init always starts clean.
+        # Skip for ModelSolver which manages its own _params dict.
+        if hasattr(model, 'params') and not getattr(model, '_is_solver_problem', False):
+            model.params = None
 
+        self.model = model
+        self.model = model
         self.problem = problem
         self.dataset  = dataset
+        self.solution = None  # optional analytical / reference solution
+        self._parameter_solutions: dict = {}  # {param_name: true_value}
         
         # Training history
         self.history = {
@@ -78,6 +86,7 @@ class Trainer:
             'epoch_times': [],
             'mse_loss': [],        # unweighted total mean(r²), no Lagrange
             'mse_terms': {},       # {term_name: [per-epoch unweighted mean(r²)]}
+            'params': {},          # {param_name: [per-epoch value]}
         }
         
         # Global epoch counter (accumulated across train() calls)
@@ -90,7 +99,6 @@ class Trainer:
         if device is None:
             device = self._auto_detect_device()
         
-        self.network = network
         self.device = device
         self.dtype = None
         
@@ -110,10 +118,16 @@ class Trainer:
             self.test_samples       = {t.name: 0 for t in problem._terms}
             self.weights            = {t.name: 1.0 for t in problem._terms}
             self.relative_weights   = {t.name: 1.0 for t in problem._terms}
+        elif problem is None:
+            # Dataset-only mode — no PDE terms, only dataset MSE losses.
+            self.train_samples    = {}
+            self.test_samples     = {}
+            self.weights          = {}
+            self.relative_weights = {}
         else:
             raise TypeError(
                 f"Unsupported problem type: {type(problem).__name__}. "
-                "Use ProblemStrong or ProblemWeak."
+                "Use ProblemStrong or ProblemWeak, or pass problem=None for dataset-only mode."
             )
         # Dataset: register weights so compile(weights={...}) can override them.
         # Do NOT add to train_samples — dataset points are injected directly in
@@ -140,9 +154,13 @@ class Trainer:
         
         # Curriculum time window — scheduler sets these to narrow/expand sampling
         # over the time axis.  None means "use the full domain range".
-        domain = problem.domain
-        self.t_min: Optional[float] = getattr(domain, '_t_min', None)
-        self.t_max: Optional[float] = getattr(domain, '_t_max', None)
+        _domain = (
+            getattr(problem, 'domain', None)
+            if problem is not None
+            else getattr(self.model, 'domain', None)
+        )
+        self.t_min: Optional[float] = getattr(_domain, '_t_min', None)
+        self.t_max: Optional[float] = getattr(_domain, '_t_max', None)
 
         # Training configuration (set by compile)
         self._epochs = 1000
@@ -157,27 +175,29 @@ class Trainer:
     
     def _setup_network_normalization(self):
         """Set up input/output normalization on the network from problem definition."""
+        if self.problem is None:
+            return  # No problem domain — skip normalization
         xmin = np.array(self.problem.domain.xmin)
         xmax = np.array(self.problem.domain.xmax)
         
         # Set input range from domain bounds (only if normalization is enabled)
-        if hasattr(self.network, 'set_input_range'):
-            if getattr(self.network, 'normalize_input', True):
-                self.network.set_input_range(xmin, xmax)
+        if hasattr(self.model, 'set_input_range'):
+            if getattr(self.model, 'normalize_input', True):
+                self.model.set_input_range(xmin, xmax)
         
         # Set output range on the network — output_range is owned by the network,
         # not the problem.  Only call set_output_range if the network has not
         # already been configured (i.e. output_range_min is None / absent).
-        if hasattr(self.network, 'set_output_range'):
-            if getattr(self.network, 'unnormalize_output', True):
+        if hasattr(self.model, 'set_output_range'):
+            if getattr(self.model, 'unnormalize_output', True):
                 already_set = (
-                    getattr(self.network, 'output_range_min', None) is not None
-                    or getattr(self.network, 'output_min', None) is not None
+                    getattr(self.model, 'output_range_min', None) is not None
+                    or getattr(self.model, 'output_min', None) is not None
                 )
                 if not already_set:
                     ymin = -np.ones(self.problem.n_outputs)
                     ymax = np.ones(self.problem.n_outputs)
-                    self.network.set_output_range(ymin, ymax)
+                    self.model.set_output_range(ymin, ymax)
     
     # ==================== Abstract Methods ====================
 
@@ -191,6 +211,7 @@ class Trainer:
     def _compile_base(
         self,
         problem: Optional[Dict[str, Dict]] = None,
+        dataset: Optional[Dict[str, Dict]] = None,
         optimizer: Optional[BaseOptimizer] = None,
         epochs: int = 1000,
         batch_size: int = None,
@@ -211,6 +232,9 @@ class Trainer:
         # of all F faces.  Reduces per-step cost; acts as stochastic regularisation.
         # Set to None (default) to use all faces (full Galerkin).
         face_batch_size: Optional[int] = None,
+        # For ModelSolver: list of parameter names to optimise.
+        # All other model parameters are frozen via stop_gradient.
+        fit_model_parameters: Optional[List[str]] = None,
     ):
         """
         Configure training parameters.
@@ -272,6 +296,18 @@ class Trainer:
                         self.weights[_t] = _cfg['weight']
                         self.relative_weights[_t] = 1.0   # reset adaptive weight on recompile
 
+        if dataset is not None:
+            for _term, _cfg in dataset.items():
+                if not isinstance(_cfg, dict):
+                    raise ValueError(
+                        f"compile(dataset={{...}}) values must be dicts, "
+                        f"got {type(_cfg).__name__!r} for term {_term!r}. "
+                        "Expected e.g. {'weight': 1.0}"
+                    )
+                if 'weight' in _cfg:
+                    self.weights[_term] = _cfg['weight']
+                    self.relative_weights[_term] = 1.0
+
         # Update schedulers list FIRST so _create_optimizer can inspect it
         new_schedulers = list(schedulers) if schedulers else []
 
@@ -299,6 +335,12 @@ class Trainer:
         self._rollout_face_batch = face_batch_size
         if face_batch_size != old_face_batch:
             optimizer_changed = True   # force recompile of loss fn
+
+        # fit_model_parameters: controls which ModelSolver params are optimised.
+        old_fit = getattr(self, '_fit_model_parameters', None)
+        self._fit_model_parameters = fit_model_parameters
+        if fit_model_parameters != old_fit:
+            optimizer_changed = True
         
         if self.optimizer is None or optimizer_changed:
             self.optimizer = self._create_optimizer()
@@ -323,6 +365,10 @@ class Trainer:
         self._after_compile_hook()
         
         self._compiled = True
+    def predict(self, x: np.ndarray, batch_size: Optional[int] = None) -> np.ndarray:
+        """Alias for :meth:`eval`."""
+        return self.eval(x, batch_size=batch_size)
+
     def eval(self, x: np.ndarray, batch_size: Optional[int] = None) -> np.ndarray:
         """Evaluate the network at given input points.
 
@@ -342,10 +388,10 @@ class Trainer:
             batch_size = getattr(self, '_batch_size', None)
 
         params_dict = self._build_params()
-        params = self.network.params
+        params = self.model.params
 
         def _infer_batch(x_batch):
-            out = self.network.apply(params, jnp.asarray(x_batch, dtype=jnp.float32), params_dict)
+            out = self.model.apply(params, jnp.asarray(x_batch, dtype=jnp.float32), params_dict)
             return np.array(out)
 
         if batch_size is None or batch_size >= len(x):
@@ -385,7 +431,7 @@ class Trainer:
 
     def _call_network(self, x, params_dict):
         """Call the JAX network via network.apply(params, x, params_dict)."""
-        return self.network.apply(self.network.params, x, params_dict)
+        return self.model.apply(self.model.params, x, params_dict)
 
     # ==================== PDE Loss (Common Implementation) ====================
     
@@ -479,7 +525,7 @@ class Trainer:
                 "_compute_total_loss_base called before compile(). "
                 "Call trainer.compile() first."
             )
-        residuals = _eval_fn(self.network.params, data)
+        residuals = _eval_fn(self.model.params, data)
         losses = {}
         total_loss = jnp.array(0.0)
         for name, R in residuals.items():
@@ -769,10 +815,22 @@ class Trainer:
         """
         self._train_data = {}
         self._train_targets = {}  # Store precomputed target values
+        _domain = getattr(self.problem, 'domain', None)
+        _has_surface_normals = (
+            _domain is not None
+            and getattr(_domain, '_vertex_normals', None) is not None
+        )
         for name, n in self.train_samples.items():
             if n > 0:
                 np_data = self._sample_points_np(name, n)
                 self._train_data[name] = self._to_tensor(np_data)
+                if _has_surface_normals:
+                    _normals = np.array(
+                        _domain.surface_normal(jnp.array(np_data.astype('float32')))
+                    )
+                    self._train_data[f'__fixed_domain__normals_{name}'] = (
+                        self._to_tensor(_normals)
+                    )
         # Dataset: always include all fixed observation points.
         if self.dataset is not None:
             for _dt in self.dataset._data_terms:
@@ -784,10 +842,22 @@ class Trainer:
         """Sample test data and store as backend tensors."""
         self._test_data = {}
         self._test_targets = {}  # Store precomputed target values
+        _domain = getattr(self.problem, 'domain', None)
+        _has_surface_normals = (
+            _domain is not None
+            and getattr(_domain, '_vertex_normals', None) is not None
+        )
         for name, n in self.test_samples.items():
             if n > 0:
                 np_data = self._sample_points_np(name, n)
                 self._test_data[name] = self._to_tensor(np_data)
+                if _has_surface_normals:
+                    _normals = np.array(
+                        _domain.surface_normal(jnp.array(np_data.astype('float32')))
+                    )
+                    self._test_data[f'__fixed_domain__normals_{name}'] = (
+                        self._to_tensor(_normals)
+                    )
 
     def _get_n_batches(self) -> int:
         """Get number of mini-batches based on PDE data size and batch_size."""
@@ -844,26 +914,23 @@ class Trainer:
         return f'x{input_idx}'
     
     def _build_params(self, internal: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Build structured params dictionary for PDE and solution functions.
-        
+        """Build params dictionary for PDE and solution functions.
+
+        Delegates to ``problem._build_params`` so the flat-dict layout is
+        determined by the problem class.  Returns an empty dict when no
+        problem is attached (dataset-only / ModelSolver mode).
+
         Args:
             internal: Internal training state. If None, uses current epoch/step 0.
-            
+
         Returns:
-            Dict with 'fixed', 'infer', and 'internal' keys.
+            Flat params dict as returned by the problem's ``_build_params``.
         """
+        if self.problem is None:
+            return {}
         if internal is None:
             internal = {'global_step': self._global_epoch, 'step': 0}
-        from pinns.problems.problem_strong import ProblemStrong as _PSbp
-        if isinstance(self.problem, _PSbp):
-            fixed = self.problem.fixed_params
-        else:
-            fixed = self.problem.params
-        return {
-            "fixed": fixed,
-            "infer": {},  # Reserved for future inverse problem support
-            "internal": internal
-        }
+        return self.problem._build_params(internal=internal)
     
     def _get_colormap(self, output_idx: int) -> str:
         """Get colormap based on output range symmetry.
@@ -876,10 +943,10 @@ class Trainer:
                 if a is not None:
                     return a
             return None
-        rmin = _first_not_none(getattr(self.network, 'output_range_min', None),
-                               getattr(self.network, 'output_min', None))
-        rmax = _first_not_none(getattr(self.network, 'output_range_max', None),
-                               getattr(self.network, 'output_max', None))
+        rmin = _first_not_none(getattr(self.model, 'output_range_min', None),
+                               getattr(self.model, 'output_min', None))
+        rmax = _first_not_none(getattr(self.model, 'output_range_max', None),
+                               getattr(self.model, 'output_max', None))
         if rmin is None or rmax is None:
             return 'inferno'
         try:
@@ -906,6 +973,7 @@ class Trainer:
             'epoch_times': [],
             'mse_loss': [],        # unweighted total mean(r²), no Lagrange
             'mse_terms': {},       # {term_name: [per-epoch unweighted mean(r²)]}
+            'params': {},          # {param_name: [per-epoch value]}
         }
         self._global_epoch = 0
         if self._plotter is not None:
@@ -923,6 +991,8 @@ class Trainer:
 
     def _is_mesh_domain(self):
         """Return True when the problem domain is a DomainMesh."""
+        if self.problem is None:
+            return False
         try:
             from pinns.domain import DomainMesh as _DomainMesh
             return isinstance(self.problem.domain, _DomainMesh)
@@ -930,11 +1000,10 @@ class Trainer:
             return False
 
     def _call_solution(self, x: np.ndarray) -> np.ndarray:
-        """Call problem.solution with either 1-arg or 2-arg signature."""
-        try:
-            return self.problem.solution(x, self._build_params())
-        except TypeError:
-            return self.problem.solution(x)
+        """Call the analytical solution registered via :meth:`add_solution`."""
+        if self.solution is None:
+            return None
+        return self.solution(x)
 
     def _compute_solution_error_base(self, n_points: int = 1000) -> Optional[float]:
         """
@@ -946,8 +1015,35 @@ class Trainer:
         Returns:
             Relative L2 error as a float, or None if no solution available.
         """
-        if self.problem.solution is None:
+        if not self._has_solution:
             return None
+        if self.problem is None:
+            # Dataset-only inverse mode: evaluate error on dataset points
+            if self.dataset is None:
+                return None
+            all_x, all_y = [], []
+            for term in self.dataset._data_terms:
+                pts = getattr(term, 'points', None)
+                vals = getattr(term, 'values', None)
+                if pts is not None and vals is not None:
+                    all_x.append(np.asarray(pts))
+                    all_y.append(np.asarray(vals))
+            if not all_x:
+                return None
+            x = np.concatenate(all_x, axis=0)
+            y_obs = np.concatenate(all_y, axis=0)
+            if y_obs.ndim == 1:
+                y_obs = y_obs.reshape(-1, 1)
+            y_pred = self.eval(x)
+            y_true = self._call_solution(x)
+            if y_true is None:
+                return None
+            if y_true.ndim == 1:
+                y_true = y_true.reshape(-1, 1)
+            valid = np.isfinite(y_true).all(axis=1) & np.isfinite(y_pred).all(axis=1)
+            if not valid.any():
+                return None
+            return float(np.mean((y_pred[valid] - y_true[valid]) ** 2))
 
         # For transient mesh domains, evaluate only at the plot_time_points
         # snapshots (cheap — no large random interpolation over the full
@@ -1014,6 +1110,43 @@ class Trainer:
     def _get_bc_plot_names(self) -> list:
         """Use soft (filtered) names for plot labels."""
         return self._get_soft_bc_names()
+
+    def add_solution(self, fn) -> 'Trainer':
+        """Register an analytical / reference solution for plotting and error tracking.
+
+        The function ``fn`` must accept a single argument ``x`` of shape
+        ``(N, n_dims)`` and return an array of shape ``(N,)`` or ``(N, n_outputs)``.
+
+        Args:
+            fn: Callable ``fn(x) -> np.ndarray``.
+
+        Returns:
+            self (for method chaining).
+        """
+        self.solution = fn
+        return self
+
+    def add_parameter_solution(self, name: str, value: float) -> 'Trainer':
+        """Register the true value of an inferred parameter for display on plots.
+
+        When a parameter is being inferred via ``fit_model_parameters``, this
+        method registers its ground-truth value so that a horizontal reference
+        line is drawn on the parameter-history plot during training.
+
+        Args:
+            name:  Parameter name (must be in ``fit_model_parameters``).
+            value: True / target value of the parameter.
+
+        Returns:
+            self (for method chaining).
+        """
+        self._parameter_solutions[name] = float(value)
+        return self
+
+    @property
+    def _has_solution(self) -> bool:
+        """True if a solution has been registered via :meth:`add_solution`."""
+        return self.solution is not None
 
     def compile(
         self,
@@ -1114,16 +1247,30 @@ class Trainer:
         from ..models.model_base import ModelBase as _ModelBase
         from ..models.model_partitioned import ModelPartitioned as _ModelPartitioned
         _jax_model_types = (_ModelBase, _ModelPartitioned)
-        if isinstance(self.network, _jax_model_types):
-            if not hasattr(self.network, 'params') or self.network.params is None:
+        if isinstance(self.model, _jax_model_types):
+            if not hasattr(self.model, 'params') or self.model.params is None:
                 rng = jax.random.PRNGKey(0)
-                self.network.params = self.network.init(rng)
+                self.model.params = self.model.init(rng)
+
+        # ModelSolver: initialise params as the subset selected by fit_model_parameters.
+        if getattr(self.model, '_is_solver_problem', False):
+            _fit = getattr(self, '_fit_model_parameters', None)
+            if _fit is not None:
+                import jax.numpy as _jnp
+                self.model.params = {
+                    k: _jnp.array(self.model._params[k]) for k in _fit
+                }
+            elif not hasattr(self.model, 'params') or self.model.params is None:
+                import jax.numpy as _jnp
+                self.model.params = {
+                    k: _jnp.array(v) for k, v in self.model._params.items()
+                }
 
         if self.optimizer_name == "lbfgs":
             # L-BFGS state is managed by jaxopt solver
             self.opt_state = None
         else:
-            self.opt_state = self.optimizer.init(self.network.params)
+            self.opt_state = self.optimizer.init(self.model.params)
 
     def _after_compile_hook(self):
         """Sample data and precompute FBPINN sparse data if applicable."""
@@ -1141,7 +1288,7 @@ class Trainer:
         use_batching = self._batch_size is not None and self._batch_size > 0
 
         from ..models.model_partitioned import ModelPartitioned as _MP
-        if self._use_sparse_fbpinn and isinstance(self.network, _MP) and not use_batching:
+        if self._use_sparse_fbpinn and isinstance(self.model, _MP) and not use_batching:
             self._precompute_sparse_data()
         elif use_batching:
             # Clear any precomputed sparse data when batching
@@ -1154,7 +1301,7 @@ class Trainer:
         New JAX ``ModelPartitioned`` models do not expose the precomputation API;
         this method is a no-op for those models.
         """
-        if not hasattr(self.network, 'precompute_sparse_indices_jit'):
+        if not hasattr(self.model, 'precompute_sparse_indices_jit'):
             return
 
         params_dict = self._build_params()
@@ -1163,7 +1310,7 @@ class Trainer:
         if 'pde' in self._train_data:
             x_pde = self._train_data['pde']
             # Store sparse indices for differentiable PDE computation
-            self._precomputed_pde = self.network.precompute_sparse_indices_jit(
+            self._precomputed_pde = self.model.precompute_sparse_indices_jit(
                 x_pde, threshold=self._sparse_threshold, params_dict=params_dict
             )
         
@@ -1171,7 +1318,7 @@ class Trainer:
         self._precomputed_bcs = {}
         for name, x_bc in self._train_data.items():
             if name != 'pde':
-                self._precomputed_bcs[name] = self.network.precompute_training_data_jit(
+                self._precomputed_bcs[name] = self.model.precompute_training_data_jit(
                     x_bc, threshold=self._sparse_threshold, params_dict=params_dict
                 )
 
@@ -1195,14 +1342,14 @@ class Trainer:
         """Compute PDE residual using JAX autodiff - supports both 3-arg and 4-arg PDEs,
         and ProblemStrong (which uses _terms instead of pde_fn)."""
         from pinns.problems.problem_strong import ProblemStrong as _PSResidual
-        model_apply = lambda p, xin: self.network.apply(p, xin, params_dict)
+        model_apply = lambda p, xin: self.model.apply(p, xin, params_dict)
 
         if isinstance(self.problem, _PSResidual):
             # ProblemStrong: evaluate the first 'inner' term as the PDE residual
             inner_terms = [t for t in self.problem._terms if t.kind == 'inner']
             if not inner_terms:
                 return jnp.zeros((x.shape[0], 1))
-            deriv_fn = make_derivative_fn(model_apply, self.network.params)
+            deriv_fn = make_derivative_fn(model_apply, self.model.params)
             residuals = []
             for term in inner_terms:
                 if term.fn is not None and callable(term.fn):
@@ -1222,8 +1369,8 @@ class Trainer:
         if getattr(bc, 'is_weak', False):
             out_names = bc.output_names or [bc.name]
             return {oname: 0.0 for oname in out_names}
-        model_apply = lambda p, xin: self.network.apply(p, xin, params_dict)
-        deriv_fn = make_derivative_fn(model_apply, self.network.params)
+        model_apply = lambda p, xin: self.model.apply(p, xin, params_dict)
+        deriv_fn = make_derivative_fn(model_apply, self.model.params)
         import inspect as _inspect
         sig = _inspect.signature(bc.fn)
         n_params = len(sig.parameters)
@@ -1246,8 +1393,8 @@ class Trainer:
         """Evaluate a TermMeshCustomBC residual with full JAX autodiff."""
         if getattr(bc, 'is_weak', False):
             return 0.0
-        model_apply = lambda p, xin: self.network.apply(p, xin, params_dict)
-        deriv_fn = make_derivative_fn(model_apply, self.network.params)
+        model_apply = lambda p, xin: self.model.apply(p, xin, params_dict)
+        deriv_fn = make_derivative_fn(model_apply, self.model.params)
         import inspect as _inspect
         sig = _inspect.signature(bc.fn)
         n_params = len(sig.parameters)
@@ -1277,9 +1424,9 @@ class Trainer:
             return {}
         x = jnp.array(x_np)
         params_dict = self._build_params()
-        model_apply = lambda p, xin: self.network.apply(p, xin, params_dict)
-        y = self.network.apply(self.network.params, x, params_dict)
-        deriv_fn = make_derivative_fn(model_apply, self.network.params)
+        model_apply = lambda p, xin: self.model.apply(p, xin, params_dict)
+        y = self.model.apply(self.model.params, x, params_dict)
+        deriv_fn = make_derivative_fn(model_apply, self.model.params)
         try:
             sig = _inspect.signature(obs_fn)
             n_params = len(sig.parameters)
@@ -1302,8 +1449,8 @@ class Trainer:
     
     def _compute_directional_derivative(self, x, component: int, dim: int, params_dict):
         """Compute derivative of y[component] w.r.t. x[dim] using JAX JVP."""
-        params = self.network.params
-        model_apply = lambda p, xin: self.network.apply(p, xin, params_dict)
+        params = self.model.params
+        model_apply = lambda p, xin: self.model.apply(p, xin, params_dict)
         
         n_dims = x.shape[1]
         eye = jnp.eye(n_dims)
@@ -1325,7 +1472,7 @@ class Trainer:
         For JIT training, make_derivative_fn is called inline in compute_loss_strong.
         """
         from ..functional import make_derivative_fn
-        network = self.network
+        network = self.model
         params = network.params
         _pd = params_dict
 
@@ -1356,11 +1503,30 @@ class Trainer:
 
         _weights           = weights
         _relative_weights  = relative_weights
-        _net_losses = list(getattr(self.network, 'network_losses', []))
-        _residual_fn = self.problem.make_residual_fn(self.network)
+        _net_losses = list(getattr(self.model, 'network_losses', []))
+        if self.problem is not None:
+            _residual_fn = self.problem.make_residual_fn(self.model)
+        else:
+            # Dataset-only / ModelSolver mode — no PDE residuals.
+            _residual_fn = lambda params, data: {}
         self._residual_fn = _residual_fn
         self._residual_fn_jit = jax.jit(_residual_fn)
         _schedulers = list(schedulers) if schedulers else []
+
+        # Bake dataset targets into the closure as static JAX arrays so they are
+        # included in the JIT-compiled training loss (not just the metrics path).
+        _dataset_terms = []
+        _dataset_targets = {}   # (name, col_idx) -> jnp array (N,)
+        _network_apply = self.model.apply
+        _params_dict_for_dataset = params_dict
+        if self.dataset is not None:
+            for _dt in self.dataset._data_terms:
+                _dataset_terms.append(_dt)
+                for k, comp in enumerate(_dt.components):
+                    _dataset_targets[(_dt.name, k)] = (
+                        jnp.array(_dt.outputs[:, k], dtype=jnp.float32),
+                        comp,
+                    )
 
         def _resolve_weight(name):
             """Effective weight = static priority * adaptive relative weight.
@@ -1409,6 +1575,18 @@ class Trainer:
                     total_loss = (total_loss
                                   + _weights.get(nloss.name, nloss.weight)
                                   * nloss.fn(params, x_nl))
+            # Dataset supervised terms: fixed inputs are in train_data; targets
+            # are baked into the closure as static JAX arrays.
+            for _dt in _dataset_terms:
+                _x_d = train_data.get(_dt.name) if train_data else None
+                if _x_d is None:
+                    continue
+                _y_d = _network_apply(params, _x_d, _params_dict_for_dataset)
+                _w_d = _resolve_weight(_dt.name)
+                for k, comp in enumerate(_dt.components):
+                    _tgt, _comp = _dataset_targets[(_dt.name, k)]
+                    _res = _y_d[:, _comp] - _tgt
+                    total_loss = total_loss + _w_d * jnp.mean(_res ** 2)
             return total_loss, (residuals, new_sched_states)
 
         return compute_loss, True
@@ -1450,10 +1628,11 @@ class Trainer:
         """Override: for BPTT rollout mode unroll the full trajectory and compare."""
         from pinns.problems.problem_weak import ProblemWeak as _PW
         _is_rollout = (
-            isinstance(self.problem, _PW)
+            self.problem is not None
+            and isinstance(self.problem, _PW)
             and getattr(self.problem.domain, '_time_mode', None) == 'discrete'
-            and self.problem.solution is not None
-            and hasattr(self.network, 'predict_rollout')
+            and self._has_solution
+            and hasattr(self.model, 'predict_rollout')
         )
         if not _is_rollout:
             return self._compute_solution_error_base(n_points)
@@ -1463,7 +1642,7 @@ class Trainer:
         # Use the current curriculum stage count if set, else full domain horizon
         n_steps = getattr(self, '_curriculum_n_steps', None) or domain.n_steps
         dt      = float(domain.dt)
-        u_all = self.network.predict_rollout(n_steps=n_steps, dt=dt)
+        u_all = self.model.predict_rollout(n_steps=n_steps, dt=dt)
         # u_all: (n_steps+1, n_nodes)
         verts = _np.array(domain._vertices)  # (n_nodes, 2)
         t_vals = _np.array(domain._time_points[:n_steps + 1])  # only trained steps
@@ -1519,7 +1698,7 @@ class Trainer:
             else:
                 total_loss, losses = 0.0, {}
             residuals = (getattr(self, '_last_residuals', None)
-                         or self._residual_fn(self.network.params, None))
+                         or self._residual_fn(self.model.params, None))
             weak_pde_loss = 0.0
             for name, r in residuals.items():
                 _w = weights_dict.get(name, 1.0)
@@ -1613,7 +1792,7 @@ class Trainer:
         _pde_loss = _mse_terms.get('pde', 0.0)
         _bc_losses = [v for k, v in _mse_terms.items() if k != 'pde']
 
-        _loss_to_record = float(reported_loss) if reported_loss is not None else float(full_train_loss)
+        _loss_to_record = float(full_train_loss)
 
         self.history['epoch'].append(epoch_key)
         self.history['train_loss'].append(_loss_to_record)
@@ -1637,8 +1816,16 @@ class Trainer:
             )
             self.history['test_loss'].append(float(test_total))
 
-        if self.problem.solution is not None:
+        if self._has_solution:
             self.history['solution_error'].append(self._compute_solution_error())
+
+        # Track inferred model parameters (fit_model_parameters)
+        _fit_params = getattr(self, '_fit_model_parameters', None)
+        if _fit_params and hasattr(self.model, 'params') and self.model.params is not None:
+            for _pname in _fit_params:
+                if _pname in self.model.params:
+                    _pval = float(self.model.params[_pname])
+                    self.history['params'].setdefault(_pname, []).append(_pval)
 
         msg = (stage_prefix +
                f"Epoch {epoch_display}/{ep_total} | "
@@ -1649,8 +1836,16 @@ class Trainer:
             msg += f" | Data: [{data_str}]"
         if self.history['test_loss']:
             msg += f" | Test Loss: {self.history['test_loss'][-1]:.2e}"
-        if self.problem.solution is not None:
-            msg += f" | Error: {self.history['solution_error'][-1]:.2e}"
+        if self._has_solution:
+            _sol_err = self.history['solution_error'][-1]
+            msg += f" | Error: {_sol_err:.2e}" if _sol_err is not None else " | Error: N/A"
+        if self.history['params']:
+            _p_strs = []
+            for _pn, _pv_list in self.history['params'].items():
+                if _pv_list:
+                    _p_strs.append(f"{_pn}: {_pv_list[-1]:.6g}")
+            if _p_strs:
+                msg += f" | Params: [{', '.join(_p_strs)}]"
         msg += f" | Time: {elapsed:.1f}s"
         print(msg)
 
@@ -1693,6 +1888,12 @@ class Trainer:
         target_dict  = self._train_targets if kind == "train" else self._test_targets
         samples_dict = self.train_samples  if kind == "train" else self.test_samples
 
+        _domain = getattr(self.problem, 'domain', None)
+        _has_surface_normals = (
+            _domain is not None
+            and getattr(_domain, '_vertex_normals', None) is not None
+        )
+
         def _resample_one(name):
             current_n = samples_dict.get(name, 0)
             new_n = n if n is not None else current_n
@@ -1702,6 +1903,13 @@ class Trainer:
             samples_dict[name] = new_n
             np_data = self._sample_points_np(name, new_n)
             data_dict[name] = self._to_tensor(np_data)
+            if _has_surface_normals:
+                _normals = np.array(
+                    _domain.surface_normal(jnp.array(np_data.astype('float32')))
+                )
+                data_dict[f'__fixed_domain__normals_{name}'] = (
+                    self._to_tensor(_normals)
+                )
             # Recompute targets for BCs with callable values
             bc = self._get_bc_by_name(name)
             if bc is not None and callable(getattr(bc, 'value', None)):
@@ -1798,7 +2006,7 @@ class Trainer:
         if _cached is not None and term in _cached:
             return np.asarray(_cached[term]).flatten()
         _eval_fn = getattr(self, '_residual_fn_jit', None) or self._residual_fn
-        residuals_dict = _eval_fn(self.network.params, self._train_data)
+        residuals_dict = _eval_fn(self.model.params, self._train_data)
         if term not in residuals_dict:
             raise KeyError(
                 f"Term {term!r} not found in residuals. "
@@ -1906,9 +2114,10 @@ class Trainer:
         #   stage N → unroll N_TIME steps for epochs_by_time_step epochs
         # Each stage re-JITs the rollout loss fn for the new scan length.
         _ebt = getattr(self, '_epochs_by_time_step', None)
+        _problem_domain = getattr(self.problem, 'domain', None) if self.problem is not None else None
         _n_time_max = (
-            self.problem.domain.n_steps
-            if getattr(self.problem.domain, '_time_mode', None) == 'discrete'
+            _problem_domain.n_steps
+            if _problem_domain is not None and getattr(_problem_domain, '_time_mode', None) == 'discrete'
             else None
         )
         _in_curriculum = getattr(self, '_curriculum_running', False)
@@ -1929,7 +2138,7 @@ class Trainer:
                     # changes the loss landscape significantly, so stale SOAP/Adam
                     # second-order statistics from the previous (shorter) stage
                     # would cause overshooting on the first few updates.
-                    self.opt_state = self.optimizer.init(self.network.params)
+                    self.opt_state = self.optimizer.init(self.model.params)
                     self.train()   # recursive call; _curriculum_running guards re-entry
             finally:
                 self._curriculum_running = False
@@ -1944,12 +2153,12 @@ class Trainer:
                 else:
                     _step_weights_final = None
                 self._weak_loss_fn = jax.jit(
-                    self.problem.make_rollout_loss_fn(self.network, n_steps=_n_time_max, step_weights=_step_weights_final)
+                    self.problem.make_rollout_loss_fn(self.model, n_steps=_n_time_max, step_weights=_step_weights_final)
                 )
                 # Rebuild AL fn for the full rollout if AL mode is active
                 if getattr(self, '_rollout_al_mode', False):
                     _n_free = len(self.problem.free_nodes)
-                    _al_fn  = jax.jit(self.problem.make_rollout_al_loss_fn(self.network, n_steps=_n_time_max))
+                    _al_fn  = jax.jit(self.problem.make_rollout_al_loss_fn(self.model, n_steps=_n_time_max))
                     self._rollout_al_fn = _al_fn
                     # Reset lambdas for full-rollout phase (same rationale as per-stage reset)
                     self._rollout_lambdas = jnp.zeros((_n_time_max, _n_free), dtype=jnp.float32)
@@ -2112,17 +2321,17 @@ class Trainer:
                             batch_targets[name] = shuffled_train_targets[name][start_idx:end_idx]
                     
                     if is_full_jit:
-                        self.network.params, self.opt_state, loss, _step_res, _new_ss = train_step(
-                                self.network.params, self.opt_state, batch_data, batch_targets,
+                        self.model.params, self.opt_state, loss, _step_res, _new_ss = train_step(
+                                self.model.params, self.opt_state, batch_data, batch_targets,
                                 _sched_states,
                             )
                         self._last_residuals = _step_res
                         _sched_states = {**_sched_states, **_new_ss}
                     else:
-                        (loss, (_step_res, _new_ss)), grads = grad_fn(self.network.params, batch_data, batch_targets, _sched_states)
+                        (loss, (_step_res, _new_ss)), grads = grad_fn(self.model.params, batch_data, batch_targets, _sched_states)
                         self._last_residuals = _step_res
                         _sched_states = {**_sched_states, **_new_ss}
-                        self.network.params, self.opt_state = apply_updates(self.network.params, grads, self.opt_state)
+                        self.model.params, self.opt_state = apply_updates(self.model.params, grads, self.opt_state)
                     
                     epoch_loss += float(loss)
                 
@@ -2132,25 +2341,25 @@ class Trainer:
                 if is_full_jit:
                     # ── Per-step Lagrangian rollout (AL dual-ascent) ──────────
                     if _al_step_fn is not None:
-                        self.network.params, self.opt_state, loss, _step_res = _al_step_fn(
-                            self.network.params, self.opt_state, self._rollout_lambdas
+                        self.model.params, self.opt_state, loss, _step_res = _al_step_fn(
+                            self.model.params, self.opt_state, self._rollout_lambdas
                         )
                         # Dual ascent: λ ← λ + lr * R̂  (plain numpy, outside JIT)
                         # step_res are already normalised by node_norm inside the
                         # loss fn, so the update is scale-free w.r.t. mesh size.
                         self._rollout_lambdas = self._rollout_lambdas + self.lagrange_lr * _step_res
                     else:
-                        self.network.params, self.opt_state, loss, _step_res, _new_ss = train_step(
-                                self.network.params, self.opt_state, self._train_data, _train_targets,
+                        self.model.params, self.opt_state, loss, _step_res, _new_ss = train_step(
+                                self.model.params, self.opt_state, self._train_data, _train_targets,
                                 _sched_states,
                             )
                         self._last_residuals = _step_res
                         _sched_states = {**_sched_states, **_new_ss}
                 else:
-                    (loss, (_step_res, _new_ss)), grads = grad_fn(self.network.params, self._train_data, _train_targets, _sched_states)
+                    (loss, (_step_res, _new_ss)), grads = grad_fn(self.model.params, self._train_data, _train_targets, _sched_states)
                     self._last_residuals = _step_res
                     _sched_states = {**_sched_states, **_new_ss}
-                    self.network.params, self.opt_state = apply_updates(self.network.params, grads, self.opt_state)
+                    self.model.params, self.opt_state = apply_updates(self.model.params, grads, self.opt_state)
 
             # Scheduler on_epoch_end hooks (lr plateau detection, etc.)
             if _has_schedulers:

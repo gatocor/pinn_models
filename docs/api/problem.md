@@ -53,7 +53,7 @@ def pde_fn(X: torch.Tensor, V: torch.Tensor, params: dict) -> torch.Tensor:
         X: Input tensor of shape (batch_size, n_dims)
         V: Network output tensor of shape (batch_size, n_outputs)
         params: Dictionary containing:
-            - 'fixed': User-provided parameters
+            - flat params: User-provided parameters
             - 'infer': Parameters to infer (future)
             - 'internal': Training state {global_step, step}
             
@@ -69,7 +69,7 @@ $$\frac{\partial u}{\partial t} = \alpha \frac{\partial^2 u}{\partial x^2}$$
 
 ```python
 def heat_equation(X, V, params):
-    alpha = params["fixed"]["alpha"]
+    alpha = params["parameter"]["alpha"]
     
     u_t = pinns.derivative(V, X, component=0, order=(1,))    # ∂u/∂t
     u_xx = pinns.derivative(V, X, component=0, order=(0, 0)) # ∂²u/∂x²
@@ -85,8 +85,8 @@ $$\frac{\partial u}{\partial x} + \frac{\partial v}{\partial y} = 0$$
 
 ```python
 def navier_stokes(X, V, params):
-    nu = params["fixed"]["nu"]
-    rho = params["fixed"]["rho"]
+    nu = params["parameter"]["nu"]
+    rho = params["parameter"]["rho"]
     
     # Outputs: u, v, p
     u = V[:, 0:1]
@@ -167,7 +167,7 @@ def analytical_solution(X, params):
     Returns:
         Solution array of shape (batch_size, n_outputs)
     """
-    alpha = params["fixed"]["alpha"]
+    alpha = params["parameter"]["alpha"]
     x = X[:, 0:1]
     t = X[:, 1:2]
     
@@ -229,14 +229,14 @@ domain.add_dirichlet(
 
 # 3. Define PDE
 def heat_equation(X, V, params):
-    alpha = params["fixed"]["alpha"]
+    alpha = params["parameter"]["alpha"]
     u_t = pinns.derivative(V, X, 0, (1,))
     u_xx = pinns.derivative(V, X, 0, (0, 0))
     return u_t - alpha * u_xx
 
 # 4. Define analytical solution
 def solution(X, params):
-    alpha = params["fixed"]["alpha"]
+    alpha = params["parameter"]["alpha"]
     x, t = X[:, 0:1], X[:, 1:2]
     return np.exp(-alpha * np.pi**2 * t) * np.sin(np.pi * x)
 

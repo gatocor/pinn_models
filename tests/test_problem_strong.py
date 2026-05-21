@@ -241,51 +241,49 @@ class TestDataset:
 
 
 # ---------------------------------------------------------------------------
-# add_fixed / add_inferred / update_params
+# add_parameter / update_params
 # ---------------------------------------------------------------------------
 
 class TestParams:
-    def test_add_fixed_scalar(self):
+    def test_add_parameter_scalar(self):
         p = ProblemStrong(_domain_1d(), ['u'])
-        p.add_fixed('alpha', 0.01)
-        assert p.fixed_params['alpha'] == 0.01
+        p.add_parameter('alpha', 0.01)
+        assert p._params['alpha'] == 0.01
 
-    def test_add_fixed_list(self):
+    def test_add_parameter_list(self):
         p = ProblemStrong(_domain_1d(), ['u'])
-        p.add_fixed(['a', 'b'], [1.0, 2.0])
-        assert p.fixed_params == {'a': 1.0, 'b': 2.0}
+        p.add_parameter(['a', 'b'], [1.0, 2.0])
+        assert p._params == {'a': 1.0, 'b': 2.0}
 
-    def test_add_fixed_list_length_mismatch_raises(self):
+    def test_add_parameter_list_length_mismatch_raises(self):
         p = ProblemStrong(_domain_1d(), ['u'])
         with pytest.raises(ValueError, match="value"):
-            p.add_fixed(['a', 'b'], [1.0])
+            p.add_parameter(['a', 'b'], [1.0])
 
-    def test_add_inferred(self):
+    def test_add_parameter_trainable(self):
         p = ProblemStrong(_domain_1d(), ['u'])
-        p.add_inferred('k', init=1.5)
-        assert p.inferred_params['k'] == 1.5
+        p.add_parameter('k', 1.5, trainable=True)
+        assert p._params['k'] == 1.5
+        assert 'k' in p._trainable
 
-    def test_add_inferred_multiple(self):
+    def test_add_parameter_trainable_multiple(self):
         p = ProblemStrong(_domain_1d(), ['u'])
-        p.add_inferred(['k', 'm'], init=[1.0, 2.0])
-        assert p.inferred_params == {'k': 1.0, 'm': 2.0}
+        p.add_parameter(['k', 'm'], [1.0, 2.0], trainable=True)
+        assert p._params['k'] == 1.0
+        assert p._params['m'] == 2.0
+        assert 'k' in p._trainable
+        assert 'm' in p._trainable
 
     def test_update_params(self):
         p = ProblemStrong(_domain_1d(), ['u'])
-        p.add_fixed('alpha', 0.0)
+        p.add_parameter('alpha', 0.0)
         p.update_params(alpha=0.5)
-        assert p.fixed_params['alpha'] == 0.5
+        assert p._params['alpha'] == 0.5
 
-    def test_chaining_add_fixed(self):
+    def test_chaining_add_parameter(self):
         p = ProblemStrong(_domain_1d(), ['u'])
-        result = p.add_fixed('a', 1.0)
+        result = p.add_parameter('a', 1.0)
         assert result is p
-
-    def test_add_solution(self):
-        p = ProblemStrong(_domain_1d(), ['u'])
-        sol = lambda x, pars: np.zeros(x.shape[0])
-        p.add_solution(sol)
-        assert callable(p.solution)
 
 
 # ---------------------------------------------------------------------------

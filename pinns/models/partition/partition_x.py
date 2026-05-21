@@ -134,7 +134,7 @@ def register_interface_loss(
     Register an X-PINN interface-continuity loss on two
     :class:`~pinns.models.model_base.ModelBase` instances.
 
-    Adds a :class:`~pinns.models.model_base.NetworkLoss` to **both** networks so that
+    Adds a :class:`~pinns.models.model_base.modelLoss` to **both** networks so that
     each one tries to match the other's prediction at the interface.  The
     gradient flows only through the *owning* network's parameters;
     the other network's output is treated as a fixed target via

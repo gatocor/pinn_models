@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 import numpy as np
+import jax.nn
 import jax.numpy as jnp
 
 __all__ = ["PartitionFB"]
@@ -13,58 +14,77 @@ class PartitionFB:
     """Finite-Basis PINN (FB-PINN) strategy.
 
     Each network covers one subdomain and its output is weighted by a smooth
-    **window function** that peaks at the subdomain centre and decays to zero
-    at the boundary, with the width of the transition zone controlled by
-    *overlap*.  The global solution is the sum of all windowed predictions
-    (partition of unity).
+    **window function**.  The subdomain decomposition is defined by the domain
+    partition (``domain.set_partition(...)``); ``PartitionFB`` only controls
+    *how wide* the windows are relative to each subdomain's width.
 
-    Subdomain bounds are read automatically from the domain during
-    :meth:`setup`, or can be specified explicitly via *xmin* / *xmax* when a
-    single network covers only part of a larger domain (multi-network
-    decomposition).
+    The global solution is assembled as a **dynamic partition of unity**:
+
+        u(x) = Σᵢ wᵢ(x)·uᵢ(x) / Σᵢ wᵢ(x)
+
+    which is exact regardless of window shape, matching the original FBPINNs
+    implementation.
 
     Parameters
     ----------
     overlap : float
-        Controls the width of the tanh transition zone as a fraction of each
-        subdomain's spatial extent (0 = no smooth overlap; 0.5 = default).
-    continuity_weight : float
-        Weight on the interface-continuity penalty used by the Trainer.
-        Default ``1.0``.
-    xmin, xmax : array-like or None
-        Explicit spatial bounds of this network's subdomain.  When ``None``
-        (default), bounds are taken from the domain passed to :meth:`setup`.
+        Window width as a multiple of the subdomain spacing.
+        For ``window='hann'`` (default): each bell spans
+        ``overlap × spacing`` centred on the subdomain midpoint.
+        The original FBPINNs paper uses ``subdomain_ws = 0.15`` with
+        ``spacing = 1/14``, giving ``overlap ≈ 2.1``.
+        For ``window='cosine'``: the flat-top region equals the home interval
+        and each transition extends ``overlap × home_width`` on each side.
+        For ``window='sigmoid'``: same as cosine but with a logistic ramp.
+        Must be > 0.
+    window : str
+        Window function:
+
+        * ``'hann'`` (default) — pure cosine bell ``((1+cos)/2)²``,
+          matching the original FBPINNs paper.  Dynamic POU normalization
+          makes the precise width less critical.
+        * ``'cosine'`` — flat-top cosine with zero-derivative plateau inside
+          each subdomain.  Useful when ODE residuals must be free of
+          window-derivative cross-terms.
+        * ``'sigmoid'`` — logistic sigmoid ramp on each edge.
 
     Example::
 
-        # Single network for the whole domain:
-        net = ModelBase(domain, output_dim=1, spatial=PartitionFB(overlap=0.3))
-
-        # Multi-network decomposition (each network gets its own bounds):
-        net_left  = ModelBase(domain, output_dim=1,
-                            spatial=PartitionFB(overlap=0.3, xmin=[0], xmax=[0.5]))
-        net_right = ModelBase(domain, output_dim=1,
-                            spatial=PartitionFB(overlap=0.3, xmin=[0.5], xmax=[1.0]))
+        domain = DomainCubic(time=(0, 1))
+        domain.set_partition(time=15)   # 14 subdomains
+        model  = create_model(domain, output_dim=1, hidden_dims=(32,))
+        net_fb = ModelPartitioned(model, PartitionFB(overlap=2.1))
+        # window width ≈ 2.1 × (1/14) ≈ 0.15, matching the original paper
     """
 
     def __init__(
         self,
-        overlap: float = 0.5,
-        continuity_weight: float = 1.0,
+        overlap: float = 2.1,
+        window: str = "hann",
         xmin=None,
         xmax=None,
+        wmin=None,
+        wmax=None,
     ):
-        if not (0.0 <= overlap < 1.0):
-            raise ValueError("PartitionFB: overlap must be in [0, 1).")
-        if continuity_weight < 0.0:
-            raise ValueError("PartitionFB: continuity_weight must be >= 0.")
+        if overlap <= 0.0:
+            raise ValueError("PartitionFB: overlap must be > 0.")
+        if window not in ("cosine", "sigmoid", "hann"):
+            raise ValueError("PartitionFB: window must be 'cosine', 'sigmoid', or 'hann'.")
         self.overlap = float(overlap)
-        self.continuity_weight = float(continuity_weight)
+        self.window = window
         self._xmin: Optional[np.ndarray] = (
             np.asarray(xmin, dtype=np.float64) if xmin is not None else None
         )
         self._xmax: Optional[np.ndarray] = (
             np.asarray(xmax, dtype=np.float64) if xmax is not None else None
+        )
+        # wmin/wmax: total window width on the left/right edge.
+        # Set internally by ModelPartitioned based on overlap × spacing.
+        self._wmin: Optional[np.ndarray] = (
+            np.asarray(wmin, dtype=np.float64) if wmin is not None else None
+        )
+        self._wmax: Optional[np.ndarray] = (
+            np.asarray(wmax, dtype=np.float64) if wmax is not None else None
         )
 
     def setup(self, domain) -> None:
@@ -80,26 +100,92 @@ class PartitionFB:
     # ------------------------------------------------------------------
 
     def _window(self, x_spatial):
-        """Smooth bump window: product of tanh ramps over each spatial dim.
+        """Window function for FB-PINN.
 
-        ``w(x) = prod_d  tanh((x_d - xmin_d)/σ_d) * tanh((xmax_d - x_d)/σ_d)``
+        Two variants are supported, chosen by ``self.window``:
 
-        where ``σ_d = max(overlap * (xmax_d - xmin_d), 1e-8)``.
-        The result is in ``(0, 1]`` (maximum 1 at the domain centre).
+        **'cosine'** (default):
+            Flat-top window with cosine transitions at each edge.
+            Inside the home interval ``[a, b]``, ``w = 1`` and ``dw/dt = 0``
+            exactly, so auto-differentiated ODE residuals contain no spurious
+            window-derivative cross-terms.  Outside ``[a - ov·h, b + ov·h]``,
+            ``w = 0`` exactly.  Transition is a raised-cosine ramp.
+
+        **'hann'** (default, matches the original FBPINNs paper exactly):
+            Hann bell (raised cosine squared) centered at the subdomain midpoint
+            with total width ``overlap × spacing`` (set by ModelPartitioned).
+            The window spans ``[center - width/2, center + width/2]``.
+            Sub-networks use global domain normalization, matching
+            ``unnorm=(0., 1.)`` from the original code.
+
+        **'sigmoid'** (matches eq. 14 of the paper text):
+            Logistic sigmoid window.  Has no flat top, so window derivatives
+            are non-zero everywhere and can pollute high-frequency ODE
+            residuals at subdomain boundaries.
+
+        In 'cosine'/'sigmoid' cases, ``xmin``/``xmax`` store the home
+        breakpoints ``a``/``b`` and ``wmin``/``wmax`` store the transition
+        widths.  In 'hann' case, ``xmin = xmax = center`` and
+        ``wmin = wmax = width`` (total window width).
+
         Shape: ``(batch, 1)``.
         """
-        xmin = jnp.array(self._xmin, dtype=x_spatial.dtype)
-        xmax = jnp.array(self._xmax, dtype=x_spatial.dtype)
-        sigma = jnp.maximum(
-            self.overlap * (xmax - xmin),
-            jnp.full_like(xmax, 1e-8),
-        )
-        w = jnp.prod(
-            jnp.tanh((x_spatial - xmin) / sigma)
-            * jnp.tanh((xmax - x_spatial) / sigma),
-            axis=-1,
-            keepdims=True,
-        )
+        a = jnp.array(self._xmin, dtype=x_spatial.dtype)   # home left  breakpoints (= center for hann)
+        b = jnp.array(self._xmax, dtype=x_spatial.dtype)   # home right breakpoints (= center for hann)
+
+        if self._wmin is not None and self._wmax is not None:
+            wmin = jnp.array(self._wmin, dtype=x_spatial.dtype)
+            wmax = jnp.array(self._wmax, dtype=x_spatial.dtype)
+        else:
+            # Fallback: transition width = half the home width
+            wmin = wmax = (b - a) / 2.0
+
+        if self.window in ("cosine", "hann"):  # hann = cosine with a=b=center
+            # ── Cosine flat-top window ─────────────────────────────────── #
+            # Transition half-widths on left (wl) and right (wr).
+            # Since wmin = 2*ov*h, the transition width on each side = wmin/2 = ov*h.
+            wl = wmin / 2.0   # left transition width  (a - wl  ..  a)
+            wr = wmax / 2.0   # right transition width (b  ..  b + wr)
+
+            # Per-dimension cosine window factors:
+            #   left of outer_left (a-wl):  0
+            #   left ramp [a-wl, a]:        0.5*(1 - cos(π*(x-(a-wl))/wl))
+            #   flat top  [a, b]:           1
+            #   right ramp [b, b+wr]:       0.5*(1 + cos(π*(x-b)/wr))
+            #   right of b+wr:              0
+            def _cos_window_1d(x_d, a_d, b_d, wl_d, wr_d):
+                left_outer  = a_d - wl_d
+                right_outer = b_d + wr_d
+                left_ramp  = 0.5 * (1.0 - jnp.cos(jnp.pi * (x_d - left_outer) / wl_d))
+                right_ramp = 0.5 * (1.0 + jnp.cos(jnp.pi * (x_d - b_d) / wr_d))
+                return jnp.where(
+                    x_d < left_outer, 0.0,
+                    jnp.where(x_d < a_d, left_ramp,
+                    jnp.where(x_d <= b_d, 1.0,
+                    jnp.where(x_d <= right_outer, right_ramp,
+                    0.0))))
+
+            # Apply per-dimension and multiply (for multi-D domains)
+            w = jnp.ones((x_spatial.shape[0], 1), dtype=x_spatial.dtype)
+            for d in range(x_spatial.shape[1]):
+                w_d = _cos_window_1d(
+                    x_spatial[:, d:d+1], a[d], b[d], wl[d], wr[d]
+                )
+                w = w * w_d
+            # Original FBPINNs squares the Hann bell: w = ((1+cos)/2)^2
+            if self.window == 'hann':
+                w = w ** 2
+
+        else:
+            # ── Sigmoid window (eq. 14 of the paper text) ─────────────── #
+            tol = 1e-8
+            t = jnp.log((1.0 - tol) / tol)  # ≈ 18.4
+            sd_min = wmin / (2.0 * t)
+            sd_max = wmax / (2.0 * t)
+            ws = (jax.nn.sigmoid((x_spatial - a) / sd_min)
+                  * jax.nn.sigmoid((b - x_spatial) / sd_max))    # (batch, n_s)
+            w = jnp.prod(ws, axis=-1, keepdims=True)              # (batch, 1)
+
         return w
 
     def predict(self, apply_fn, params, x, params_dict=None):
@@ -135,7 +221,10 @@ class PartitionFB:
         return w * y
 
     def __repr__(self) -> str:
-        parts = [f"overlap={self.overlap}", f"continuity_weight={self.continuity_weight}"]
+        parts = [f"window={self.window!r}", f"overlap={self.overlap}"]
         if self._xmin is not None:
-            parts.append(f"xmin={self._xmin.tolist()}, xmax={self._xmax.tolist()}")
+            parts.append(f"center={self._xmin.tolist()}" if self.window == "hann"
+                         else f"a={self._xmin.tolist()}, b={self._xmax.tolist()}")
+        if self._wmin is not None:
+            parts.append(f"wmin={self._wmin.tolist()}, wmax={self._wmax.tolist()}")
         return f"PartitionFB({', '.join(parts)})"

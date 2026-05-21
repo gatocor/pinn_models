@@ -13,6 +13,7 @@ from .scheduler_grad_norm import SchedulerGradNorm
 from .scheduler_causal import SchedulerCausal
 from .scheduler_warmup_decay import SchedulerWarmupDecay
 from .scheduler_ntk import SchedulerNTK
+from .scheduler_partition import SchedulerPartition, MaskedState, make_masked_optimizer
 
 __all__ = [
     "Scheduler", "is_notebook",
@@ -21,4 +22,5 @@ __all__ = [
     "SchedulerCurriculum", "SchedulerLagrange",
     "SchedulerGradNorm", "SchedulerCausal",
     "SchedulerWarmupDecay", "SchedulerNTK",
+    "SchedulerPartition", "MaskedState", "make_masked_optimizer",
 ]

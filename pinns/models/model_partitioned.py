@@ -89,7 +89,7 @@ from __future__ import annotations
 
 import copy
 import itertools
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -107,14 +107,18 @@ def _clone_strategy(
     prototype: Union[PartitionFB, PartitionX],
     xmin: np.ndarray,
     xmax: np.ndarray,
+    wmin: Optional[np.ndarray] = None,
+    wmax: Optional[np.ndarray] = None,
 ) -> Union[PartitionFB, PartitionX]:
     """Return a new strategy with the same hyper-parameters but new bounds."""
     if isinstance(prototype, PartitionFB):
         return PartitionFB(
             overlap=prototype.overlap,
-            continuity_weight=prototype.continuity_weight,
+            window=prototype.window,
             xmin=xmin,
             xmax=xmax,
+            wmin=wmin,
+            wmax=wmax,
         )
     elif isinstance(prototype, PartitionX):
         return PartitionX(
@@ -131,11 +135,10 @@ def _clone_strategy(
 
 
 def _patch_normalize(model: ModelBase, sub_xmin: np.ndarray, sub_xmax: np.ndarray) -> None:
-    """Update the Normalize layer in *model* to use subdomain bounds.
+    """Update the Normalize layer in *model* to use the given bounds.
 
-    The template model's Normalize layer was configured with the full domain
-    bounds.  For FB-PINN correctness each sub-network must normalize inputs
-    to [-1, 1] within *its own* subdomain, not the global domain.
+    The original FBPINNs uses the WINDOW (extended) bounds for normalisation,
+    so each sub-network normalises its inputs relative to its full window extent.
     """
     from .layers.normalize import Normalize
     import jax.numpy as _jnp
@@ -226,9 +229,10 @@ class ModelPartitioned:
         self._models: List[ModelBase] = []
         self._strategies: List = []
 
+        # ── Normal grid-based build ──────────────────────────────────────── #
         for t_range in temporal_combos:
             for s_combo in spatial_combos:
-                # Assemble bounds for this subdomain.
+                # Assemble home bounds for this subdomain (used for input normalisation).
                 if n_s > 0 and s_combo:
                     sub_xmin = np.array([lo for lo, _hi in s_combo], dtype=float)
                     sub_xmax = np.array([hi for _lo, hi in s_combo], dtype=float)
@@ -240,13 +244,44 @@ class ModelPartitioned:
                     sub_xmin = np.append(sub_xmin, t_range[0])
                     sub_xmax = np.append(sub_xmax, t_range[1])
 
-                # Create a new strategy instance with these bounds.
-                new_strategy = _clone_strategy(strategy, sub_xmin, sub_xmax)
-                new_strategy.setup(domain)
-
-                # Deep-copy the template model and re-normalise to subdomain bounds.
-                m = copy.deepcopy(model)
-                _patch_normalize(m, sub_xmin, sub_xmax)
+                # For PartitionFB, compute window parameters based on overlap and
+                # subdomain width.  For 'hann': bell centered at interval midpoint,
+                # width = overlap × spacing.  For 'cosine'/'sigmoid': flat-top or
+                # sigmoid window spanning [sub_xmin, sub_xmax] with transitions of
+                # width overlap × home_width on each side.
+                if isinstance(strategy, PartitionFB) and len(sub_xmin) > 0:
+                    win = getattr(strategy, 'window', 'hann')
+                    if win == "hann":
+                        # ── Hann bell (original FBPINNs): center-based ── #
+                        # center at interval midpoint; width = overlap × interval_spacing.
+                        # Each sub-network is normalized to its window bounds [center-w/2, center+w/2],
+                        # matching original FBPINNs unnorm=(subdomain_xmin, subdomain_xmax).
+                        center = (sub_xmin + sub_xmax) / 2.0
+                        spacing = sub_xmax - sub_xmin        # interval width per dim
+                        total_w = strategy.overlap * spacing  # window width per dim
+                        outer_xmin = center - total_w / 2.0
+                        outer_xmax = center + total_w / 2.0
+                        s_wmin = s_wmax = total_w
+                        new_strategy = _clone_strategy(strategy, center, center, s_wmin, s_wmax)
+                        new_strategy.setup(domain)
+                        m = copy.deepcopy(model)
+                        _patch_normalize(m, outer_xmin, outer_xmax)
+                    else:
+                        # ── Flat-top cosine / sigmoid: interval-based ─────────── #
+                        ov = strategy.overlap
+                        width = sub_xmax - sub_xmin
+                        s_wmin = s_wmax = 2.0 * ov * width
+                        outer_xmin = sub_xmin - ov * width
+                        outer_xmax = sub_xmax + ov * width
+                        new_strategy = _clone_strategy(strategy, sub_xmin, sub_xmax, s_wmin, s_wmax)
+                        new_strategy.setup(domain)
+                        m = copy.deepcopy(model)
+                        _patch_normalize(m, outer_xmin, outer_xmax)
+                else:
+                    s_wmin = s_wmax = None
+                    new_strategy = _clone_strategy(strategy, sub_xmin, sub_xmax)
+                    new_strategy.setup(domain)
+                    m = copy.deepcopy(model)
                 self._models.append(m)
                 self._strategies.append(new_strategy)
 
@@ -275,6 +310,60 @@ class ModelPartitioned:
             [s._xmax if s._xmax is not None and len(s._xmax) > 0
              else np.empty(0) for s in self._strategies]
         )
+        # Sigmoid transition widths (wmin/wmax) per sub-model.
+        # _all_xmin/_all_xmax are the home breakpoints a_i / b_i (sigmoid centres).
+        # outer edges = a_i - wmin/2  and  b_i + wmax/2.
+        def _w(s, attr):
+            v = getattr(s, attr, None)
+            return v if v is not None else (s._xmax - s._xmin) / 2.0 if s._xmax is not None else np.empty(0)
+        self._all_wmin: np.ndarray = np.stack([_w(s, '_wmin') for s in self._strategies])
+        self._all_wmax: np.ndarray = np.stack([_w(s, '_wmax') for s in self._strategies])
+        # Pre-compute outer edges for reference (not used in forward pass,
+        # normalization is baked into each sub-model's Normalize layer).
+        self._all_outer_xmin: np.ndarray = self._all_xmin - self._all_wmin / 2.0
+        self._all_outer_xmax: np.ndarray = self._all_xmax + self._all_wmax / 2.0
+
+        # Pre-stack per-subdomain normalisation bounds for vmapped FB-PINN forward.
+        # Each sub-model has its own Normalize layer (patched to window bounds);
+        # we extract those bounds here so they can be passed as vmap arguments.
+        from .layers.normalize import Normalize as _Normalize
+        def _get_norm_bounds(m):
+            for layer in getattr(m, '_layers', []):
+                if isinstance(layer, _Normalize) and layer._coords_min is not None:
+                    return np.array(layer._coords_min), np.array(layer._coords_max)
+            dom = m.domain
+            return np.asarray(dom.xmin, dtype=np.float32), np.asarray(dom.xmax, dtype=np.float32)
+        _nb = [_get_norm_bounds(m) for m in self._models]
+        self._all_norm_min: np.ndarray = np.stack([nb[0] for nb in _nb])  # (K, n_dims)
+        self._all_norm_max: np.ndarray = np.stack([nb[1] for nb in _nb])  # (K, n_dims)
+
+        # ── Cache JAX arrays and layer split for fast vmapped FB-PINN forward ── #
+        # These are computed once here so `apply` never repeats numpy→JAX
+        # conversions or Python layer-search on every call.
+        if isinstance(strategy, PartitionFB):
+            self._jax_norm_min = jnp.array(self._all_norm_min, dtype=jnp.float32)
+            self._jax_norm_max = jnp.array(self._all_norm_max, dtype=jnp.float32)
+            self._jax_xmin     = jnp.array(self._all_xmin,     dtype=jnp.float32)
+            self._jax_xmax     = jnp.array(self._all_xmax,     dtype=jnp.float32)
+            self._jax_wmin     = jnp.array(self._all_wmin,     dtype=jnp.float32)
+            self._jax_wmax     = jnp.array(self._all_wmax,     dtype=jnp.float32)
+
+            # Split layers at the Normalize boundary (done once).
+            _norm_idx_init = next(
+                (i for i, l in enumerate(self._models[0]._layers)
+                 if isinstance(l, _Normalize)), None
+            )
+            if _norm_idx_init is not None:
+                self._fb_post_layers = self._models[0]._layers[_norm_idx_init + 1:]
+                self._fb_post_lnames = self._models[0]._layer_names[_norm_idx_init + 1:]
+            else:
+                self._fb_post_layers = self._models[0]._layers
+                self._fb_post_lnames = self._models[0]._layer_names
+
+        elif isinstance(strategy, PartitionX):
+            # Cache arrays for vmapped X-PINN forward.
+            self._jax_xmin = jnp.array(self._all_xmin, dtype=jnp.float32)
+            self._jax_xmax = jnp.array(self._all_xmax, dtype=jnp.float32)
 
     # ── Public interface ─────────────────────────────────────────────── #
 
@@ -355,42 +444,84 @@ class ModelPartitioned:
         apply_fn = self._models[0]._sequential_apply
 
         if isinstance(self._strategy_proto, PartitionFB):
-            # ── FB-PINN: window-weighted sum, fully vmapped ─────────────── #
-            overlap = float(self._strategy_proto.overlap)
-            n_s = self._all_xmin.shape[1]  # spatial+time dims per bound vector
-            all_xmin = jnp.array(self._all_xmin, dtype=x.dtype)  # (K, n_dims)
-            all_xmax = jnp.array(self._all_xmax, dtype=x.dtype)  # (K, n_dims)
+            # ── FB-PINN: window-weighted sum with dynamic POU, vmapped ──── #
+            n_s = self._all_xmin.shape[1]
 
-            # Stack sub-params along a new leading axis so vmap can iterate.
+            # Use precomputed JAX arrays (no numpy→JAX conversion on every call).
+            all_norm_min = self._jax_norm_min.astype(x.dtype)
+            all_norm_max = self._jax_norm_max.astype(x.dtype)
+            all_xmin_v   = self._jax_xmin.astype(x.dtype)
+            all_xmax_v   = self._jax_xmax.astype(x.dtype)
+            all_wmin_v   = self._jax_wmin.astype(x.dtype)
+            all_wmax_v   = self._jax_wmax.astype(x.dtype)
+
+            # Use precomputed layer split (no Python layer search on every call).
+            _post_layers = self._fb_post_layers
+            _post_lnames = self._fb_post_lnames
+
             sub_params_list = [params[f"sub_{i}"] for i in range(n)]
             stacked = jax.tree.map(
                 lambda *arrs: jnp.stack(arrs, axis=0), *sub_params_list
             )
 
-            def _single(sub_p, xmin_i, xmax_i):
-                """Evaluate one sub-network and apply its window function."""
-                y_i = apply_fn(sub_p, x, params_dict)           # (batch, out)
-                x_s = x[:, :n_s]                                 # spatial dims
-                sigma = jnp.maximum(
-                    overlap * (xmax_i - xmin_i),
-                    jnp.full_like(xmax_i, 1e-8),
-                )
-                w = jnp.prod(
-                    jnp.tanh((x_s - xmin_i) / sigma)
-                    * jnp.tanh((xmax_i - x_s) / sigma),
-                    axis=-1, keepdims=True,
-                )                                               # (batch, 1)
-                return w * y_i                                  # (batch, out)
+            _win_type = getattr(self._strategy_proto, 'window', 'hann')
+            _use_hann = _win_type == 'hann'
+            _use_cos  = _win_type in ('cosine', 'hann')
 
-            # all_out: (K, batch, out_dim) — all sub-networks in one XLA call.
-            all_out = jax.vmap(_single)(stacked, all_xmin, all_xmax)
-            return jnp.sum(all_out, axis=0)
+            # Hoist params_dict setup outside the vmapped closure.
+            pd = dict(params_dict) if params_dict else {}
+            pd.setdefault('_x_orig', x)
+
+            def _single_fb(sub_p, nm_min, nm_max, a_i, b_i, wmin_i, wmax_i):
+                # 1. Manual normalise to [-1, 1] using per-subdomain window bounds.
+                x_n = 2.0 * (x - nm_min) / (nm_max - nm_min + 1e-8) - 1.0
+                # 2. Run post-Normalize layers of model 0 (shared architecture).
+                for lname, layer in zip(_post_lnames, _post_layers):
+                    x_n = layer.apply(sub_p.get(lname, {}), x_n, pd)
+                y_i = x_n
+                # 3. Window function.
+                x_s = x[:, :n_s]
+                if _use_cos:
+                    wl = wmin_i / 2.0
+                    wr = wmax_i / 2.0
+                    def _cos1d(x_d, a_d, b_d, wl_d, wr_d):
+                        lo = a_d - wl_d
+                        hi = b_d + wr_d
+                        lr = 0.5 * (1.0 - jnp.cos(jnp.pi * (x_d - lo) / wl_d))
+                        rr = 0.5 * (1.0 + jnp.cos(jnp.pi * (x_d - b_d) / wr_d))
+                        return jnp.where(x_d < lo, 0.0,
+                               jnp.where(x_d < a_d,  lr,
+                               jnp.where(x_d <= b_d, 1.0,
+                               jnp.where(x_d <= hi,  rr, 0.0))))
+                    w = jnp.ones((x_s.shape[0], 1), dtype=x.dtype)
+                    for d in range(n_s):
+                        w = w * _cos1d(x_s[:, d:d+1], a_i[d], b_i[d], wl[d], wr[d])
+                    if _use_hann:
+                        w = w ** 2
+                else:
+                    tol   = 1e-8
+                    t_val = jnp.log((1.0 - tol) / tol)
+                    sd_l  = wmin_i / (2.0 * t_val)
+                    sd_r  = wmax_i / (2.0 * t_val)
+                    ws    = (jax.nn.sigmoid((x_s - a_i) / sd_l)
+                             * jax.nn.sigmoid((b_i - x_s) / sd_r))
+                    w     = jnp.prod(ws, axis=-1, keepdims=True)
+                return w * y_i, w
+
+            all_uw, all_w = jax.vmap(_single_fb)(
+                stacked, all_norm_min, all_norm_max,
+                all_xmin_v, all_xmax_v, all_wmin_v, all_wmax_v,
+            )  # (K, batch, out), (K, batch, 1)
+
+            sum_w  = jnp.sum(all_w,  axis=0)   # (batch, 1)
+            sum_uw = jnp.sum(all_uw, axis=0)   # (batch, out)
+            return sum_uw / jnp.where(sum_w > 0, sum_w, 1.0)
 
         elif isinstance(self._strategy_proto, PartitionX):
             # ── X-PINN: hard-masked sum, fully vmapped ─────────────────── #
             n_s = self._all_xmin.shape[1]
-            all_xmin = jnp.array(self._all_xmin, dtype=x.dtype)
-            all_xmax = jnp.array(self._all_xmax, dtype=x.dtype)
+            all_xmin = self._jax_xmin.astype(x.dtype)
+            all_xmax = self._jax_xmax.astype(x.dtype)
 
             sub_params_list = [params[f"sub_{i}"] for i in range(n)]
             stacked = jax.tree.map(

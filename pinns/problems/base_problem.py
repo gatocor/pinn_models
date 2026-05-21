@@ -4,7 +4,7 @@ pinns/problems/base_problem.py — Shared base class for ProblemStrong and Probl
 Both problem forms share:
 * A flat ``_terms`` list as the single source of truth for all registered terms.
 * ``boundary_conditions`` and ``_inner_terms`` as filter *properties* over ``_terms``.
-* Parameter management (``fixed_params``, ``inferred_params``, ``_build_params``).
+* Parameter management (``_params``, ``_trainable``, ``_build_params``).
 * Observable / solution attachment.
 * Unified ``add_periodic`` via ``domain._periodic_regions``.
 """
@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 class _Dependency:
     """Declares a quantity to evaluate from the previous step's network
-    and store in ``pars['fixed']`` before the next step."""
+    and store in ``pars`` (flat params dict) before the next step."""
 
     def __init__(self, name: str, component: int, order: tuple):
         self.name = name
@@ -46,11 +46,10 @@ class BaseProblem:
         self.n_dims = domain.n_dims
 
         # ── parameter storage ────────────────────────────────────────────
-        self.fixed_params: Dict[str, Any] = {}
-        self.inferred_params: Dict[str, Any] = {}
+        self._params:    Dict[str, Any] = {}   # all parameters, keyed by name
+        self._trainable: set            = set() # names whose gradient should flow
 
-        # ── solution / observable bookkeeping ────────────────────────────
-        self.solution = None
+        # ── observable bookkeeping ──────────────────────────────────────
         self.obs_fn:      Optional[Callable] = None
         self.obs_names:   Optional[List[str]] = None
         self.obs_spatial: List[str] = []
@@ -80,8 +79,8 @@ class BaseProblem:
 
     @property
     def params(self) -> Dict[str, Any]:
-        """Alias for :attr:`fixed_params` (backward compat with ProblemWeak API)."""
-        return self.fixed_params
+        """All registered parameters as a flat dict."""
+        return self._params
 
     @property
     def xmin(self):
@@ -95,7 +94,7 @@ class BaseProblem:
 
     @params.setter
     def params(self, value: Dict[str, Any]) -> None:
-        self.fixed_params = value
+        self._params = value
 
     # ──────────────────────────────────────────────────────────────────── #
     #  Term filter properties                                             #
@@ -456,20 +455,8 @@ class BaseProblem:
         return self
 
     # ──────────────────────────────────────────────────────────────────── #
-    #  Solution / observable                                              #
+    #  Observable                                                         #
     # ──────────────────────────────────────────────────────────────────── #
-
-    def add_solution(self, fn) -> 'BaseProblem':
-        """Attach a reference / analytical solution for error tracking.
-
-        Args:
-            fn: Callable ``fn(xy, params=None) -> array``, shape ``(n, n_dims)``.
-
-        Returns:
-            ``self`` for method chaining.
-        """
-        self.solution = fn
-        return self
 
     def add_observable(
         self,
@@ -499,23 +486,31 @@ class BaseProblem:
     #  Parameter management                                               #
     # ──────────────────────────────────────────────────────────────────── #
 
-    def add_fixed(self, name=None, value=None, **kwargs) -> 'BaseProblem':
-        """Register fixed (constant) parameters.
+    def add_parameter(
+        self,
+        name,
+        value=None,
+        trainable: bool = False,
+    ) -> 'BaseProblem':
+        """Register a parameter.
 
         Supports three call styles::
 
-            problem.add_fixed('alpha', 1e-3)                   # single
-            problem.add_fixed(['alpha', 'beta'], [1e-3, 0.5])  # list
-            problem.add_fixed(alpha=1e-3, beta=0.5)            # kwargs
+            problem.add_parameter('alpha', 1e-3)                          # single
+            problem.add_parameter(['alpha', 'beta'], [1e-3, 0.5])         # list
+            problem.add_parameter('alpha', 1e-3, trainable=True)          # learnable
+
+        Args:
+            name:      Parameter name (``str``) or list of names.
+            value:     Value(s) to register. Scalar is broadcast over names.
+            trainable: If ``True`` gradient flows through this parameter;
+                       otherwise it is frozen with ``stop_gradient``.
 
         Returns:
             ``self`` for method chaining.
         """
-        if kwargs:
-            self.fixed_params.update(kwargs)
-            return self
         if isinstance(name, str):
-            names = [name]
+            names  = [name]
             values = [value]
         else:
             names = list(name)
@@ -525,78 +520,61 @@ class BaseProblem:
                 values = list(value)
                 if len(values) != len(names):
                     raise ValueError(
-                        f"add_fixed: {len(names)} name(s) but {len(values)} value(s)."
+                        f"add_parameter: {len(names)} name(s) but {len(values)} value(s)."
                     )
             else:
-                raise ValueError(
-                    "add_fixed: when name is a list, value must be a "
-                    "list/tuple of the same length, or None."
-                )
+                # broadcast scalar
+                values = [value] * len(names)
         for n, v in zip(names, values):
-            self.fixed_params[n] = v
-        return self
-
-    def add_inferred(self, name, init=0.0) -> 'BaseProblem':
-        """Register learnable (inferred) parameters.
-
-        Args:
-            name: Parameter name (``str``) or list of names.
-            init: Initial value(s).  A scalar is broadcast over all names.
-
-        Returns:
-            ``self`` for method chaining.
-        """
-        if isinstance(name, str):
-            names = [name]
-            inits = [init]
-        else:
-            names = list(name)
-            if isinstance(init, (list, tuple)):
-                inits = list(init)
-                if len(inits) != len(names):
-                    raise ValueError(
-                        f"add_inferred: {len(names)} name(s) but {len(inits)} init(s)."
-                    )
+            self._params[n] = v
+            if trainable:
+                self._trainable.add(n)
             else:
-                inits = [init] * len(names)
-        for n, v in zip(names, inits):
-            self.inferred_params[n] = v
+                self._trainable.discard(n)
         return self
 
     def update_params(self, **kwargs) -> 'BaseProblem':
-        """Update existing fixed or inferred parameters.
+        """Update existing parameter values.
 
         Returns:
             ``self`` for method chaining.
 
         Raises:
-            KeyError: If a key is not found in either ``fixed_params`` or
-                ``inferred_params``.
+            KeyError: If a key is not registered.
         """
         for k, v in kwargs.items():
-            if k in self.fixed_params:
-                self.fixed_params[k] = v
-            elif k in self.inferred_params:
-                self.inferred_params[k] = v
-            else:
+            if k not in self._params:
                 raise KeyError(f"update_params: unknown parameter '{k}'.")
+            self._params[k] = v
         return self
 
-    def _build_params(self, internal=None) -> Dict[str, Any]:
-        """Return the params dict passed to ``term.fn(x, u, params, deriv)``.
+    def _build_params(self, override=None, internal=None) -> Dict[str, Any]:
+        """Return the flat params dict passed to term functions.
+
+        Trainable keys that appear in *override* receive the override value
+        (gradient can flow).  All other values are wrapped with
+        ``jax.lax.stop_gradient``.
+
+        Args:
+            override: Dict of trainable parameter values from the optimiser.
+            internal: Internal training-state dict.
 
         Returns:
-            ``{"fixed": fixed_params, "infer": {}, "internal": {...},
-               "domain": domain}``
+            Flat dict ``{name: value, ..., "internal": {...}, "domain": domain}``.
         """
+        import jax
         if internal is None:
             internal = {'global_step': 0, 'step': 0}
-        return {
-            "fixed":    self.fixed_params,
-            "infer":    {},
-            "internal": internal,
-            "domain":   self.domain,
-        }
+        override = override or {}
+        parameter: Dict[str, Any] = {}
+        for k, v in self._params.items():
+            if k in override:
+                parameter[k] = override[k]
+            elif k in self._trainable:
+                parameter[k] = v
+            else:
+                parameter[k] = jax.lax.stop_gradient(v) if v is not None else v
+        return {"parameter": parameter, "internal": internal, "domain": {"object": self.domain}}
 
     # ──────────────────────────────────────────────────────────────────── #
     #  Sampling interface (subclass must override)                        #

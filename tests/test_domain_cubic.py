@@ -193,13 +193,6 @@ class TestPartitionUtils:
         pos = self.d.get_internal_boundary_positions(0)
         np.testing.assert_allclose(pos, [0.5])
 
-    def test_subdomains_property(self):
-        subs = self.d.subdomains
-        assert len(subs) == 4
-        for s in subs:
-            assert hasattr(s, 'xmin')
-            assert hasattr(s, 'xmax')
-
     def test_to_numpy(self):
         arr = self.d.to_numpy()
         assert arr.dtype == np.float32

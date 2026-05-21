@@ -87,12 +87,12 @@ def heat_equation(X, V, params):
     Args:
         X: Input tensor (batch, 2) with columns [x, t]
         V: Network output (batch, 1) with column [u]
-        params: Dictionary with 'fixed', 'infer', 'internal' keys
+        params: Dictionary with 'parameter', 'infer', 'internal' keys
     
     Returns:
         Residual tensor (should be zero when PDE is satisfied)
     """
-    alpha = params["fixed"]["alpha"]
+    alpha = params["parameter"]["alpha"]
     
     # Compute derivatives
     u_t = pinns.derivative(V, X, component=0, order=(1,))   # ∂u/∂t
@@ -124,7 +124,7 @@ network = pinns.FNN(
 )
 
 # Create trainer
-trainer = pinns.Trainer(problem, network)
+trainer = pinns.Trainer(network, problem=problem)
 ```
 
 ### Step 7: Compile and Train
@@ -195,7 +195,7 @@ If your boundary conditions are not being satisfied well with the standard `Trai
 
 ```python
 # Replace Trainer with ALTrainer
-trainer = pinns.ALTrainer(problem, network)
+trainer = pinns.ALTrainer(network, problem=problem)
 
 trainer.compile(
     train_samples={

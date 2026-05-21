@@ -43,7 +43,7 @@ domain.add_dirichlet((None, 0), value=lambda x: np.sin(np.pi * x[:, 0:1]),
 
 # 3. Define the PDE residual
 def heat_equation(X, V, params):
-    alpha = params["fixed"]["alpha"]
+    alpha = params["parameter"]["alpha"]
     u_t = pinns.derivative(V, X, component=0, order=(1,))     # ∂u/∂t
     u_xx = pinns.derivative(V, X, component=0, order=(0, 0))  # ∂²u/∂x²
     return u_t - alpha * u_xx
@@ -59,7 +59,7 @@ problem = pinns.Problem(
 
 # 5. Create network and trainer
 network = pinns.FNN([2, 64, 64, 64, 1], activation="tanh")
-trainer = pinns.Trainer(problem, network)
+trainer = pinns.Trainer(network, problem=problem)
 
 # 6. Train
 trainer.compile(

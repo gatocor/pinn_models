@@ -404,7 +404,7 @@ def my_sampler(X, params):
     
     Args:
         X: ndarray of shape (n_points, n_dims) with values in [0, 1]
-        params: dict with 'fixed', 'infer', 'internal' keys
+        params: dict with flat params + 'internal' keys
         
     Returns:
         ndarray of shape (n_points, n_dims) with transformed coordinates
@@ -432,8 +432,8 @@ import scipy.stats as sp
 
 def gaussian_sampler(X, params):
     """Sample from mixture of uniform and Gaussian."""
-    sigma = params["fixed"]["sigma"]
-    w = params["fixed"]["weight"]
+    sigma = params["parameter"]["sigma"]
+    w = params["parameter"]["weight"]
     
     n = int(X.shape[0] * w)
     

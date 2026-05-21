@@ -20,7 +20,7 @@ from .periodic  import PeriodicEmbedding
 from .gnn       import GNNFeatures
 from .laplacian import LaplacianFeatures, AlphaTransform
 
-from .lifting import Lifting
+from .lifting import Lifting, CustomLifting
 
 __all__ = [
     # normalisation
@@ -43,4 +43,5 @@ __all__ = [
     # full mesh-based networks
     # hard enforcement
     "Lifting",
+    "CustomLifting",
 ]

@@ -611,7 +611,7 @@ class ProblemWeak(BaseProblem):
     basis : str
         Test function basis — currently only ``"lagrange"`` is supported.
     params : dict or None
-        Fixed problem parameters passed as ``params["fixed"]``.
+        Fixed problem parameters in flat ``params`` dict.
     solution : callable or None
         Reference solution for error tracking (can also be set via
         :meth:`add_solution`).
@@ -635,7 +635,6 @@ class ProblemWeak(BaseProblem):
         lagrange_order: int = 1,
         basis: str = "lagrange",
         params: Optional[Dict[str, Any]] = None,
-        solution: Optional[Callable] = None,
     ):
         from ..domain import DomainMesh
 
@@ -650,11 +649,9 @@ class ProblemWeak(BaseProblem):
         self.cubature_order     = cubature_order
         self.lagrange_order     = lagrange_order
         self.basis              = basis
-        # Allow construction-time params via the 'params' alias → fixed_params
+        # Allow construction-time params via the 'params' arg → _params
         if params:
-            self.fixed_params.update(params)
-        if solution is not None:
-            self.solution = solution
+            self._params.update(params)
 
         # ── runtime-filled ───────────────────────────────────────────────
         self.cubature_data:    Dict       = {}

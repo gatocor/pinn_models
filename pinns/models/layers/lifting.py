@@ -256,3 +256,101 @@ class Lifting:
             f"Lifting(value={v}, region={self.region!r}, "
             f"sigma={self._sigma_val:.3g}, output_idx={self.output_idx})"
         )
+
+
+class CustomLifting:
+    """Analytic hard-enforcement layer defined by a user-supplied function.
+
+    Transforms the raw network output ``N(x)`` into:
+
+    .. math::
+
+        u(x) = g(x) + f(x) \\cdot N(x)
+
+    where:
+
+    * **g** — the prescribed boundary value (any function of the original
+      input ``x_orig``).  Must satisfy the boundary condition exactly:
+      ``g(x_bc) == u_bc``.
+    * **f** — a **distance factor** that is 0 on the boundary and non-zero
+      in the interior (e.g. ``tanh``, ``sigmoid``, or a polynomial).
+      This guarantees ``u = g`` on the boundary regardless of ``N``.
+
+    Both ``g`` and ``f`` are arbitrary JAX-differentiable callables that
+    receive the **original, un-normalised** input coordinates
+    ``x_orig`` of shape ``(batch, n_dims)``.
+
+    Parameters
+    ----------
+    g : callable ``(x_orig) -> jnp.ndarray``  shape ``(batch, output_dim)`` or ``(batch, 1)``
+        Boundary-value function.
+    f : callable ``(x_orig) -> jnp.ndarray``  shape ``(batch, 1)``
+        Distance-factor function.  Must be zero exactly on the boundary
+        where ``g`` is prescribed.
+    name : str, optional
+        Human-readable label used in ``__repr__``.
+
+    Example::
+
+        from pinns.models.layers import CustomLifting
+
+        # 2D transport ansatz:  û = (1/ω) sin(ω x2) + tanh(ω x1) * N
+        lifting = CustomLifting(
+            g = lambda x: (1.0 / omega) * jnp.sin(omega * x[:, 1:2]),
+            f = lambda x: jnp.tanh(omega * x[:, 0:1]),
+            name="transport_bc",
+        )
+        template.add(lifting)
+    """
+
+    def __init__(self, g: Callable, f: Callable, name: str = "custom"):
+        if not callable(g) or not callable(f):
+            raise TypeError("CustomLifting: both g and f must be callable.")
+        self._g    = g
+        self._f    = f
+        self._name = name
+
+    # ── layer protocol ────────────────────────────────────────────────── #
+
+    def _configure(self, network, input_dim: int) -> int:
+        """Shape-preserving — no setup required."""
+        return input_dim
+
+    def init(self, rng) -> dict:
+        """No trainable parameters."""
+        return {}
+
+    def apply(
+        self,
+        params: dict,
+        x: "jnp.ndarray",
+        params_dict: Optional[dict] = None,
+    ) -> "jnp.ndarray":
+        """Apply the analytic lifting transform.
+
+        Parameters
+        ----------
+        params : dict
+            Empty (no trainable parameters).
+        x : jnp.ndarray  shape ``(batch, output_dim)``
+            Raw network output from the preceding layers.
+        params_dict : dict or None
+            Must contain ``'_x_orig'`` — injected automatically by
+            :meth:`~pinns.modelbase.ModelBase.apply`.
+
+        Returns
+        -------
+        jnp.ndarray  shape ``(batch, output_dim)``
+        """
+        if params_dict is None or '_x_orig' not in params_dict:
+            raise RuntimeError(
+                "CustomLifting.apply() requires '_x_orig' in params_dict. "
+                "Use ModelBase.apply() which injects this automatically."
+            )
+        x_orig = params_dict['_x_orig']   # (batch, n_dims), original coords
+        g = self._g(x_orig)               # (batch, output_dim) or (batch, 1)
+        f = self._f(x_orig)               # (batch, 1)
+        return g + f * x
+
+    def __repr__(self) -> str:
+        return f"CustomLifting(name={self._name!r})"

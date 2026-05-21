@@ -69,7 +69,7 @@ class TrainPlotter:
         show_prediction: bool = True,
         show_residuals: bool = True,
         show_loss: bool = True,
-        show_mse_loss: bool = True,
+        show_mse_loss: bool = False,
     ) -> None:
         self.save = save
         self.subdomains = subdomains
@@ -84,6 +84,7 @@ class TrainPlotter:
         self.show_residuals = show_residuals
         self.show_loss = show_loss
         self.show_mse_loss = show_mse_loss
+        self.show_parameters = True  # always enabled; draws param-history panel when params tracked
 
         # State (set by _activate / reset on each compile)
         self._trainer = None
@@ -117,21 +118,80 @@ class TrainPlotter:
         else:
             self._show_sampling_points = {'solution': False, 'residuals': False, 'zoom': False}
             self._show_sampling_points.update(_sp)
+        # When there is no problem (dataset-only / ModelSolver mode) disable residuals
+        if self._trainer.problem is None:
+            self.show_residuals = False
         if self.time_points is not None:
             self._plot_time_points = self.time_points
         elif self._is_mesh_domain():
-            domain = self._trainer.problem.domain
+            domain = self._get_domain()
             if domain._t_min is not None:
                 self._plot_time_points = [domain._t_min, domain._t_max]
         elif not self._is_mesh_domain():
-            domain = self._trainer.problem.domain
-            if (getattr(domain, 'has_time', False)
+            domain = self._get_domain()
+            if (domain is not None
+                    and getattr(domain, '_t_min', None) is not None
                     and getattr(domain, '_spatial_dims', 0) >= 2):
                 self._plot_time_points = [domain._t_min, domain._t_max]
             else:
                 self._plot_time_points = None
         else:
             self._plot_time_points = None
+
+    # ==================== Domain/Problem Helpers ====================
+
+    def _get_domain(self):
+        """Return the domain from problem (if set) or from the network."""
+        if self._trainer.problem is not None:
+            return self._trainer.problem.domain
+        return getattr(self._trainer.model, 'domain', None)
+
+    def _get_n_dims(self):
+        """Return total input dimensions (spatial + time)."""
+        if self._trainer.problem is not None:
+            return self._trainer.problem.n_dims
+        dom = self._get_domain()
+        if dom is None:
+            return 1
+        return dom.n_dims
+
+    def _get_xmin(self, i):
+        """Return lower bound for input dimension i."""
+        if self._trainer.problem is not None:
+            return self._trainer.problem.xmin[i]
+        dom = self._get_domain()
+        if dom is None:
+            return 0.0
+        return float(dom.xmin[i])
+
+    def _get_xmax(self, i):
+        """Return upper bound for input dimension i."""
+        if self._trainer.problem is not None:
+            return self._trainer.problem.xmax[i]
+        dom = self._get_domain()
+        if dom is None:
+            return 1.0
+        return float(dom.xmax[i])
+
+    def _get_n_outputs(self):
+        """Return number of model outputs."""
+        if self._trainer.problem is not None:
+            return self._trainer.problem.n_outputs
+        return getattr(self._trainer.model, 'output_dim', 1)
+
+    def _get_fit_params(self) -> list:
+        """Return list of fitted parameter names (from _fit_model_parameters)."""
+        return list(getattr(self._trainer, '_fit_model_parameters', None) or [])
+
+    def _get_n_param_rows(self) -> int:
+        """Return number of parameter-history rows to show."""
+        if not self.show_parameters:
+            return 0
+        return len(self._get_fit_params())
+
+    def _get_has_solution(self):
+        """Return True if an analytical solution is available (trainer or problem)."""
+        return self._trainer._has_solution
 
     def __repr__(self) -> str:  # pragma: no cover
         parts = []
@@ -174,7 +234,7 @@ class TrainPlotter:
         Returns:
             tuple: (free_dims, free_ranges, fixed_dims, fixed_values)
         """
-        n_dims = self._trainer.problem.n_dims
+        n_dims = self._get_n_dims()
         
         if region is None:
             region = [None] * n_dims
@@ -187,7 +247,7 @@ class TrainPlotter:
         for i, spec in enumerate(region):
             if spec is None:
                 free_dims.append(i)
-                free_ranges.append((self._trainer.problem.xmin[i], self._trainer.problem.xmax[i]))
+                free_ranges.append((self._get_xmin(i), self._get_xmax(i)))
             elif isinstance(spec, (list, tuple)) and len(spec) == 2:
                 free_dims.append(i)
                 free_ranges.append((spec[0], spec[1]))
@@ -280,12 +340,12 @@ class TrainPlotter:
 
     def _create_figure(self):
         """Create figure and axes for plotting."""
-        n_dims = self._trainer.problem.n_dims
-        n_outputs = self._trainer.problem.n_outputs
-        has_solution = self._trainer.problem.solution is not None
+        n_dims = self._get_n_dims()
+        n_outputs = self._get_n_outputs()
+        has_solution = self._get_has_solution()
         n_regions = len(self.regions)
-        obs_names = list(getattr(self._trainer.problem, 'obs_names', None) or [])
-        obs_spatial = list(getattr(self._trainer.problem, 'obs_spatial', None) or [])
+        obs_names = list(getattr(self._trainer.problem, 'obs_names', None) or []) if self._trainer.problem is not None else []
+        obs_spatial = list(getattr(self._trainer.problem, 'obs_spatial', None) or []) if self._trainer.problem is not None else []
         # Regular observables: those not listed in obs_spatial
         obs_regular = [n for n in obs_names if n not in obs_spatial]
         has_spatial = len(obs_spatial) > 0
@@ -296,6 +356,7 @@ class TrainPlotter:
         _show_loss = self.show_loss
         _show_mse  = self.show_mse_loss
         _n_loss_rows = int(_show_loss) + int(_show_mse)
+        _n_param_rows = self._get_n_param_rows()
         _content_row = _n_loss_rows  # first row index after loss panels
 
         if n_dims == 1:
@@ -303,7 +364,7 @@ class TrainPlotter:
             if n_cols == 0:
                 n_cols = 1  # at minimum keep the loss rows
 
-            n_rows = _n_loss_rows + n_outputs + n_regions + n_obs
+            n_rows = _n_loss_rows + n_outputs + n_regions + n_obs + _n_param_rows
             if n_rows == 0:
                 n_rows = 1
             fig = plt.figure(figsize=(5 * n_cols, 3.5 * n_rows))
@@ -335,12 +396,16 @@ class TrainPlotter:
                 axes['obs__deformed_ref'] = fig.add_subplot(gs[row_s, 0])
                 axes['obs__deformed_def'] = fig.add_subplot(gs[row_s, 1])
 
+            _param_row_start = _content_row + n_outputs + n_regions + n_obs
+            for _pi, _pname in enumerate(self._get_fit_params()):
+                axes[f'param_{_pname}'] = fig.add_subplot(gs[_param_row_start + _pi, :])
+
         elif n_dims == 2:
             n_cols = int(_show_pred) + int(has_solution) + int(_show_res) + int(has_solution)
             if n_cols == 0:
                 n_cols = 1
 
-            n_rows = _n_loss_rows + n_outputs + n_regions + n_obs
+            n_rows = _n_loss_rows + n_outputs + n_regions + n_obs + _n_param_rows
             if n_rows == 0:
                 n_rows = 1
             fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
@@ -373,6 +438,10 @@ class TrainPlotter:
                 row_s = _content_row + n_outputs + n_regions + len(obs_regular)
                 axes['obs__deformed_ref'] = fig.add_subplot(gs[row_s, 0])
                 axes['obs__deformed_def'] = fig.add_subplot(gs[row_s, 1])
+
+            _param_row_start = _content_row + n_outputs + n_regions + n_obs
+            for _pi, _pname in enumerate(self._get_fit_params()):
+                axes[f'param_{_pname}'] = fig.add_subplot(gs[_param_row_start + _pi, :])
 
         elif self._is_mesh_domain() and self._plot_time_points:
             # Transient mesh domain with time snapshots.
@@ -453,7 +522,7 @@ class TrainPlotter:
             if n_cols == 0:
                 n_cols = 1
 
-            n_rows = _n_loss_rows + n_snap
+            n_rows = _n_loss_rows + n_snap + _n_param_rows
             if n_rows == 0:
                 n_rows = 1
             fig = plt.figure(figsize=(4 * n_cols, 3.5 * n_rows))
@@ -480,10 +549,13 @@ class TrainPlotter:
                         axes[f'snap_err_{i}_t{t_val}'] = fig.add_subplot(gs[row, _col])
                     row += 1
 
+            for _pi, _pname in enumerate(self._get_fit_params()):
+                axes[f'param_{_pname}'] = fig.add_subplot(gs[_content_row + n_snap + _pi, :])
+
         else:
             # For 3D+: loss plot + region slices for all outputs with residuals
-            n_cols = 2 * n_outputs  # Two columns per output (solution + residual)
-            n_rows = _n_loss_rows + n_regions  # loss rows + one row per region
+            n_cols = max(2 * n_outputs, 1)  # Two columns per output (solution + residual)
+            n_rows = _n_loss_rows + n_regions + _n_param_rows  # loss rows + one row per region
             if n_rows == 0:
                 n_rows = 1
             fig = plt.figure(figsize=(4 * n_cols, 4 * n_rows))
@@ -500,11 +572,39 @@ class TrainPlotter:
                 for i in range(n_outputs):
                     axes[f'region_{r}_{i}'] = fig.add_subplot(gs[_content_row + r, 2*i])
                     axes[f'region_res_{r}_{i}'] = fig.add_subplot(gs[_content_row + r, 2*i + 1])
+
+            for _pi, _pname in enumerate(self._get_fit_params()):
+                axes[f'param_{_pname}'] = fig.add_subplot(gs[_content_row + n_regions + _pi, :])
         
         self._colorbars = []
         self._apply_plot_style(fig, axes)
         return fig, axes
     
+    def _plot_parameters(self, axes: dict):
+        """Plot inferred parameter values over epochs, with optional true-value reference lines."""
+        epochs = self._trainer.history['epoch']
+        params_history = self._trainer.history.get('params', {})
+        param_solutions = getattr(self._trainer, '_parameter_solutions', {})
+
+        for pname in self._get_fit_params():
+            ax_key = f'param_{pname}'
+            if ax_key not in axes:
+                continue
+            ax = axes[ax_key]
+            vals = params_history.get(pname, [])
+            if vals:
+                ep = epochs[:len(vals)]
+                ax.plot(ep, vals, 'b-', linewidth=2, label=f'{pname} (inferred)')
+            if pname in param_solutions:
+                true_val = param_solutions[pname]
+                ax.axhline(true_val, color='r', linestyle='--', linewidth=1.5,
+                           label=f'{pname} = {true_val:.6g} (true)')
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel(pname)
+            ax.set_title(f'Inferred parameter: {pname}')
+            ax.legend(loc='best', fontsize=8)
+            ax.grid(True, alpha=0.3)
+
     def _plot_losses(self, ax):
         """Plot training-objective curves (weighted + Lagrange) on given axes."""
         epochs = self._trainer.history['epoch']
@@ -625,11 +725,11 @@ class TrainPlotter:
     
     def _plot_solution_1d(self, ax, output_idx, n_points=200):
         """Plot 1D solution on given axes."""
-        x = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points).reshape(-1, 1)
+        x = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points).reshape(-1, 1)
         y = self._trainer.eval(x)
         
         # Plot true solution if available
-        if self._trainer.problem.solution is not None:
+        if self._get_has_solution():
             y_true = self._trainer._call_solution(x)
             if isinstance(y_true, (list, tuple)):
                 y_true = np.concatenate([np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true], axis=1)
@@ -652,7 +752,8 @@ class TrainPlotter:
         """Return True when the problem domain is a DomainMesh."""
         try:
             from pinns.domain import DomainMesh as _DomainMesh
-            return isinstance(self._trainer.problem.domain, _DomainMesh)
+            dom = self._get_domain()
+            return dom is not None and isinstance(dom, _DomainMesh)
         except ImportError:
             return False
 
@@ -660,7 +761,7 @@ class TrainPlotter:
         """Return True when the domain is a DomainMesh with 3 spatial dimensions (no time)."""
         if not self._is_mesh_domain():
             return False
-        dom = self._trainer.problem.domain
+        dom = self._get_domain()
         # spatial_dims == 3 and no time axis
         return getattr(dom, '_spatial_dims', dom._vertices.shape[1]) == 3
 
@@ -674,14 +775,14 @@ class TrainPlotter:
         """
         import matplotlib.tri as _mtri
 
-        dom      = self._trainer.problem.domain
+        dom      = self._get_domain()
         verts_xy = dom._vertices          # (N, 2)
         faces    = dom._faces             # (F, 3)
         n_verts  = len(verts_xy)
-        t_dim    = getattr(dom, '_t_dim', self._trainer.problem.n_dims - 1)
+        t_dim    = getattr(dom, '_t_dim', self._get_n_dims() - 1)
 
         # Build space-time input: (N, n_inputs) with t injected at t_dim
-        n_inputs = self._trainer.problem.n_dims
+        n_inputs = self._get_n_dims()
         x_st = np.zeros((n_verts, n_inputs), dtype=np.float32)
         spatial_dims = [d for d in range(n_inputs) if d != t_dim]
         for k, sd in enumerate(spatial_dims):
@@ -703,7 +804,7 @@ class TrainPlotter:
                 _res_fn = _jax.jit(
                     self._trainer.problem.make_residual_vector_fn_at_t(_u_and_grad, float(t_val))
                 )
-                R_full = np.array(_res_fn(self._trainer.network.params))   # (n_dofs * n_comp,)
+                R_full = np.array(_res_fn(self._trainer.model.params))   # (n_dofs * n_comp,)
                 _n_dofs = self._trainer.problem.n_dofs
                 # Take the component for output_idx (row block)
                 R_comp = R_full[output_idx * _n_dofs:(output_idx + 1) * _n_dofs]
@@ -737,7 +838,7 @@ class TrainPlotter:
         else:
             y_pred = self._trainer.eval(x_st)[:, output_idx]
             if kind == 'true':
-                if self._trainer.problem.solution is None:
+                if not self._get_has_solution():
                     return
                 y_true_raw = self._trainer._call_solution(x_st)
                 if isinstance(y_true_raw, (list, tuple)):
@@ -749,7 +850,7 @@ class TrainPlotter:
                 label = f'True (t={t_val:.3g})'
                 cmap = self._trainer._get_colormap(output_idx)
             elif kind == 'err':
-                if self._trainer.problem.solution is None:
+                if not self._get_has_solution():
                     return
                 y_true_raw = self._trainer._call_solution(x_st)
                 if isinstance(y_true_raw, (list, tuple)):
@@ -790,8 +891,8 @@ class TrainPlotter:
 
     def _build_2d_spatial_grid_at_t(self, t_val, n_points):
         """Return (x0, x1, x_flat) for a spatial meshgrid with t=t_val appended."""
-        x0 = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points)
-        x1 = np.linspace(self._trainer.problem.xmin[1], self._trainer.problem.xmax[1], n_points)
+        x0 = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points)
+        x1 = np.linspace(self._get_xmin(1), self._get_xmax(1), n_points)
         X0, X1 = np.meshgrid(x0, x1)
         x_flat = np.column_stack([X0.ravel(), X1.ravel(), np.full(X0.size, float(t_val))])
         return x0, x1, X0, x_flat
@@ -816,7 +917,7 @@ class TrainPlotter:
 
     def _plot_true_solution_2d_at_time(self, ax, output_idx, t_val, n_points=50, plot_key='solution'):
         """Plot true 2D spatial snapshot at fixed time t_val as a heatmap."""
-        if self._trainer.problem.solution is None:
+        if not self._get_has_solution():
             return
         cmap = self._trainer._get_colormap(output_idx)
         ikw = {'cmap': cmap}
@@ -860,7 +961,7 @@ class TrainPlotter:
 
     def _plot_error_2d_at_time(self, ax, output_idx, t_val, n_points=50, plot_key='error'):
         """Plot |error| 2D spatial snapshot at fixed time t_val as a heatmap."""
-        if self._trainer.problem.solution is None:
+        if not self._get_has_solution():
             return
         ikw = {'cmap': 'Reds'}
         ikw.update(self._get_imshow_kwargs(plot_key))
@@ -889,7 +990,7 @@ class TrainPlotter:
 
     def _plot_solution_1d_at_times(self, ax, output_idx, t_vals, n_points=200):
         """Overlay predicted 1D snapshots u(x) at multiple time values."""
-        x0 = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points)
+        x0 = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points)
         colors = plt.cm.viridis(np.linspace(0, 1, len(t_vals)))
         for t_val, color in zip(t_vals, colors):
             x_full = np.column_stack([x0, np.full(n_points, float(t_val))])
@@ -904,7 +1005,7 @@ class TrainPlotter:
 
     def _plot_residuals_1d_at_times(self, ax, output_idx, t_vals, n_points=200):
         """Overlay |PDE residual| 1D snapshots at multiple time values."""
-        x0 = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points)
+        x0 = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points)
         colors = plt.cm.inferno(np.linspace(0, 0.9, len(t_vals)))
         for t_val, color in zip(t_vals, colors):
             x_full = np.column_stack([x0, np.full(n_points, float(t_val))])
@@ -928,15 +1029,15 @@ class TrainPlotter:
         ikw.update(self._get_imshow_kwargs(plot_key))
 
         if self._is_mesh_domain():
-            dom = self._trainer.problem.domain
+            dom = self._get_domain()
             tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
             y = self._trainer.eval(dom._vertices)
             vals = y[:, output_idx]
             im = ax.tricontourf(tri, vals, levels=50, **ikw)
             ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
         else:
-            x0 = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points)
-            x1 = np.linspace(self._trainer.problem.xmin[1], self._trainer.problem.xmax[1], n_points)
+            x0 = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points)
+            x1 = np.linspace(self._get_xmin(1), self._get_xmax(1), n_points)
             X0, X1 = np.meshgrid(x0, x1)
             x_flat = np.column_stack([X0.ravel(), X1.ravel()])
             y = self._trainer.eval(x_flat)
@@ -1036,7 +1137,7 @@ class TrainPlotter:
 
     def _plot_true_solution_2d(self, ax, output_idx, n_points=50, plot_key='solution'):
         """Plot 2D true solution as heatmap on given axes."""
-        if self._trainer.problem.solution is None:
+        if not self._get_has_solution():
             return
 
         cmap = self._trainer._get_colormap(output_idx)
@@ -1051,15 +1152,15 @@ class TrainPlotter:
             return y_true
 
         if self._is_mesh_domain():
-            dom = self._trainer.problem.domain
+            dom = self._get_domain()
             tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
             y_true = _normalise(self._trainer._call_solution(dom._vertices))
             vals = y_true[:, output_idx]
             im = ax.tricontourf(tri, vals, levels=50, **ikw)
             ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
         else:
-            x0 = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points)
-            x1 = np.linspace(self._trainer.problem.xmin[1], self._trainer.problem.xmax[1], n_points)
+            x0 = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points)
+            x1 = np.linspace(self._get_xmin(1), self._get_xmax(1), n_points)
             X0, X1 = np.meshgrid(x0, x1)
             x_flat = np.column_stack([X0.ravel(), X1.ravel()])
             y_true = _normalise(self._trainer._call_solution(x_flat))
@@ -1077,10 +1178,10 @@ class TrainPlotter:
     
     def _plot_error_1d(self, ax, output_idx, n_points=200):
         """Plot 1D absolute error."""
-        if self._trainer.problem.solution is None:
+        if not self._get_has_solution():
             return
         
-        x = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points).reshape(-1, 1)
+        x = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points).reshape(-1, 1)
         y = self._trainer.eval(x)
         
         y_true = self._trainer._call_solution(x)
@@ -1101,7 +1202,7 @@ class TrainPlotter:
     
     def _plot_error_2d(self, ax, output_idx, n_points=50, plot_key='error'):
         """Plot 2D absolute error as heatmap."""
-        if self._trainer.problem.solution is None:
+        if not self._get_has_solution():
             return
 
         ikw = {'cmap': 'Reds'}
@@ -1115,7 +1216,7 @@ class TrainPlotter:
             return y_true
 
         if self._is_mesh_domain():
-            dom = self._trainer.problem.domain
+            dom = self._get_domain()
             tri = mtri.Triangulation(dom._vertices[:, 0], dom._vertices[:, 1], dom._faces)
             y = self._trainer.eval(dom._vertices)
             y_true = _normalise(self._trainer._call_solution(dom._vertices))
@@ -1123,8 +1224,8 @@ class TrainPlotter:
             im = ax.tricontourf(tri, error, levels=50, **ikw)
             ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
         else:
-            x0 = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points)
-            x1 = np.linspace(self._trainer.problem.xmin[1], self._trainer.problem.xmax[1], n_points)
+            x0 = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points)
+            x1 = np.linspace(self._get_xmin(1), self._get_xmax(1), n_points)
             X0, X1 = np.meshgrid(x0, x1)
             x_flat = np.column_stack([X0.ravel(), X1.ravel()])
             y = self._trainer.eval(x_flat)
@@ -1148,7 +1249,7 @@ class TrainPlotter:
         
         if n_free == 0:
             # No free dimensions - just show the single point value
-            x_point = np.zeros((1, self._trainer.problem.n_dims))
+            x_point = np.zeros((1, self._get_n_dims()))
             for i, val in zip(fixed_dims, fixed_values):
                 x_point[0, i] = val
             y = self._trainer.eval(x_point)
@@ -1163,7 +1264,7 @@ class TrainPlotter:
             x_range = free_ranges[0]
             x_vals = np.linspace(x_range[0], x_range[1], n_points)
             
-            x_full = np.zeros((n_points, self._trainer.problem.n_dims))
+            x_full = np.zeros((n_points, self._get_n_dims()))
             x_full[:, dim] = x_vals
             for i, val in zip(fixed_dims, fixed_values):
                 x_full[:, i] = val
@@ -1192,7 +1293,7 @@ class TrainPlotter:
             X0, X1 = np.meshgrid(x0, x1)
             
             n_total = X0.size
-            x_full = np.zeros((n_total, self._trainer.problem.n_dims))
+            x_full = np.zeros((n_total, self._get_n_dims()))
             x_full[:, dim0] = X0.ravel()
             x_full[:, dim1] = X1.ravel()
             for i, val in zip(fixed_dims, fixed_values):
@@ -1229,7 +1330,7 @@ class TrainPlotter:
         
         if n_free == 0:
             # No free dimensions - just show the single point residual value
-            x_point = np.zeros((1, self._trainer.problem.n_dims))
+            x_point = np.zeros((1, self._get_n_dims()))
             for i, val in zip(fixed_dims, fixed_values):
                 x_point[0, i] = val
             residuals = self._trainer._compute_residuals(x_point)
@@ -1248,7 +1349,7 @@ class TrainPlotter:
             x_range = free_ranges[0]
             x_vals = np.linspace(x_range[0], x_range[1], n_points)
             
-            x_full = np.zeros((n_points, self._trainer.problem.n_dims))
+            x_full = np.zeros((n_points, self._get_n_dims()))
             x_full[:, dim] = x_vals
             for i, val in zip(fixed_dims, fixed_values):
                 x_full[:, i] = val
@@ -1281,7 +1382,7 @@ class TrainPlotter:
             X0, X1 = np.meshgrid(x0, x1)
             
             n_total = X0.size
-            x_full = np.zeros((n_total, self._trainer.problem.n_dims))
+            x_full = np.zeros((n_total, self._get_n_dims()))
             x_full[:, dim0] = X0.ravel()
             x_full[:, dim1] = X1.ravel()
             for i, val in zip(fixed_dims, fixed_values):
@@ -1315,9 +1416,9 @@ class TrainPlotter:
     def _update_figure(self, fig, axes, n_points=200):
         """Update existing figure with current data."""
         self._axes = axes   # make axes accessible to plot helpers (e.g. cax lookup)
-        n_dims = self._trainer.problem.n_dims
-        n_outputs = self._trainer.problem.n_outputs
-        has_solution = self._trainer.problem.solution is not None
+        n_dims = self._get_n_dims()
+        n_outputs = self._get_n_outputs()
+        has_solution = self._get_has_solution()
         
         self._clear_colorbars()
         
@@ -1350,7 +1451,7 @@ class TrainPlotter:
                     self._apply_plot_kwargs(axes[f'err_{i}'], 'error')
         
         elif n_dims == 2:
-            _dom2 = self._trainer.problem.domain
+            _dom2 = self._get_domain()
             _has_time2 = getattr(_dom2, 'has_time', False)
             _pts2 = self._plot_time_points
             if _has_time2 and _pts2 is not None:
@@ -1389,8 +1490,9 @@ class TrainPlotter:
         # ── Cubic 2+1D spatial snapshots at fixed times (e.g. Grey-Scott) ──────
         _pts = self._plot_time_points
         if _pts and not self._is_mesh_domain():
-            _dom_c = self._trainer.problem.domain
-            if (getattr(_dom_c, 'has_time', False)
+            _dom_c = self._get_domain()
+            if (_dom_c is not None
+                    and getattr(_dom_c, 'has_time', False)
                     and getattr(_dom_c, '_spatial_dims', 0) >= 2):
                 _np_snap = max(n_points // 4, 30)
                 for _t_val in _pts:
@@ -1447,7 +1549,7 @@ class TrainPlotter:
 
         # Plot regions (for any dimension)
         regions = self.regions
-        n_outputs = self._trainer.problem.n_outputs
+        n_outputs = self._get_n_outputs()
         for r, region in enumerate(regions):
             # Check if we have per-output region axes (3D+ case)
             if f'region_{r}_0' in axes:
@@ -1466,6 +1568,11 @@ class TrainPlotter:
                 self._apply_plot_kwargs(axes[f'region_{r}'], 'region')
                 self._apply_plot_kwargs(axes[f'region_{r}'], f'region_{r}')
         
+        # Plot inferred parameter histories
+        _fit_params = self._get_fit_params()
+        if _fit_params:
+            self._plot_parameters(axes)
+
         self._apply_plot_style(fig, axes)
         fig.tight_layout()
     
@@ -1509,7 +1616,7 @@ class TrainPlotter:
         if isinstance(self._trainer.problem, _ProblemWeak):
             self._plot_weak_residuals_on_mesh(ax, output_idx)
             return
-        x_np = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points).reshape(-1, 1)
+        x_np = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points).reshape(-1, 1)
         
         residuals = self._trainer._compute_residuals(x_np)
         
@@ -1543,7 +1650,7 @@ class TrainPlotter:
             ax.set_title('Weak Residual')
             return
 
-        R_raw = weak_res_fn(self._trainer.network.params)
+        R_raw = weak_res_fn(self._trainer.model.params)
 
         dom        = self._trainer.problem.domain
         verts_xy   = dom._vertices                        # (n_verts, 2)
@@ -1656,8 +1763,8 @@ class TrainPlotter:
             im = ax.tricontourf(tri, res, levels=50, **ikw)
             ax.triplot(tri, color='gray', lw=0.3, alpha=0.3)
         else:
-            x0 = np.linspace(self._trainer.problem.xmin[0], self._trainer.problem.xmax[0], n_points)
-            x1 = np.linspace(self._trainer.problem.xmin[1], self._trainer.problem.xmax[1], n_points)
+            x0 = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points)
+            x1 = np.linspace(self._get_xmin(1), self._get_xmax(1), n_points)
             X0, X1 = np.meshgrid(x0, x1)
             x_np = np.column_stack([X0.ravel(), X1.ravel()])
             try:
@@ -1852,19 +1959,19 @@ class TrainPlotter:
         if predictions is None:
             return  # Not an FBPINN network
         
-        if hasattr(self._trainer.network, 'domain'):
-            lower_bounds, upper_bounds = self._trainer.network.domain.get_subdomain_bounds()
-            n_subdomains = self._trainer.network.n_subdomains
+        if hasattr(self._trainer.model, 'domain'):
+            lower_bounds, upper_bounds = self._trainer.model.domain.get_subdomain_bounds()
+            n_subdomains = self._trainer.model.n_subdomains
             colors = plt.cm.tab10(np.linspace(0, 1, min(n_subdomains, 10)))
             
             for i in range(n_subdomains):
                 pred_i = predictions[:, i, output_idx]
                 
                 # Unnormalize if needed
-                if hasattr(self._trainer.network, 'output_range_min') and self._trainer.network.output_range_min is not None:
-                    if hasattr(self._trainer.network, 'unnormalize_output') and self._trainer.network.unnormalize_output:
-                        y_min = np.array(self._trainer.network.output_range_min[output_idx])
-                        y_max = np.array(self._trainer.network.output_range_max[output_idx])
+                if hasattr(self._trainer.model, 'output_range_min') and self._trainer.model.output_range_min is not None:
+                    if hasattr(self._trainer.model, 'unnormalize_output') and self._trainer.model.unnormalize_output:
+                        y_min = np.array(self._trainer.model.output_range_min[output_idx])
+                        y_max = np.array(self._trainer.model.output_range_max[output_idx])
                         # Handle tensor conversion if needed
                         y_min = np.asarray(y_min)
                         y_max = np.asarray(y_max)
@@ -1881,9 +1988,9 @@ class TrainPlotter:
         """Plot 2D subdomain boundaries as rectangles."""
         from matplotlib.patches import Rectangle
         
-        if hasattr(self._trainer.network, 'domain') and hasattr(self._trainer.network.domain, 'get_subdomain_bounds'):
-            lower_bounds, upper_bounds = self._trainer.network.domain.get_subdomain_bounds()
-            n_subdomains = self._trainer.network.n_subdomains
+        if hasattr(self._trainer.model, 'domain') and hasattr(self._trainer.model.domain, 'get_subdomain_bounds'):
+            lower_bounds, upper_bounds = self._trainer.model.domain.get_subdomain_bounds()
+            n_subdomains = self._trainer.model.n_subdomains
             
             for i in range(n_subdomains):
                 lb = lower_bounds[i]
@@ -1948,7 +2055,7 @@ class TrainPlotter:
             isinstance(self._trainer.problem, _PW)
             and getattr(self._trainer.problem.domain, '_time_mode', None) == 'discrete'
             and getattr(self._trainer.problem, 'n_time_steps', None) is not None
-            and hasattr(self._trainer.network, 'predict_rollout')
+            and hasattr(self._trainer.model, 'predict_rollout')
         )
         if not _is_rollout or kind not in ('sol', 'err', 'true', 'res'):
             return self._plot_mesh_snapshot_base(ax, output_idx, t_val, kind)
@@ -1961,7 +2068,7 @@ class TrainPlotter:
 
         # run rollout over the full domain
         try:
-            u_all = self._trainer.network.predict_rollout(n_steps=n_steps, dt=dt)  # (n_steps+1, n_nodes)
+            u_all = self._trainer.model.predict_rollout(n_steps=n_steps, dt=dt)  # (n_steps+1, n_nodes)
         except Exception:
             ax.text(0.5, 0.5, 'Rollout not ready', ha='center', va='center',
                     transform=ax.transAxes, fontsize=10, color='gray')
@@ -1995,7 +2102,7 @@ class TrainPlotter:
             ax.set_title(label)
             ax.set_xlabel('x'); ax.set_ylabel('y')
 
-        elif kind == 'err' and self._trainer.problem.solution is not None:
+        elif kind == 'err' and self._get_has_solution():
             x_ref = _np.hstack([verts_xy, _np.full((len(verts_xy), 1), t_actual, dtype=_np.float32)])
             y_true = self._trainer._call_solution(x_ref)
             if y_true is None:
@@ -2013,7 +2120,7 @@ class TrainPlotter:
             ax.set_title(label)
             ax.set_xlabel('x'); ax.set_ylabel('y')
 
-        elif kind == 'true' and self._trainer.problem.solution is not None:
+        elif kind == 'true' and self._get_has_solution():
             x_ref = _np.hstack([verts_xy, _np.full((len(verts_xy), 1), t_actual, dtype=_np.float32)])
             y_true = self._trainer._call_solution(x_ref)
             if y_true is None:

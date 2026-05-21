@@ -38,7 +38,7 @@ class ProblemStrong(BaseProblem):
 
     * **x** — collocation points ``(n_points, n_dims)``.
     * **u** — network output ``(n_points, n_outputs)``.
-    * **pars** — ``{"fixed": {}, "inferred": {}, "internal": {…}}``.
+    * **pars** — flat dict of all registered parameters plus ``"internal"`` and ``"domain"``.
     * **derivative** — autodiff helper (typically ``pinns.derivative``).
     * Returns a scalar residual per point, or an array ``(n_points, n_eqs)``.
 
@@ -52,7 +52,7 @@ class ProblemStrong(BaseProblem):
     axis (if present) is labelled ``t``.
 
     Fixed problem parameters and an analytical solution can be registered
-    with :meth:`add_fixed`, :meth:`add_inferred`, and :meth:`add_solution`.
+    with :meth:`add_parameter`.
 
     Args:
         domain: :class:`~pinns.domain.DomainCubic` or
@@ -71,10 +71,10 @@ class ProblemStrong(BaseProblem):
         domain.add_boundary(lambda v: v[:, 0] < -0.99, name='left_arc')
 
         problem = ProblemStrong(domain=domain, output_names=['u'])
-        problem.add_fixed('alpha', 0.01)
+        problem.add_parameter('alpha', 0.01)
 
         def heat(x, u, pars, diff):
-            a = pars['fixed']['alpha']
+            a = pars['parameter']['alpha']
             return diff(u, x, 0, (2,)) - a * (diff(u, x, 0, (0, 0)) + diff(u, x, 0, (1, 1)))
 
         problem.add_inner(heat, name='pde')
@@ -375,13 +375,14 @@ class ProblemStrong(BaseProblem):
 
         def residual_fn(params, data):
             # Merge any dynamic fixed-param overrides passed through train_data.
-            # Keys prefixed '__fixed__' carry per-sample arrays (e.g. resampled
-            # surface normals) that must be explicit JIT arguments so JAX sees
-            # their updated values after every SchedulerResample refresh.
+            # Keys prefixed '__fixed__' carry per-sample arrays that must be
+            # explicit JIT arguments so JAX sees updated values after every
+            # SchedulerResample refresh.
             _dyn_fixed = {k[len('__fixed__'):]: data[k]
-                          for k in data if k.startswith('__fixed__')}
+                          for k in data if k.startswith('__fixed__')
+                          and not k.startswith('__fixed_domain__')}
             if _dyn_fixed:
-                _p = {**_params_dict, 'fixed': {**_params_dict['fixed'], **_dyn_fixed}}
+                _p = {**_params_dict, 'parameter': {**_params_dict['parameter'], **_dyn_fixed}}
             else:
                 _p = _params_dict
 
@@ -394,9 +395,18 @@ class ProblemStrong(BaseProblem):
                 u = _model_apply(params, x)
                 kind = term.kind
 
+                # Per-term domain data (e.g. surface normals for 3-D mesh domains).
+                # Stored in train_data as '__fixed_domain__normals_{term_name}';
+                # injected into params['domain']['normals'] for this term only.
+                _normals_key = f'__fixed_domain__normals_{term.name}'
+                if _normals_key in data:
+                    _tp = {**_p, 'domain': {**_p['domain'], 'normals': data[_normals_key]}}
+                else:
+                    _tp = _p
+
                 if kind in ('inner', 'initial', 'boundary'):
                     fn = term.fn
-                    raw = _call_fn(fn, x, u, deriv_fn, _p)
+                    raw = _call_fn(fn, x, u, deriv_fn, _tp)
                     if isinstance(raw, tuple) and len(raw) == 2 and raw[0] is None:
                         # fn(x) -> target values
                         col = getattr(term, 'output_idx', 0) or 0
@@ -421,9 +431,12 @@ class ProblemStrong(BaseProblem):
 
                 elif kind == 'dirichlet':
                     col = term.component
-                    target = jnp.asarray(term.get_value(x, _p))
-                    if hasattr(target, 'ndim') and target.ndim == 2:
-                        target = target[:, 0:1]
+                    target = jnp.asarray(term.get_value(x, _tp))
+                    if hasattr(target, 'ndim'):
+                        if target.ndim == 1:
+                            target = target[:, None]
+                        elif target.ndim == 2:
+                            target = target[:, 0:1]
                     residual = u[:, col:col + 1] - target
 
                 elif kind in ('neumann', 'robin'):
@@ -432,7 +445,7 @@ class ProblemStrong(BaseProblem):
                             f"{kind.capitalize()} BC '{term.name}' has no pre-built fn. "
                             "Use add_neumann / add_robin to register it."
                         )
-                    raw = _call_fn(term.fn, x, u, deriv_fn, _p)
+                    raw = _call_fn(term.fn, x, u, deriv_fn, _tp)
                     residual = raw[0] if len(raw) == 1 else jnp.stack(raw, axis=-1)
 
                 elif kind == 'periodic':
@@ -492,7 +505,7 @@ class ProblemStrong(BaseProblem):
             f"domain={type(self.domain).__name__}, "
             f"n_dims={self.n_dims}, n_outputs={self.n_outputs}, "
             f"inner={n_in}, boundary={n_bnd}, initial={n_ic}, "
-            f"fixed={list(self.fixed_params.keys())}, "
-            f"inferred={list(self.inferred_params.keys())}"
+            f"params={list(self._params.keys())}, "
+            f"trainable={list(self._trainable)}"
             f"{deps})"
         )

@@ -2,53 +2,9 @@ import warnings
 import numpy as np
 from itertools import product
 from typing import TYPE_CHECKING, Callable, Optional, Union, Literal, Tuple, List, Any
-from dataclasses import dataclass
 
 if TYPE_CHECKING:
     from ..problems.terms import TermDirichletBC, TermNeumannBC, TermRobinBC, TermPoints
-
-# ============================================================================
-# Subdomain info class for easy filtering
-# ============================================================================
-
-@dataclass
-class SubdomainInfo:
-    """
-    Information about a subdomain, used for filtering active subdomains.
-    
-    Provides convenient access to subdomain properties like bounds, center, etc.
-    
-    Attributes:
-        index (int): Flat index of the subdomain
-        multi_index (tuple): Per-dimension index tuple, e.g., (i, j) for 2D
-        xmin (np.ndarray): Lower bounds of the subdomain (shape: n_dims)
-        xmax (np.ndarray): Upper bounds of the subdomain (shape: n_dims)
-        center (np.ndarray): Center of the subdomain (shape: n_dims)
-        
-    Example:
-        # Filter by subdomain position in FBPINN
-        fbpinn = FBPINN(
-            partition, network,
-            active_subdomains=lambda sub: sub.xmin[0] >= 0  # Only x >= 0
-        )
-    """
-    index: int
-    multi_index: tuple
-    xmin: np.ndarray
-    xmax: np.ndarray
-    
-    @property
-    def center(self) -> np.ndarray:
-        """Center of the subdomain."""
-        return (self.xmin + self.xmax) / 2
-    
-    @property
-    def size(self) -> np.ndarray:
-        """Size of the subdomain in each dimension."""
-        return self.xmax - self.xmin
-    
-    def __repr__(self):
-        return f"SubdomainInfo(index={self.index}, xmin={self.xmin.tolist()}, xmax={self.xmax.tolist()})"
 
 # ============================================================================
 # Sampling utilities
@@ -1728,20 +1684,6 @@ class DomainCubic:
             lower_list.append([self.grid_positions[d][idx[d]] for d in range(self._spatial_dims)])
             upper_list.append([self.grid_positions[d][idx[d] + 1] for d in range(self._spatial_dims)])
         return np.array(lower_list), np.array(upper_list)
-
-    @property
-    def subdomains(self) -> List['SubdomainInfo']:
-        """
-        List of :class:`SubdomainInfo` objects, one per subdomain in the
-        partition (flat ordering, row-major).
-        """
-        self._require_partition()
-        lower_bounds, upper_bounds = self.get_subdomain_bounds()
-        return [
-            SubdomainInfo(index=i, multi_index=self.get_multi_index(i),
-                          xmin=lower_bounds[i], xmax=upper_bounds[i])
-            for i in range(self.n_subdomains)
-        ]
 
     def get_multi_index(self, flat_index):
         """

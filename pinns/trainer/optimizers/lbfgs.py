@@ -96,7 +96,7 @@ class LBFGSOptimizer(BaseOptimizer):
 
         auto_save_path = trainer._setup_training_plot(show_plots, save_plots)
 
-        state = solver.init_state(trainer.network.params, trainer._train_data)
+        state = solver.init_state(trainer.model.params, trainer._train_data)
 
         if print_each > 0:
             trainer._log_epoch(
@@ -111,8 +111,8 @@ class LBFGSOptimizer(BaseOptimizer):
             t0 = time.time()
             global_epoch = start_epoch + epoch
 
-            trainer.network.params, state = solver.update(
-                trainer.network.params, state, trainer._train_data
+            trainer.model.params, state = solver.update(
+                trainer.model.params, state, trainer._train_data
             )
             loss = state.value
             epoch_times.append(time.time() - t0)

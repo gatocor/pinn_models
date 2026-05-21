@@ -285,7 +285,7 @@ class SchedulerCausal(Scheduler):
         if residual_fn is None:
             raise RuntimeError("Call trainer.compile() first.")
 
-        residuals = residual_fn(trainer.network.params, trainer._train_data)
+        residuals = residual_fn(trainer.model.params, trainer._train_data)
 
         state    = self.get_jit_state()
         sort_idx = state[f"sort_idx_{t}"]
