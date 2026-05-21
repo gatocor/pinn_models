@@ -1,7 +1,7 @@
 """
 pinns/models/model_solver.py — Spectral model solver.
 
-:class:`ModelSolver` couples a :class:`~pinns.domain.DomainCubic` (geometry)
+:class:`ModelSpectralSolver` couples a :class:`~pinns.domain.DomainCubic` (geometry)
 with a spectral discretisation (``shape``, ``bc``) and an owned integrator.
 The spectral infrastructure — grid nodes, wavenumbers, K², and forward/inverse
 transforms — lives directly on the model.
@@ -24,7 +24,7 @@ Usage::
 
     domain = pinns.DomainCubic(space=[(-1.0, 1.0)], time=(0.0, 1.0))
     integrator = pinns.IntegratorETD2RK(dt=5e-4, checkpoint=True)
-    model = pinns.ModelSolver(domain, ["u"], integrator, shape=64)
+    model = pinns.ModelSpectralSolver(domain, ["u"], integrator, shape=64)
     model.set_linear_op(lambda K2, p: {"u": 1j * p["mu"]**2 * model.k * K2})
     model.set_nonlinear_op(nonlinear)
     model.add_parameter("eta", eta_val)
@@ -45,7 +45,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 
 import numpy as np
 
-__all__ = ["ModelSolver"]
+__all__ = ["ModelSpectralSolver"]
 
 # ─────────────────────────────────────────────────────────────────────────── #
 #  JAX bilinear interpolation (differentiable, works inside jax.grad)        #
@@ -155,10 +155,10 @@ def _jax_apply_stencil_1d(U, i0, j0, w00, w01, w10, w11):
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
-#  ModelSolver                                                               #
+#  ModelSpectralSolver                                                               #
 # ─────────────────────────────────────────────────────────────────────────── #
 
-class ModelSolver:
+class ModelSpectralSolver:
     """Spectral PDE model that owns a numerical integrator.
 
     Analogous to a neural-network model: exposes :meth:`apply` with the
@@ -211,11 +211,11 @@ class ModelSolver:
 
         if not isinstance(domain, DomainCubic):
             raise TypeError(
-                f"ModelSolver expects a DomainCubic, got {type(domain).__name__}."
+                f"ModelSpectralSolver expects a DomainCubic, got {type(domain).__name__}."
             )
         if not isinstance(integrator, Integrator):
             raise TypeError(
-                f"ModelSolver expects an Integrator, got {type(integrator).__name__}."
+                f"ModelSpectralSolver expects an Integrator, got {type(integrator).__name__}."
             )
 
         bc = bc.lower()
@@ -404,7 +404,7 @@ class ModelSolver:
         self,
         name: Union[str, List[str]],
         value: Any,
-    ) -> "ModelSolver":
+    ) -> "ModelSpectralSolver":
         """Register a model parameter.
 
         Trainability is decided at Trainer compile time (``fit_model_parameters``).
@@ -449,7 +449,7 @@ class ModelSolver:
     #  Operator registration                                               #
     # ──────────────────────────────────────────────────────────────────── #
 
-    def set_linear_op(self, fn: Callable) -> "ModelSolver":
+    def set_linear_op(self, fn: Callable) -> "ModelSpectralSolver":
         """Register the linear spectral operator.
 
         ``fn(K2, p) → {state_name: eigenvalue_array}``
@@ -459,7 +459,7 @@ class ModelSolver:
         self._linear_op = fn
         return self
 
-    def set_nonlinear_op(self, fn: Callable) -> "ModelSolver":
+    def set_nonlinear_op(self, fn: Callable) -> "ModelSpectralSolver":
         """Register the nonlinear spectral operator.
 
         ``fn(state_hat, p) → {state_name: spectral_array}``
@@ -473,7 +473,7 @@ class ModelSolver:
     #  Initial conditions and observations                                  #
     # ──────────────────────────────────────────────────────────────────── #
 
-    def add_initial(self, *arrays, **kwargs) -> "ModelSolver":
+    def add_initial(self, *arrays, **kwargs) -> "ModelSpectralSolver":
         """Set initial-condition arrays (physical space).
 
         Three call styles::
@@ -504,7 +504,7 @@ class ModelSolver:
         self,
         t_obs,
         data: Union[Dict[str, np.ndarray], List[np.ndarray]],
-    ) -> "ModelSolver":
+    ) -> "ModelSpectralSolver":
         """Set observation data.  Required only for direct :meth:`solve` without
         explicit ``t_obs`` argument; :meth:`apply` uses stored ``_obs_times``.
         """
@@ -569,7 +569,7 @@ class ModelSolver:
             errors.append("initial condition not set — call add_initial().")
         if errors:
             raise RuntimeError(
-                "ModelSolver is not fully configured:\n  " + "\n  ".join(errors)
+                "ModelSpectralSolver is not fully configured:\n  " + "\n  ".join(errors)
             )
 
     # ──────────────────────────────────────────────────────────────────── #
@@ -597,7 +597,7 @@ class ModelSolver:
             t_obs=t_obs if t_obs is not None else self._obs_times,
         )
 
-    def precompute_interp_stencil(self, X) -> "ModelSolver":
+    def precompute_interp_stencil(self, X) -> "ModelSpectralSolver":
         """Precompute the bilinear interpolation stencil for query points ``X``.
 
         Call this **once** before training whenever ``X`` (the observation
@@ -651,9 +651,9 @@ class ModelSolver:
         """Differentiable evaluation at scattered ``(x[, y, ...], t)`` points.
 
         Mirrors the ``network.apply(params, X[, params_dict])`` interface so
-        that Trainer can use ModelSolver and a neural network interchangeably.
+        that Trainer can use ModelSpectralSolver and a neural network interchangeably.
         The optional ``params_dict`` argument is accepted for API compatibility
-        but ignored (ModelSolver handles its own parameter dict internally).
+        but ignored (ModelSpectralSolver handles its own parameter dict internally).
 
         The full chain ``params → integrator.solve → U → bilinear_interp``
         is differentiable end-to-end (gradients flow through U via JAX).
@@ -735,7 +735,7 @@ class ModelSolver:
     def __repr__(self) -> str:
         pnames = list(self._params.keys())
         return (
-            f"ModelSolver(states={self.state_names}, shape={self.shape}, "
+            f"ModelSpectralSolver(states={self.state_names}, shape={self.shape}, "
             f"bc={self.bc!r}, params={pnames}, "
             f"integrator={type(self._integrator).__name__})"
         )

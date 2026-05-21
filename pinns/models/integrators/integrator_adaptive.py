@@ -102,7 +102,7 @@ class AdaptiveIntegrator(Integrator):
         """Adaptive-step forward solve using the wrapped integrator's step.
 
         Args:
-            problem:         A fully-configured :class:`~pinns.models.ModelSolver`.
+            problem:         A fully-configured :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params: Dict of JAX-differentiable parameter values.
             t_obs:           Ignored; observation times come from
                              ``problem.add_observations()``.

@@ -52,18 +52,18 @@ class Trainer:
         Initialize common trainer attributes.
         
         Args:
-            model: Neural network or :class:`~pinns.ModelSolver` to train.
+            model: Neural network or :class:`~pinns.ModelSpectralSolver` to train.
                    This is the mandatory first argument (formerly ``network``).
             problem: Optional problem instance defining PDE and boundary conditions
                      (:class:`~pinns.ProblemStrong` or :class:`~pinns.ProblemWeak`).
-                     Pass ``None`` for dataset-only training (e.g. with ModelSolver).
+                     Pass ``None`` for dataset-only training (e.g. with ModelSpectralSolver).
             dataset: Optional :class:`~pinns.Dataset` of fixed observation data.
                      Each registered point set is evaluated every training step
                      as a supervised MSE loss (no domain-based sampling).
             device: Device to use. If None, auto-detect using backend.
         """
         # Reset network parameters so fresh init always starts clean.
-        # Skip for ModelSolver which manages its own _params dict.
+        # Skip for ModelSpectralSolver which manages its own _params dict.
         if hasattr(model, 'params') and not getattr(model, '_is_solver_problem', False):
             model.params = None
 
@@ -232,7 +232,7 @@ class Trainer:
         # of all F faces.  Reduces per-step cost; acts as stochastic regularisation.
         # Set to None (default) to use all faces (full Galerkin).
         face_batch_size: Optional[int] = None,
-        # For ModelSolver: list of parameter names to optimise.
+        # For ModelSpectralSolver: list of parameter names to optimise.
         # All other model parameters are frozen via stop_gradient.
         fit_model_parameters: Optional[List[str]] = None,
     ):
@@ -336,7 +336,7 @@ class Trainer:
         if face_batch_size != old_face_batch:
             optimizer_changed = True   # force recompile of loss fn
 
-        # fit_model_parameters: controls which ModelSolver params are optimised.
+        # fit_model_parameters: controls which ModelSpectralSolver params are optimised.
         old_fit = getattr(self, '_fit_model_parameters', None)
         self._fit_model_parameters = fit_model_parameters
         if fit_model_parameters != old_fit:
@@ -918,7 +918,7 @@ class Trainer:
 
         Delegates to ``problem._build_params`` so the flat-dict layout is
         determined by the problem class.  Returns an empty dict when no
-        problem is attached (dataset-only / ModelSolver mode).
+        problem is attached (dataset-only / ModelSpectralSolver mode).
 
         Args:
             internal: Internal training state. If None, uses current epoch/step 0.
@@ -1252,7 +1252,7 @@ class Trainer:
                 rng = jax.random.PRNGKey(0)
                 self.model.params = self.model.init(rng)
 
-        # ModelSolver: initialise params as the subset selected by fit_model_parameters.
+        # ModelSpectralSolver: initialise params as the subset selected by fit_model_parameters.
         if getattr(self.model, '_is_solver_problem', False):
             _fit = getattr(self, '_fit_model_parameters', None)
             if _fit is not None:
@@ -1507,7 +1507,7 @@ class Trainer:
         if self.problem is not None:
             _residual_fn = self.problem.make_residual_fn(self.model)
         else:
-            # Dataset-only / ModelSolver mode — no PDE residuals.
+            # Dataset-only / ModelSpectralSolver mode — no PDE residuals.
             _residual_fn = lambda params, data: {}
         self._residual_fn = _residual_fn
         self._residual_fn_jit = jax.jit(_residual_fn)

@@ -3,7 +3,7 @@ pinns/integrators/integrator_diffrax.py — Diffrax-based adaptive integrator.
 
 Wraps any `diffrax` solver (Dopri5, Dopri8, Kvaerno5, …) inside the standard
 ``Integrator`` interface.  The full RHS (linear + nonlinear) is built from the
-``ModelSolver`` operators and passed to ``diffrax.diffeqsolve``.
+``ModelSpectralSolver`` operators and passed to ``diffrax.diffeqsolve``.
 
 Gradient strategy
 -----------------
@@ -35,7 +35,7 @@ Usage
         adjoint="backsolve",   # gradient via adjoint ODE
         dt0=1e-3,              # initial step hint
     )
-    model = pinns.ModelSolver(domain, ["u"], integrator, shape=64)
+    model = pinns.ModelSpectralSolver(domain, ["u"], integrator, shape=64)
     ...
     states = model.solve(t_obs=t_ref)
 """
@@ -134,7 +134,7 @@ class IntegratorDiffrax(Integrator):
         """Forward-simulate and return states at observation times.
 
         Args:
-            problem:         A fully-configured :class:`~pinns.models.ModelSolver`.
+            problem:         A fully-configured :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params: Dict of JAX-differentiable parameter values.
             t_obs:           1-D array of snapshot times.
 

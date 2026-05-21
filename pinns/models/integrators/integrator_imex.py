@@ -65,7 +65,7 @@ class IntegratorIMEX(Integrator):
         """Forward-simulate using IMEX Euler and return states at observation times.
 
         Args:
-            problem:         A fully-configured :class:`~pinns.models.ModelSolver`.
+            problem:         A fully-configured :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params: Dict of JAX-differentiable parameter values.
             t_obs:           1-D array of snapshot times.  If ``None``, uses
                              times from ``problem.add_observations()``.
@@ -155,7 +155,7 @@ class IntegratorIMEX(Integrator):
             1) but provides a reliable error estimate for adaptive control.
 
         Args:
-            problem:   :class:`~pinns.models.ModelSolver`.
+            problem:   :class:`~pinns.models.ModelSpectralSolver`.
             state_hat: Fourier-space state dict.
             t:         Current time (unused by IMEX-Euler but kept for API
                        consistency).

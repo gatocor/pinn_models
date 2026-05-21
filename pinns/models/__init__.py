@@ -3,7 +3,7 @@ from .model_partitioned import ModelPartitioned
 from . import integrators
 from .model_stepper import ModelStepper
 from .model_utilities import create_model
-from .model_solver import ModelSolver
+from .model_solver import ModelSpectralSolver
 from .partition import PartitionFB, PartitionX, register_interface_loss
 from .stepping import StepperStep, StepperDt
 from . import layers
@@ -14,7 +14,7 @@ __all__ = [
     "ModelBase", "NetworkLoss",
     "ModelPartitioned",
     "ModelStepper",
-    "ModelSolver",
+    "ModelSpectralSolver",
     "create_model",
     "PartitionFB", "PartitionX", "register_interface_loss",
     "StepperStep", "StepperDt",

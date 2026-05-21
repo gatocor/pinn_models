@@ -31,6 +31,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 @dataclass
+@dataclass
 class TermPoints:
     """Data-assimilation term at arbitrary fixed coordinates.
 
@@ -48,18 +49,16 @@ class TermPoints:
                  treated as ``(N, 1)``.
         components: Network output index for each column of *outputs*.
         name: Base label used in weight dicts and plots.
-        output_names: Optional per-column labels.
 
     Example::
 
         obs = TermPoints(inputs=x_meas, outputs=u_meas, components=0, name='obs')
     """
 
-    inputs:       np.ndarray
-    outputs:      np.ndarray
-    components:   Union[int, List[int]] = 0
-    name:         Optional[str]         = None
-    output_names: Optional[List[str]]   = None
+    inputs:     np.ndarray
+    outputs:    np.ndarray
+    components: Union[int, List[int]] = 0
+    name:       Optional[str]         = None
 
     kind:      ClassVar[str]  = 'points'
     has_value: ClassVar[bool] = False
@@ -82,8 +81,6 @@ class TermPoints:
 
     def get_input_names(self) -> List[str]:
         base = self.name or 'pts'
-        if self.output_names is not None:
-            return list(self.output_names)
         return [base] if len(self.components) == 1 else \
                [f'{base}_{k}' for k in range(len(self.components))]
 
@@ -128,27 +125,48 @@ class Dataset:
         x,
         u,
         name: str,
-        component: int = 0,
-        output_names: Optional[List[str]] = None,
+        component: Union[int, List[int]] = 0,
+        outputs: Optional[List[str]] = None,
     ) -> 'Dataset':
         """Register a labelled set of observation points.
+
+        When *outputs* is given (a list of output names), a multi-column *u*
+        is automatically split into one term per output, named ``{name}_{out}``.
+        This mirrors the ``outputs=[...]`` behaviour of
+        ``problem.add_inner / add_initial``, so each species gets its own
+        tracked loss and individual weight in ``compile(dataset={...})``.
 
         Args:
             x: Array-like of shape ``(N, n_dims)`` — observation coordinates.
             u: Array-like of shape ``(N,)`` or ``(N, K)`` — target values.
-            name: Unique label used in the loss dict and weight dict.
-            component: Network output index this data supervises.  For
-                multi-output supervision call :meth:`add_points` once per
-                output, or pass a 2-D *u* together with a list of
-                *component* values.
-            output_names: Optional list of per-column loss keys (length
-                must match number of columns in *u*).
+            name: Base label for the term(s) in the loss/weight dict.
+            component: Network output index this data supervises.  Ignored
+                when *outputs* is given (components are assigned positionally
+                0, 1, … unless a matching-length list is passed).  For
+                single-output terms, an int; for multi-output without
+                *outputs*, a list of ints matching columns of *u*.
+            outputs: List of output names, e.g. ``["u", "v"]``.  When
+                provided, *u* must have ``len(outputs)`` columns and the call
+                creates one term per column named ``{name}_{out}`` with
+                component indices 0, 1, … (or taken from *component* if it
+                is a matching-length list).
 
         Returns:
             ``self`` for method chaining.
 
         Raises:
-            ValueError: If *x* and *u* have incompatible leading dimensions.
+            ValueError: If *x* and *u* have incompatible leading dimensions,
+                or *outputs* length does not match columns of *u*.
+
+        Example::
+
+            # Split u and v into separate tracked terms automatically:
+            dataset.add_points(X, uv_array, name="data", outputs=["u", "v"])
+            # → creates "data_u" (component 0) and "data_v" (component 1)
+
+            # Equivalent explicit form:
+            dataset.add_points(X, u_col, name="data_u", component=0)
+            dataset.add_points(X, v_col, name="data_v", component=1)
         """
         x_arr = np.asarray(x, dtype=np.float32)
         if x_arr.ndim == 1:
@@ -161,6 +179,37 @@ class Dataset:
                 f"Dataset.add_points('{name}'): x has {x_arr.shape[0]} row(s) "
                 f"but u has {u_arr.shape[0]} row(s)."
             )
+
+        # ── Multi-output split mode ────────────────────────────────────────
+        if outputs is not None:
+            n_cols = u_arr.shape[1]
+            if n_cols != len(outputs):
+                raise ValueError(
+                    f"Dataset.add_points('{name}'): u has {n_cols} column(s) "
+                    f"but outputs has {len(outputs)} element(s)."
+                )
+            # Resolve per-column component indices
+            if isinstance(component, int):
+                # Default: positional (0, 1, 2, …)
+                comp_list = list(range(n_cols))
+            else:
+                comp_list = list(component)
+                if len(comp_list) != n_cols:
+                    raise ValueError(
+                        f"Dataset.add_points('{name}'): component list length "
+                        f"{len(comp_list)} does not match outputs length {n_cols}."
+                    )
+            for col_idx, out_name in enumerate(outputs):
+                term = TermPoints(
+                    inputs=x_arr,
+                    outputs=u_arr[:, col_idx : col_idx + 1],
+                    components=[comp_list[col_idx]],
+                    name=f"{name}_{out_name}",
+                )
+                self._data_terms.append(term)
+            return self
+
+        # ── Single-term mode (original behaviour) ─────────────────────────
         n_cols = u_arr.shape[1]
         components: List[int] = (
             [component] * n_cols if isinstance(component, int) else list(component)
@@ -175,7 +224,6 @@ class Dataset:
             outputs=u_arr,
             components=components,
             name=name,
-            output_names=output_names,
         )
         self._data_terms.append(term)
         return self

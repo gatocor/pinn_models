@@ -114,7 +114,7 @@ class IntegratorRK45(Integrator):
         """Forward-simulate using fixed-step Dormand-Prince RK45.
 
         Args:
-            problem:         A fully-configured :class:`~pinns.models.ModelSolver`.
+            problem:         A fully-configured :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params: Dict of JAX-differentiable parameter values.
             t_obs:           1-D array of snapshot times.  If ``None``, uses
                              times from ``problem.add_observations()``.

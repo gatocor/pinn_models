@@ -118,7 +118,7 @@ class TrainPlotter:
         else:
             self._show_sampling_points = {'solution': False, 'residuals': False, 'zoom': False}
             self._show_sampling_points.update(_sp)
-        # When there is no problem (dataset-only / ModelSolver mode) disable residuals
+        # When there is no problem (dataset-only / ModelSpectralSolver mode) disable residuals
         if self._trainer.problem is None:
             self.show_residuals = False
         if self.time_points is not None:
@@ -1022,6 +1022,52 @@ class TrainPlotter:
         ax.legend(loc='best', fontsize=7)
         ax.grid(True, alpha=0.3)
 
+    def _plot_true_solution_1d_at_times(self, ax, output_idx, t_vals, n_points=200):
+        """Overlay true/reference 1D snapshots u(x) at multiple time values."""
+        if not self._get_has_solution():
+            return
+        x0 = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points)
+        colors = plt.cm.viridis(np.linspace(0, 1, len(t_vals)))
+        for t_val, color in zip(t_vals, colors):
+            x_full = np.column_stack([x0, np.full(n_points, float(t_val))])
+            y_true_raw = self._trainer._call_solution(x_full)
+            if isinstance(y_true_raw, (list, tuple)):
+                y_true_raw = np.concatenate(
+                    [np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true_raw], axis=1)
+            elif y_true_raw.ndim == 1:
+                y_true_raw = y_true_raw.reshape(-1, 1)
+            ax.plot(x0, y_true_raw[:, output_idx], color=color, linewidth=1.5, label=f't={t_val:.3g}')
+        output_name = self._trainer._get_output_name(output_idx)
+        ax.set_xlabel(self._trainer._get_input_name(0))
+        ax.set_ylabel(output_name)
+        ax.set_title(f'True ({output_name}) snapshots')
+        ax.legend(loc='best', fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_error_1d_at_times(self, ax, output_idx, t_vals, n_points=200):
+        """Overlay |error| 1D snapshots at multiple time values."""
+        if not self._get_has_solution():
+            return
+        x0 = np.linspace(self._get_xmin(0), self._get_xmax(0), n_points)
+        colors = plt.cm.Reds(np.linspace(0.3, 1.0, len(t_vals)))
+        for t_val, color in zip(t_vals, colors):
+            x_full = np.column_stack([x0, np.full(n_points, float(t_val))])
+            y_pred = self._trainer.eval(x_full)[:, output_idx]
+            y_true_raw = self._trainer._call_solution(x_full)
+            if isinstance(y_true_raw, (list, tuple)):
+                y_true_raw = np.concatenate(
+                    [np.atleast_2d(yt).T if yt.ndim == 1 else yt for yt in y_true_raw], axis=1)
+            elif y_true_raw.ndim == 1:
+                y_true_raw = y_true_raw.reshape(-1, 1)
+            err = np.abs(y_pred - y_true_raw[:, output_idx])
+            ax.plot(x0, err, color=color, linewidth=1.5, label=f't={t_val:.3g}')
+        output_name = self._trainer._get_output_name(output_idx)
+        ax.set_xlabel(self._trainer._get_input_name(0))
+        ax.set_ylabel(f'|Error| ({output_name})')
+        ax.set_title(f'Error ({output_name}) snapshots')
+        ax.legend(loc='best', fontsize=7)
+        ax.grid(True, alpha=0.3)
+
     def _plot_solution_2d(self, ax, output_idx, n_points=50, plot_key='solution'):
         """Plot 2D solution as heatmap on given axes."""
         cmap = self._trainer._get_colormap(output_idx)
@@ -1460,9 +1506,15 @@ class TrainPlotter:
                     if f'sol_{i}' in axes:
                         self._plot_solution_1d_at_times(axes[f'sol_{i}'], i, _pts2, n_points)
                         self._apply_plot_kwargs(axes[f'sol_{i}'], 'solution')
+                    if f'true_{i}' in axes and has_solution:
+                        self._plot_true_solution_1d_at_times(axes[f'true_{i}'], i, _pts2, n_points)
+                        self._apply_plot_kwargs(axes[f'true_{i}'], 'solution')
                     if f'res_{i}' in axes:
                         self._plot_residuals_1d_at_times(axes[f'res_{i}'], i, _pts2, n_points)
                         self._apply_plot_kwargs(axes[f'res_{i}'], 'residuals')
+                    if f'err_{i}' in axes and has_solution:
+                        self._plot_error_1d_at_times(axes[f'err_{i}'], i, _pts2, n_points)
+                        self._apply_plot_kwargs(axes[f'err_{i}'], 'error')
             else:
                 for i in range(n_outputs):
                     if f'sol_{i}' in axes:

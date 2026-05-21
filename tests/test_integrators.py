@@ -12,7 +12,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from pinns import DomainCubic, ModelSolver
+from pinns import DomainCubic, ModelSpectralSolver
 from pinns import IntegratorETD2RK, IntegratorRK4, IntegratorIMEX, AdaptiveIntegrator, PIDController
 
 try:
@@ -43,7 +43,7 @@ def make_heat_problem(alpha_init=ALPHA_TRUE, N=N, integrator=None):
         space=[(0.0, 1.0)],
         time=(0.0, 1.0),
     )
-    problem = ModelSolver(domain, state_names=["u"], integrator=integrator, shape=N)
+    problem = ModelSpectralSolver(domain, state_names=["u"], integrator=integrator, shape=N)
 
     problem.set_linear_op(
         lambda K2, p: {"u": -p["alpha"] * K2}
@@ -229,7 +229,7 @@ class TestMultiState:
             time=(0.0, 0.1),
         )
         integrator = IntegratorETD2RK(dt=1e-3)
-        problem = ModelSolver(domain, state_names=["u", "v"], integrator=integrator, shape=(N, N))
+        problem = ModelSpectralSolver(domain, state_names=["u", "v"], integrator=integrator, shape=(N, N))
 
         alpha1, alpha2 = 0.01, 0.02
         problem.set_linear_op(
@@ -284,7 +284,7 @@ class TestValidationErrors:
         from pinns import ProblemStrong, DomainCubic
         d = DomainCubic(space=[(0.0, 1.0)])
         p = ProblemStrong(domain=d, output_names=["u"])
-        with pytest.raises(TypeError, match="ModelSolver"):
+        with pytest.raises(TypeError, match="ModelSpectralSolver"):
             IntegratorETD2RK(dt=DT_STIFF).solve(p)
 
 

@@ -13,7 +13,7 @@ class Integrator(ABC):
     """Abstract base class for spectral time integrators.
 
     All integrators expose a single :meth:`solve` method that takes a
-    :class:`~pinns.models.ModelSolver` and an optional dict of inferred
+    :class:`~pinns.models.ModelSpectralSolver` and an optional dict of inferred
     parameter values, and returns the simulated state at the observation
     times registered via ``problem.add_observations()``.
 
@@ -30,7 +30,7 @@ class Integrator(ABC):
         """Forward-simulate the PDE and return states at observation times.
 
         Args:
-            problem: A fully-configured :class:`~pinns.models.ModelSolver`.
+            problem: A fully-configured :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params: Dict of differentiable parameter values.
                 If ``None``, the values stored in ``problem.inferred_params``
                 are used (as plain Python scalars, not JAX arrays).
@@ -45,11 +45,11 @@ class Integrator(ABC):
         """Validate problem type and configuration.
 
         Accepts any object carrying the ``_is_solver_problem = True`` marker,
-        which covers :class:`~pinns.models.ModelSolver`.
+        which covers :class:`~pinns.models.ModelSpectralSolver`.
         """
         if not getattr(problem, '_is_solver_problem', False):
             raise TypeError(
-                f"{type(self).__name__}.solve() expects a ModelSolver, "
+                f"{type(self).__name__}.solve() expects a ModelSpectralSolver, "
                 f"got {type(problem).__name__}."
             )
         problem._validate()
@@ -58,7 +58,7 @@ class Integrator(ABC):
         """Return observation times, preferring the ``t_obs`` argument.
 
         Args:
-            problem: A :class:`~pinns.models.ModelSolver`.
+            problem: A :class:`~pinns.models.ModelSpectralSolver`.
             t_obs:   Optional array of observation times passed directly to
                      ``solve()``.  If ``None``, falls back to the times
                      registered via ``problem.add_observations()``.
@@ -86,7 +86,7 @@ class Integrator(ABC):
         Override in subclasses that support adaptive time stepping.
 
         Args:
-            problem:   A :class:`~pinns.models.ModelSolver`.
+            problem:   A :class:`~pinns.models.ModelSpectralSolver`.
             state_hat: Dict of Fourier-space state arrays at time ``t``.
             t:         Current time (JAX scalar).
             dt:        Step size to attempt (JAX scalar).
@@ -132,7 +132,7 @@ class Integrator(ABC):
         the backward pass.
 
         Args:
-            problem:         A :class:`~pinns.models.ModelSolver`.
+            problem:         A :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params: Differentiable parameter dict (passed as explicit
                              JAX pytree so ``jax.grad`` traces through it).
             controller:      A :class:`~pinns.integrators.StepsizeController`
@@ -183,12 +183,17 @@ class Integrator(ABC):
 
             # Observation buffer — shape (n_obs, *mode_shape) per state
             # Initialised to zeros; will be filled as integration proceeds.
-            obs_buf = {
-                name: jnp.zeros(
+            # Pre-fill any observation time that equals t0 with the IC so
+            # the crossing condition (t < t_obs[i]) never misses t=t0.
+            obs_buf = {}
+            for name in state_names:
+                buf = jnp.zeros(
                     (n_obs,) + sh0[name].shape, dtype=sh0[name].dtype
                 )
-                for name in state_names
-            }
+                for i, t_i in enumerate(t_obs_np):
+                    if abs(float(t_i) - float(t0)) < 1e-12 * max(abs(float(t1) - float(t0)), 1e-30):
+                        buf = buf.at[i].set(sh0[name])
+                obs_buf[name] = buf
 
             ctrl_state0 = controller.init()
 
@@ -323,7 +328,7 @@ class Integrator(ABC):
         space-time points, exactly like a trained network.
 
         Args:
-            problem: The :class:`~pinns.models.ModelSolver` that was solved.
+            problem: The :class:`~pinns.models.ModelSpectralSolver` that was solved.
             result:  Dict ``{state_name: array(n_obs, *shape)}`` (physical space).
             t_obs:   1-D numpy array of observation times used in the solve.
         """

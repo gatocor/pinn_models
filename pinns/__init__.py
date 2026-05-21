@@ -54,7 +54,7 @@ from .models.model_base import ModelBase, NetworkLoss
 from .models.model_utilities import create_model
 from .models.model_partitioned import ModelPartitioned
 from .models.model_stepper import ModelStepper
-from .models.model_solver import ModelSolver
+from .models.model_solver import ModelSpectralSolver
 
 # Networks / layers
 from .models.layers import (
@@ -96,7 +96,7 @@ __all__ = [
     "FNN", "WFFNN", "PirateNet", "ResNet", "RandomFourierFeatures", "FourierFeatures", "DenseRWF", "PeriodicEmbedding",
     "Normalize", "Denormalize",
     "GNNFeatures", "LaplacianFeatures",
-    "ModelBase", "NetworkLoss", "create_model", "ModelPartitioned", "ModelStepper", "ModelSolver",
+    "ModelBase", "NetworkLoss", "create_model", "ModelPartitioned", "ModelStepper", "ModelSpectralSolver",
     "PartitionFB", "PartitionX", "StepperStep", "StepperDt", "register_interface_loss",
     "ProblemStrong", "ProblemWeak",
     "Integrator", "IntegratorETD2RK", "AdaptiveIntegrator",

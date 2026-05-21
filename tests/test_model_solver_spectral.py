@@ -1,4 +1,4 @@
-"""Tests for ModelSolver spectral infrastructure — grid, transforms, K2."""
+"""Tests for ModelSpectralSolver spectral infrastructure — grid, transforms, K2."""
 
 import numpy as np
 import pytest
@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 
 import pinns
-from pinns import DomainCubic, ModelSolver, IntegratorETD2RK
+from pinns import DomainCubic, ModelSpectralSolver, IntegratorETD2RK
 
 
 # ============================================================================
@@ -14,10 +14,10 @@ from pinns import DomainCubic, ModelSolver, IntegratorETD2RK
 # ============================================================================
 
 def _make(space, shape, bc="periodic", time=(0.0, 1.0)):
-    """Create a ModelSolver with minimal operators (for spectral tests)."""
+    """Create a ModelSpectralSolver with minimal operators (for spectral tests)."""
     domain = DomainCubic(space=space, time=time)
     integrator = IntegratorETD2RK(dt=1e-3)
-    model = ModelSolver(domain, ["u"], integrator, shape=shape, bc=bc)
+    model = ModelSpectralSolver(domain, ["u"], integrator, shape=shape, bc=bc)
     return model
 
 
@@ -72,13 +72,13 @@ class TestConstruction:
 
     def test_repr(self):
         m = _make([(0.0, 1.0)], 8)
-        assert "ModelSolver" in repr(m)
+        assert "ModelSpectralSolver" in repr(m)
         assert "periodic" in repr(m)
 
     def test_wrong_domain_type(self):
         integrator = IntegratorETD2RK(dt=1e-3)
         with pytest.raises(TypeError, match="DomainCubic"):
-            ModelSolver(object(), ["u"], integrator, shape=8)
+            ModelSpectralSolver(object(), ["u"], integrator, shape=8)
 
 
 # ============================================================================

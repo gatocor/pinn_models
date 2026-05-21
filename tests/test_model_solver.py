@@ -1,4 +1,4 @@
-"""Tests for ModelSolver — spectral PDE model owning its integrator."""
+"""Tests for ModelSpectralSolver — spectral PDE model owning its integrator."""
 
 import numpy as np
 import jax
@@ -14,7 +14,7 @@ import pinns
 
 @pytest.fixture
 def kdv_model():
-    """1-D KdV ModelSolver (closed-form params, no inference)."""
+    """1-D KdV ModelSpectralSolver (closed-form params, no inference)."""
     eta_val = 1.0
     mu_val  = 0.022
     Nx = 64
@@ -23,7 +23,7 @@ def kdv_model():
         space=[(-1.0, 1.0)], time=(0.0, 1.0)
     )
     integrator = pinns.IntegratorETD2RK(dt=5e-4)
-    model = pinns.ModelSolver(domain, ["u"], integrator, shape=Nx)
+    model = pinns.ModelSpectralSolver(domain, ["u"], integrator, shape=Nx)
 
     model.set_linear_op(
         lambda K2, p: {"u": 1j * p["mu2"] * model.k * K2}
@@ -41,7 +41,7 @@ def kdv_model():
 
 @pytest.fixture
 def kdv_inv_model():
-    """1-D KdV ModelSolver set up for inverse problem (mu is a free param)."""
+    """1-D KdV ModelSpectralSolver set up for inverse problem (mu is a free param)."""
     eta_val = 1.0
     mu_init = 0.02
     Nx = 64
@@ -50,7 +50,7 @@ def kdv_inv_model():
         space=[(-1.0, 1.0)], time=(0.0, 1.0)
     )
     integrator = pinns.IntegratorETD2RK(dt=5e-4, checkpoint=True)
-    model = pinns.ModelSolver(domain, ["u"], integrator, shape=Nx)
+    model = pinns.ModelSpectralSolver(domain, ["u"], integrator, shape=Nx)
 
     model.set_linear_op(
         lambda K2, p: {"u": 1j * p["mu"] ** 2 * model.k * K2}
@@ -73,20 +73,20 @@ def kdv_inv_model():
 def test_repr(kdv_model):
     model, *_ = kdv_model
     r = repr(model)
-    assert "ModelSolver" in r
+    assert "ModelSpectralSolver" in r
     assert "IntegratorETD2RK" in r
 
 
 def test_wrong_domain_raises():
     integrator = pinns.IntegratorETD2RK(dt=1e-2)
     with pytest.raises(TypeError, match="DomainCubic"):
-        pinns.ModelSolver(object(), ["u"], integrator, shape=16)
+        pinns.ModelSpectralSolver(object(), ["u"], integrator, shape=16)
 
 
 def test_wrong_integrator_raises():
     domain = pinns.DomainCubic(space=[(-1.0, 1.0)], time=(0.0, 1.0))
     with pytest.raises(TypeError, match="Integrator"):
-        pinns.ModelSolver(domain, ["u"], object(), shape=16)
+        pinns.ModelSpectralSolver(domain, ["u"], object(), shape=16)
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -102,7 +102,7 @@ def test_add_parameter_scalar(kdv_model):
 def test_add_parameter_chaining(kdv_model):
     model, domain, *_ = kdv_model
     integrator = pinns.IntegratorETD2RK(dt=1e-2)
-    m = pinns.ModelSolver(domain, ["u"], integrator, shape=model.shape[0])
+    m = pinns.ModelSpectralSolver(domain, ["u"], integrator, shape=model.shape[0])
     ret = m.add_parameter("a", 1.0)
     assert ret is m
 
@@ -114,7 +114,7 @@ def test_add_parameter_chaining(kdv_model):
 def test_validate_missing_linear_op(kdv_model):
     model, domain, *_ = kdv_model
     integrator = pinns.IntegratorETD2RK(dt=1e-2)
-    m = pinns.ModelSolver(domain, ["u"], integrator, shape=model.shape[0])
+    m = pinns.ModelSpectralSolver(domain, ["u"], integrator, shape=model.shape[0])
     m.set_nonlinear_op(lambda s, p: s)
     m.add_initial(jnp.zeros(model.x.shape))
     with pytest.raises(RuntimeError, match="linear_op"):
@@ -124,7 +124,7 @@ def test_validate_missing_linear_op(kdv_model):
 def test_validate_missing_initial(kdv_model):
     model, domain, *_ = kdv_model
     integrator = pinns.IntegratorETD2RK(dt=1e-2)
-    m = pinns.ModelSolver(domain, ["u"], integrator, shape=model.shape[0])
+    m = pinns.ModelSpectralSolver(domain, ["u"], integrator, shape=model.shape[0])
     m.set_linear_op(lambda K2, p: {"u": K2})
     m.set_nonlinear_op(lambda s, p: s)
     with pytest.raises(RuntimeError, match="initial"):
@@ -146,7 +146,7 @@ def test_build_params_no_gradient_on_fixed():
     """Gradient must not flow through a frozen parameter."""
     domain = pinns.DomainCubic(space=[(-1.0, 1.0)], time=(0.0, 1.0))
     integrator = pinns.IntegratorETD2RK(dt=1e-2)
-    model = pinns.ModelSolver(domain, ["u"], integrator, shape=16)
+    model = pinns.ModelSpectralSolver(domain, ["u"], integrator, shape=16)
     model.add_parameter("a", 2.0)
     model.add_parameter("b", 3.0)
 
@@ -239,7 +239,7 @@ def test_inverse_gradient_nonzero(kdv_inv_model):
     t_obs = np.linspace(0, 0.1, 10)   # short window — no aliasing divergence
 
     # Generate synthetic observations with the true mu
-    true_model = pinns.ModelSolver(domain, ["u"], pinns.IntegratorETD2RK(dt=5e-4), shape=model.shape[0])
+    true_model = pinns.ModelSpectralSolver(domain, ["u"], pinns.IntegratorETD2RK(dt=5e-4), shape=model.shape[0])
     true_model.set_linear_op(
         lambda K2, p: {"u": 1j * p["mu"] ** 2 * true_model.k * K2}
     )

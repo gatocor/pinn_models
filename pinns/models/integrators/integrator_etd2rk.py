@@ -96,7 +96,7 @@ class IntegratorETD2RK(Integrator):
         """Forward-simulate using ETD2RK and return states at observation times.
 
         Args:
-            problem:          A fully-configured :class:`~pinns.models.ModelSolver`.
+            problem:          A fully-configured :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params:  Dict of JAX-differentiable parameter values.
             t_obs:            1-D array of times at which to snapshot the state.
                               If ``None``, uses times from ``problem.add_observations()``.
@@ -218,7 +218,7 @@ class IntegratorETD2RK(Integrator):
                              = dt · φ₂(Ldt) · (k2 − k1)
 
         Args:
-            problem:   :class:`~pinns.models.ModelSolver`.
+            problem:   :class:`~pinns.models.ModelSpectralSolver`.
             state_hat: Fourier-space state dict at time ``t``.
             t:         Current time (ignored by ETD2RK but kept for uniformity).
             dt:        Step size (JAX scalar).
