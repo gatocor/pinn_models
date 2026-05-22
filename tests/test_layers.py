@@ -150,7 +150,7 @@ class TestRandomFourierFeatures:
         module  = FNNModule(layer_sizes=(ff.output_dim, 32, 1))
         feats   = ff(jnp.ones((BATCH, 2)))
         params  = module.init(RNG, feats[:1])
-        y       = module.apply(params, feats)
+        y       = module.apply(feats, params)
         assert y.shape == (BATCH, 1)
 
     def test_aliased_in_layers_module(self):
@@ -262,7 +262,7 @@ class TestGNNFeatures:
         enc_params = enc.init(jax.random.PRNGKey(1))
         features = enc(enc_params, query_spatial)
         net_params = module.init(RNG, features[:1])
-        y = module.apply(net_params, features)
+        y = module.apply(features, net_params)
         assert y.shape == (BATCH, 1)
 
     def test_aliased_in_layers_module(self):
@@ -330,7 +330,7 @@ class TestLaplacianFeatures:
         features = enc(query_spatial)
         module = FNNModule(layer_sizes=(enc.output_dim, 16, 1))
         params = module.init(RNG, features[:1])
-        y = module.apply(params, features)
+        y = module.apply(features, params)
         assert y.shape == (BATCH, 1)
 
     def test_aliased_in_layers_module(self):
@@ -516,7 +516,7 @@ class TestNormalizeLayer:
         net.add(layer)
         params = net.init(RNG)
         x = jnp.array([[0.0, 0.0], [1.0, 1.0], [0.5, 0.5]], dtype=jnp.float32)
-        out = layer.apply({}, x)
+        out = layer.apply(x)
         assert out.shape == (3, 2)
         assert float(out.min()) >= -1.0 - 1e-5
         assert float(out.max()) <=  1.0 + 1e-5
@@ -541,7 +541,7 @@ class TestNormalizeLayer:
         layer = Denormalize()
         net.add(layer)
         x = jnp.ones((BATCH, 1))
-        out = layer.apply({}, x)
+        out = layer.apply(x)
         assert jnp.allclose(x, out)
 
     def test_denormalize_rescales(self, simple_domain):
@@ -551,7 +551,7 @@ class TestNormalizeLayer:
         net.add(layer)
         # Input -1 → 0.0, input 1 → 2.0
         x = jnp.array([[-1.0], [1.0]])
-        out = layer.apply({}, x)
+        out = layer.apply(x)
         assert jnp.allclose(out, jnp.array([[0.0], [2.0]]), atol=1e-5)
 
 
@@ -574,7 +574,7 @@ class TestFNNLayer:
         layer = FNN([64])
         net.add(layer)
         params = layer.init(RNG)
-        out = layer.apply(params, query_spatial)
+        out = layer.apply(query_spatial, params)
         assert out.shape == (BATCH, 2)
 
     def test_repr(self, simple_domain):
@@ -591,7 +591,7 @@ class TestFNNLayer:
         layer = WFFNN([32])
         net.add(layer)
         params = layer.init(RNG)
-        out = layer.apply(params, query_spatial)
+        out = layer.apply(query_spatial, params)
         assert out.shape == (BATCH, 1)
 
 
@@ -607,7 +607,7 @@ class TestResNetLayer:
         layer = ResNet(hidden_dim=16, n_blocks=2)
         net.add(layer)
         params = layer.init(RNG)
-        out = layer.apply(params, query_spatial)
+        out = layer.apply(query_spatial, params)
         assert out.shape == (BATCH, 1)
 
     def test_repr(self, simple_domain):
@@ -624,7 +624,7 @@ class TestResNetLayer:
         layer = ResNet(hidden_dim=16, n_blocks=2)
         net.add(layer)
         params = layer.init(RNG)
-        out = layer.apply(params, query_spacetime)
+        out = layer.apply(query_spacetime, params)
         assert out.shape == (BATCH, 1)
 
     def test_multi_output(self, simple_domain, query_spatial):
@@ -633,7 +633,7 @@ class TestResNetLayer:
         layer = ResNet(hidden_dim=32, n_blocks=1)
         net.add(layer)
         params = layer.init(RNG)
-        out = layer.apply(params, query_spatial)
+        out = layer.apply(query_spatial, params)
         assert out.shape == (BATCH, 3)
 
 
@@ -649,7 +649,7 @@ class TestPirateNetLayer:
         layer = PirateNet(hidden_dim=16, n_blocks=2)
         net.add(layer)
         params = layer.init(RNG)
-        out = layer.apply(params, query_spatial)
+        out = layer.apply(query_spatial, params)
         assert out.shape == (BATCH, 1)
 
     def test_repr(self, simple_domain):
@@ -666,7 +666,7 @@ class TestPirateNetLayer:
         layer = PirateNet(hidden_dim=16, n_blocks=2)
         net.add(layer)
         params = layer.init(RNG)
-        out = layer.apply(params, query_spacetime)
+        out = layer.apply(query_spacetime, params)
         assert out.shape == (BATCH, 1)
 
     def test_multi_output(self, simple_domain, query_spatial):
@@ -675,7 +675,7 @@ class TestPirateNetLayer:
         layer = PirateNet(hidden_dim=32, n_blocks=1)
         net.add(layer)
         params = layer.init(RNG)
-        out = layer.apply(params, query_spatial)
+        out = layer.apply(query_spatial, params)
         assert out.shape == (BATCH, 3)
 
 

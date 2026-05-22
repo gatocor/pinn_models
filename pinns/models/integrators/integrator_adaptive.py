@@ -85,6 +85,11 @@ class AdaptiveIntegrator(Integrator):
         self.max_steps  = int(max_steps)
         self.checkpoint = bool(checkpoint)
 
+    @property
+    def dt(self) -> float:
+        """Alias for ``dt0``, required by :meth:`_get_obs_times`."""
+        return self.dt0
+
     # ── Delegate _one_step to the wrapped integrator ───────────────────── #
 
     def _one_step(self, problem, state_hat, t, dt, L, params):
@@ -97,15 +102,12 @@ class AdaptiveIntegrator(Integrator):
         self,
         problem,
         inferred_params: Optional[Dict[str, Any]] = None,
-        t_obs=None,
     ) -> Dict[str, Any]:
         """Adaptive-step forward solve using the wrapped integrator's step.
 
         Args:
             problem:         A fully-configured :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params: Dict of JAX-differentiable parameter values.
-            t_obs:           Ignored; observation times come from
-                             ``problem.add_observations()``.
 
         Returns:
             Dict ``{state_name: array(n_obs, *shape)}`` in physical space.
@@ -117,7 +119,6 @@ class AdaptiveIntegrator(Integrator):
             dt0             = self.dt0,
             max_steps       = self.max_steps,
             checkpoint      = self.checkpoint,
-            t_obs           = t_obs,
         )
 
     def __repr__(self) -> str:

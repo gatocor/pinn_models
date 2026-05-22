@@ -43,7 +43,7 @@ def test_vanilla_network():
     rng = jax.random.PRNGKey(0)
     params = net.init(rng)
     x = jnp.ones((100, 2))
-    y = net.apply(params, x, {})
+    y = net.apply(x, params)
 
     assert y.shape == (100, 1)
 

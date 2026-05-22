@@ -55,6 +55,9 @@ from .models.model_utilities import create_model
 from .models.model_partitioned import ModelPartitioned
 from .models.model_stepper import ModelStepper
 from .models.model_solver import ModelSpectralSolver
+from .models.model_fem_solver import ModelFEMSolver
+from .models.nonlinear import NonlinearSolverBase, NonlinearSolverNone, NonlinearSolverNewton, NonlinearSolverPicard
+from .models.linear import LinearSolverBase, LinearSolverGMRES, LinearSolverDirect
 
 # Networks / layers
 from .models.layers import (
@@ -98,6 +101,8 @@ __all__ = [
     "GNNFeatures", "LaplacianFeatures",
     "ModelBase", "NetworkLoss", "create_model", "ModelPartitioned", "ModelStepper", "ModelSpectralSolver",
     "PartitionFB", "PartitionX", "StepperStep", "StepperDt", "register_interface_loss",
+    "NonlinearSolverBase", "NonlinearSolverNone", "NonlinearSolverNewton", "NonlinearSolverPicard",
+    "LinearSolverBase", "LinearSolverGMRES", "LinearSolverDirect",
     "ProblemStrong", "ProblemWeak",
     "Integrator", "IntegratorETD2RK", "AdaptiveIntegrator",
     "IntegratorRK4", "IntegratorRK45", "IntegratorIMEX", "IntegratorDiffrax",

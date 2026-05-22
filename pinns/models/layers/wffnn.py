@@ -87,7 +87,7 @@ class WFFNN:
         dummy = jnp.ones((1, self._layer_sizes[0]))
         return self._module.init(rng, dummy)
 
-    def apply(self, params: Dict, x: jnp.ndarray, params_dict=None) -> jnp.ndarray:
+    def apply(self, x: jnp.ndarray, params: Dict = None, params_dict=None) -> jnp.ndarray:
         return self._module.apply(params, x)
 
     def __repr__(self) -> str:

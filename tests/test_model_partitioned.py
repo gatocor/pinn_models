@@ -180,28 +180,28 @@ class TestInitApply:
         ens = ModelPartitioned(model_1d_spatial, PartitionFB())
         params = ens.init(RNG)
         x = jnp.ones((BATCH, 1))
-        y = ens.apply(params, x)
+        y = ens.apply(x, params)
         assert y.shape == (BATCH, 1)
 
     def test_apply_shape_2d(self, model_2d):
         ens = ModelPartitioned(model_2d, PartitionFB())
         params = ens.init(RNG)
         x = jnp.ones((BATCH, 2))
-        y = ens.apply(params, x)
+        y = ens.apply(x, params)
         assert y.shape == (BATCH, 1)
 
     def test_apply_shape_with_time(self, model_1d_partitioned_time):
         ens = ModelPartitioned(model_1d_partitioned_time, PartitionFB(), partition_time=True)
         params = ens.init(RNG)
         x = jnp.ones((BATCH, 2))   # spatial + time
-        y = ens.apply(params, x)
+        y = ens.apply(x, params)
         assert y.shape == (BATCH, 1)
 
     def test_apply_x_strategy(self, model_1d_spatial):
         ens = ModelPartitioned(model_1d_spatial, PartitionX())
         params = ens.init(RNG)
         x = jnp.linspace(0, 1, BATCH)[:, None]
-        y = ens.apply(params, x)
+        y = ens.apply(x, params)
         assert y.shape == (BATCH, 1)
 
     def test_independent_params_per_model(self, model_1d_spatial):

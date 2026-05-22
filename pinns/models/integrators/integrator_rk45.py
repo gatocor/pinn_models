@@ -32,7 +32,7 @@ from typing import Any, Dict, Optional
 import jax
 import jax.numpy as jnp
 
-from .integrator_base import Integrator
+from .integrator_base import Integrator, _apply_L
 
 __all__ = ["IntegratorRK45"]
 
@@ -109,15 +109,12 @@ class IntegratorRK45(Integrator):
         self,
         problem,
         inferred_params: Optional[Dict[str, Any]] = None,
-        t_obs=None,
     ) -> Dict[str, Any]:
         """Forward-simulate using fixed-step Dormand-Prince RK45.
 
         Args:
             problem:         A fully-configured :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params: Dict of JAX-differentiable parameter values.
-            t_obs:           1-D array of snapshot times.  If ``None``, uses
-                             times from ``problem.add_observations()``.
 
         Returns:
             Dict ``{state_name: array(n_obs, *shape)}`` in physical space.
@@ -130,7 +127,7 @@ class IntegratorRK45(Integrator):
 
         # ── Python-level observation schedule (not traced by JAX) ──────────
         t0 = problem._t_min
-        resolved_t_obs = self._resolve_obs_times(problem, t_obs)
+        resolved_t_obs = self._get_obs_times(problem)
         obs_steps = [int(round((t - t0) / dt)) for t in resolved_t_obs]
         n_obs = len(obs_steps)
         segment_lengths = [obs_steps[0]] + [
@@ -142,14 +139,13 @@ class IntegratorRK45(Integrator):
         # ── JIT-compiled core ───────────────────────────────────────────────
         def _core(inferred):
             params = problem._build_params(inferred)
-            K2 = problem.K2
-            L  = problem._linear_op(K2, params)
+            L  = problem._call_linear_op(params)
 
             # Full RHS in spectral space: linear + nonlinear
             def _rhs(sh):
-                Nhat = problem._nonlinear_op(sh, params)
+                Nhat = problem._call_nonlinear_op(sh, params)
                 return {
-                    name: L[name] * sh[name] + Nhat[name]
+                    name: _apply_L(L[name], sh[name]) + Nhat[name]
                     for name in state_names
                 }
 
@@ -195,7 +191,7 @@ class IntegratorRK45(Integrator):
                 return new_sh, None
 
             step_fn = jax.remat(_step) if checkpoint else _step
-            state_hat_0 = problem.get_initial_hat()
+            state_hat_0 = problem.get_initial_state()
 
             if uniform and n_obs > 1:
                 def _segment(sh, _):
@@ -216,10 +212,7 @@ class IntegratorRK45(Integrator):
                     for name in state_names
                 }
 
-            return {
-                name: jax.vmap(problem.inverse)(seg_states[name])
-                for name in state_names
-            }
+            return problem._to_physical_batch(seg_states)
 
         cache_key = (id(problem), tuple(obs_steps), self.checkpoint)
         if cache_key not in self._jit_cache:

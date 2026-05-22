@@ -164,17 +164,15 @@ class ModelStepper:
 
     def apply(
         self,
-        params: dict,
         x: "jnp.ndarray",
         prev_output: "jnp.ndarray",
+        params: dict = None,
         params_dict: Optional[dict] = None,
     ) -> "jnp.ndarray":
         """Perform a **single** time step.
 
         Parameters
         ----------
-        params :
-            Parameter dict returned by :meth:`init`.
         x :
             Input coordinates, shape ``(B, d)`` where ``d`` is
             ``spatial_dims`` [+ 1 if time is included].  Do **not** include
@@ -182,6 +180,8 @@ class ModelStepper:
         prev_output :
             Previous step outputs, shape ``(B, output_dim)``.  Concatenated as
             trailing context columns before calling the model.
+        params :
+            Parameter dict returned by :meth:`init`.
         params_dict :
             Optional auxiliary dict forwarded to every layer.
 
@@ -190,7 +190,7 @@ class ModelStepper:
         jnp.ndarray  shape ``(B, output_dim)``
         """
         x_ctx = jnp.concatenate([x, prev_output], axis=-1)
-        return self.model.apply(params, x_ctx, params_dict)
+        return self.model.apply(x_ctx, params, params_dict)
 
     # ── autoregressive rollout ───────────────────────────────────────── #
 
@@ -273,7 +273,7 @@ class ModelStepper:
                 x_i = jnp.concatenate([x_spatial, t_i], axis=-1)
             else:
                 x_i = x_spatial
-            prev = self.apply(params, x_i, prev, params_dict)
+            prev = self.apply(x_i, prev, params, params_dict)
             outputs.append(prev)
 
         return jnp.stack(outputs, axis=0)  # (n_steps, B, output_dim)

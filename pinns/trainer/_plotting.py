@@ -57,7 +57,7 @@ class TrainPlotter:
     def __init__(
         self,
         *,
-        save: Optional[str] = None,
+        save_to: Optional[str] = None,
         subdomains: Union[bool, Dict[str, bool]] = False,
         sampling_points: Union[bool, Dict[str, bool]] = False,
         regions: Optional[List[tuple]] = None,
@@ -71,7 +71,7 @@ class TrainPlotter:
         show_loss: bool = True,
         show_mse_loss: bool = False,
     ) -> None:
-        self.save = save
+        self.save_to = save_to
         self.subdomains = subdomains
         self.sampling_points = sampling_points
         self.regions = regions if regions is not None else []
@@ -180,8 +180,10 @@ class TrainPlotter:
         return getattr(self._trainer.model, 'output_dim', 1)
 
     def _get_fit_params(self) -> list:
-        """Return list of fitted parameter names (from _fit_model_parameters)."""
-        return list(getattr(self._trainer, '_fit_model_parameters', None) or [])
+        """Return list of fitted parameter names (model + problem parameters)."""
+        model_params = list(getattr(self._trainer, '_fit_model_parameters', None) or [])
+        problem_params = list(getattr(self._trainer, '_fit_problem_parameters', None) or [])
+        return model_params + problem_params
 
     def _get_n_param_rows(self) -> int:
         """Return number of parameter-history rows to show."""
@@ -195,8 +197,8 @@ class TrainPlotter:
 
     def __repr__(self) -> str:  # pragma: no cover
         parts = []
-        if self.save:
-            parts.append(f"save={self.save!r}")
+        if self.save_to:
+            parts.append(f"save_to={self.save_to!r}")
         if self.subdomains:
             parts.append(f"subdomains={self.subdomains!r}")
         if self.sampling_points:
@@ -584,7 +586,9 @@ class TrainPlotter:
         """Plot inferred parameter values over epochs, with optional true-value reference lines."""
         epochs = self._trainer.history['epoch']
         params_history = self._trainer.history.get('params', {})
-        param_solutions = getattr(self._trainer, '_parameter_solutions', {})
+        model_solutions   = getattr(self._trainer, '_model_parameter_solutions', {})
+        problem_solutions = getattr(self._trainer, '_problem_parameter_solutions', {})
+        fit_prob = list(getattr(self._trainer, '_fit_problem_parameters', None) or [])
 
         for pname in self._get_fit_params():
             ax_key = f'param_{pname}'
@@ -595,8 +599,10 @@ class TrainPlotter:
             if vals:
                 ep = epochs[:len(vals)]
                 ax.plot(ep, vals, 'b-', linewidth=2, label=f'{pname} (inferred)')
-            if pname in param_solutions:
-                true_val = param_solutions[pname]
+            # Look up true value in the appropriate namespace
+            solutions = problem_solutions if pname in fit_prob else model_solutions
+            if pname in solutions:
+                true_val = solutions[pname]
                 ax.axhline(true_val, color='r', linestyle='--', linewidth=1.5,
                            label=f'{pname} = {true_val:.6g} (true)')
             ax.set_xlabel('Epoch')

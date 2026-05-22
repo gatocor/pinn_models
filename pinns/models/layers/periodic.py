@@ -174,7 +174,7 @@ class PeriodicEmbedding:
         """No trainable parameters."""
         return {}
 
-    def apply(self, params: dict, x: jnp.ndarray, params_dict=None) -> jnp.ndarray:
+    def apply(self, x: jnp.ndarray, params: dict = None, params_dict=None) -> jnp.ndarray:
         return self._forward(x)
 
     # ── Forward pass ───────────────────────────────────────────────────────── #

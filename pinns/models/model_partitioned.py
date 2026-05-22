@@ -71,7 +71,7 @@ FB-PINN using the domain's own spatial grid::
     model    = Model(domain, output_dim=1)
     ensemble = ModelPartitioned(model, PartitionFB(overlap=0.3))
     params   = ensemble.init(jax.random.PRNGKey(0))
-    y        = ensemble.apply(params, x)          # sum of 4 windowed predictions
+    y        = ensemble.apply(x, params)          # sum of 4 windowed predictions
 
 X-PINN with 2×2 spatial grid and time partitioning::
 
@@ -414,8 +414,8 @@ class ModelPartitioned:
 
     def apply(
         self,
-        params: dict,
         x: "jnp.ndarray",
+        params: dict = None,
         params_dict=None,
     ) -> "jnp.ndarray":
         """
@@ -427,10 +427,10 @@ class ModelPartitioned:
 
         Parameters
         ----------
-        params :
-            Combined parameter dict returned by :meth:`init`.
         x :
             Input array ``(batch, n_dims)``.
+        params :
+            Combined parameter dict returned by :meth:`init`.
         params_dict :
             Optional auxiliary dict forwarded to every layer.
 
@@ -477,7 +477,7 @@ class ModelPartitioned:
                 x_n = 2.0 * (x - nm_min) / (nm_max - nm_min + 1e-8) - 1.0
                 # 2. Run post-Normalize layers of model 0 (shared architecture).
                 for lname, layer in zip(_post_lnames, _post_layers):
-                    x_n = layer.apply(sub_p.get(lname, {}), x_n, pd)
+                    x_n = layer.apply(x_n, sub_p.get(lname, {}), pd)
                 y_i = x_n
                 # 3. Window function.
                 x_s = x[:, :n_s]

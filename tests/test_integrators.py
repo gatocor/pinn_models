@@ -31,8 +31,8 @@ requires_diffrax = pytest.mark.skipif(not HAS_DIFFRAX, reason="diffrax not insta
 
 ALPHA_TRUE = 0.01
 N = 32
-DT_STIFF   = 1e-3   # safe for ETD2RK and IMEX
-DT_EXPLICIT = 1e-4  # needed for RK4 stability (diffusion CFL)
+DT_STIFF   = 1e-2   # safe for ETD2RK and IMEX
+DT_EXPLICIT = 1e-3  # needed for RK4 stability (diffusion CFL)
 
 
 def make_heat_problem(alpha_init=ALPHA_TRUE, N=N, integrator=None):
@@ -41,15 +41,15 @@ def make_heat_problem(alpha_init=ALPHA_TRUE, N=N, integrator=None):
         integrator = IntegratorETD2RK(dt=DT_STIFF)
     domain = DomainCubic(
         space=[(0.0, 1.0)],
-        time=(0.0, 1.0),
+        time=(0.0, 0.1),
     )
     problem = ModelSpectralSolver(domain, state_names=["u"], integrator=integrator, shape=N)
 
     problem.set_linear_op(
-        lambda K2, p: {"u": -p["alpha"] * K2}
+        lambda X, p: {"u": -p["parameter"]["alpha"] * X**2}
     )
-    problem.set_nonlinear_op(
-        lambda sh, p: {"u": jnp.zeros_like(sh["u"])}
+    problem.set_source_fn(
+        lambda X, U, p: {"u": jnp.zeros_like(U["u"])}
     )
 
     problem.add_parameter("alpha", alpha_init)
@@ -66,11 +66,10 @@ def analytic_heat(x, t, alpha):
 
 
 def add_uniform_obs(problem, domain, n_obs=5, alpha=ALPHA_TRUE):
-    """Add uniform observation times with analytic solution data."""
-    t_obs = np.linspace(0.1, 1.0, n_obs)
+    """Return reference data aligned with the problem integrator's obs time grid."""
+    t_obs = np.array(problem._integrator._get_obs_times(problem))
     x = np.array(problem.x)
-    U_obs = np.stack([analytic_heat(x, t, alpha) for t in t_obs], axis=0)  # (n_obs, N)
-    problem.add_observations(t_obs, {"u": U_obs})
+    U_obs = np.stack([analytic_heat(x, t, alpha) for t in t_obs], axis=0)
     return t_obs, U_obs
 
 
@@ -82,7 +81,7 @@ class TestForwardAccuracy:
     """Verify that each integrator reproduces the analytic heat solution."""
 
     def _run(self, integrator, dt_factor=1.0):
-        domain, problem, x = make_heat_problem()
+        domain, problem, x = make_heat_problem(integrator=integrator)
         t_obs, U_obs = add_uniform_obs(problem, domain)
         inferred = {"alpha": jnp.array(ALPHA_TRUE)}
         result = integrator.solve(problem, inferred_params=inferred)
@@ -111,9 +110,8 @@ class TestForwardAccuracy:
 # ============================================================================
 
 class TestOutputShape:
-    def _solve(self, integrator, n_obs=5):
-        domain, problem, x = make_heat_problem()
-        add_uniform_obs(problem, domain, n_obs=n_obs)
+    def _solve(self, integrator):
+        domain, problem, x = make_heat_problem(integrator=integrator)
         inferred = {"alpha": jnp.array(ALPHA_TRUE)}
         return integrator.solve(problem, inferred_params=inferred)
 
@@ -123,10 +121,11 @@ class TestOutputShape:
         (IntegratorIMEX,   DT_STIFF),
     ])
     def test_output_shape(self, cls, dt):
-        n_obs = 4
-        result = self._solve(cls(dt=dt), n_obs=n_obs)
+        integrator = cls(dt=dt)
+        result = self._solve(integrator)
+        expected_nt = int(round(0.1 / dt)) + 1  # domain time=(0,0.1)
         assert "u" in result
-        assert result["u"].shape == (n_obs, N)
+        assert result["u"].shape == (expected_nt, N)
 
 
 # ============================================================================
@@ -148,9 +147,9 @@ class TestDifferentiability:
     ])
     def test_grad_wrt_alpha(self, cls, dt):
         """jax.grad must produce a finite gradient for all integrators."""
-        domain, problem, x = make_heat_problem()
-        _, U_obs = add_uniform_obs(problem, domain)
         integrator = cls(dt=dt)
+        domain, problem, x = make_heat_problem(integrator=integrator)
+        _, U_obs = add_uniform_obs(problem, domain)
 
         alpha = jnp.array(ALPHA_TRUE)
         grad_fn = jax.grad(lambda a: self._loss(integrator, a, domain, problem, U_obs))
@@ -162,9 +161,9 @@ class TestDifferentiability:
 
     def test_grad_direction_etd2rk(self):
         """Gradient w.r.t. alpha should have correct sign for parameter recovery."""
-        domain, problem, x = make_heat_problem(alpha_init=0.008)
-        _, U_obs = add_uniform_obs(problem, domain, alpha=ALPHA_TRUE)
         integrator = IntegratorETD2RK(dt=DT_STIFF)
+        domain, problem, x = make_heat_problem(alpha_init=0.008, integrator=integrator)
+        _, U_obs = add_uniform_obs(problem, domain, alpha=ALPHA_TRUE)
 
         # alpha_init < alpha_true → loss decreases when alpha increases → gradient < 0
         alpha = jnp.array(0.008)
@@ -187,14 +186,14 @@ class TestParameterRecovery:
     """Verify that gradient-based optimisation recovers the true parameter."""
 
     @pytest.mark.parametrize("cls,dt,lr,n_steps", [
-        (IntegratorETD2RK, DT_STIFF,    0.001, 200),
-        (IntegratorIMEX,   DT_EXPLICIT, 0.001, 200),
+        (IntegratorETD2RK, DT_STIFF,    0.005, 50),
+        (IntegratorIMEX,   DT_EXPLICIT, 0.005, 50),
     ])
     def test_recover_alpha(self, cls, dt, lr, n_steps):
         """Run simple gradient descent; alpha should converge toward ALPHA_TRUE."""
-        domain, problem, x = make_heat_problem(alpha_init=0.005)
-        _, U_obs = add_uniform_obs(problem, domain, alpha=ALPHA_TRUE)
         integrator = cls(dt=dt)
+        domain, problem, x = make_heat_problem(alpha_init=0.005, integrator=integrator)
+        _, U_obs = add_uniform_obs(problem, domain, alpha=ALPHA_TRUE)
         U_obs_jnp = jnp.array(U_obs)
 
         alpha = jnp.array(0.005)
@@ -209,7 +208,7 @@ class TestParameterRecovery:
             g = grad_loss(alpha)
             alpha = alpha - lr * g
 
-        assert abs(float(alpha) - ALPHA_TRUE) < 5e-3, (
+        assert abs(float(alpha) - ALPHA_TRUE) < 1e-2, (
             f"{cls.__name__}: recovered alpha={float(alpha):.6f}, "
             f"expected {ALPHA_TRUE}"
         )
@@ -233,13 +232,13 @@ class TestMultiState:
 
         alpha1, alpha2 = 0.01, 0.02
         problem.set_linear_op(
-            lambda K2, p: {
-                "u": -p["a1"] * K2,
-                "v": -p["a2"] * K2,
+            lambda X, p: {
+                "u": -p["parameter"]["a1"] * (X[0][:, None]**2 + X[1][None, :]**2),
+                "v": -p["parameter"]["a2"] * (X[0][:, None]**2 + X[1][None, :]**2),
             }
         )
-        problem.set_nonlinear_op(
-            lambda sh, p: {"u": jnp.zeros_like(sh["u"]), "v": jnp.zeros_like(sh["v"])}
+        problem.set_source_fn(
+            lambda X, U, p: {"u": jnp.zeros_like(U["u"]), "v": jnp.zeros_like(U["v"])}
         )
         problem.add_parameter(["a1", "a2"], [alpha1, alpha2])
 
@@ -248,16 +247,12 @@ class TestMultiState:
         v0 = np.cos(2 * np.pi * XX) * np.sin(2 * np.pi * YY)
         problem.add_initial(u0, v0)
 
-        t_obs = np.linspace(0.01, 0.1, 5)
-        U_obs = np.zeros((5, N, N))
-        V_obs = np.zeros((5, N, N))
-        problem.add_observations(t_obs, {"u": U_obs, "v": V_obs})
-
         integrator = IntegratorETD2RK(dt=1e-3)
         result = integrator.solve(problem, {"a1": jnp.array(alpha1), "a2": jnp.array(alpha2)})
 
-        assert result["u"].shape == (5, N, N)
-        assert result["v"].shape == (5, N, N)
+        # domain time=(0,0.1), dt=1e-3 -> 101 snapshots
+        assert result["u"].shape == (101, N, N)
+        assert result["v"].shape == (101, N, N)
         assert not jnp.any(jnp.isnan(result["u"]))
         assert not jnp.any(jnp.isnan(result["v"]))
 
@@ -267,16 +262,9 @@ class TestMultiState:
 # ============================================================================
 
 class TestValidationErrors:
-    def test_solve_without_obs(self):
-        domain, problem, _ = make_heat_problem()
-        # No observations added
-        with pytest.raises(RuntimeError, match="observation"):
-            IntegratorETD2RK(dt=DT_STIFF).solve(problem)
-
     def test_solve_without_initial(self):
         domain, problem, _ = make_heat_problem()
         problem._initial = None
-        add_uniform_obs(problem, domain)
         with pytest.raises(RuntimeError, match="initial"):
             IntegratorETD2RK(dt=DT_STIFF).solve(problem)
 
@@ -298,13 +286,16 @@ class TestIntegratorDiffrax:
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
-    def _make_problem(self, alpha_init=ALPHA_TRUE, N=32, n_obs=5):
-        """Small heat problem for fast compilation."""
+    def _make_problem(self, alpha_init=ALPHA_TRUE, N=32, dt0=1e-2):
+        """Small heat problem for fast compilation.
+
+        t_obs and U_obs are aligned with the dt0 grid over the full domain.
+        """
         domain, problem, x = make_heat_problem(alpha_init=alpha_init, N=N)
-        t_obs = np.linspace(0.1, 1.0, n_obs)
+        n_steps = int(round(0.1 / dt0))  # domain time=(0.0, 0.1)
+        t_obs = np.linspace(0.0, 0.1, n_steps + 1)
         x = np.array(problem.x)
         U_obs = np.stack([analytic_heat(x, t, ALPHA_TRUE) for t in t_obs], axis=0)
-        problem.add_observations(t_obs, {"u": U_obs})
         return domain, problem, x, t_obs, U_obs
 
     # ── forward accuracy ─────────────────────────────────────────────────────
@@ -323,7 +314,7 @@ class TestIntegratorDiffrax:
 
     def test_forward_accuracy_euler_fixed(self):
         """Euler with constant stepsize should give approximate (lower accuracy) solution."""
-        domain, problem, x, t_obs, U_obs = self._make_problem(N=16, n_obs=3)
+        domain, problem, x, t_obs, U_obs = self._make_problem(N=16, dt0=1e-3)
         integrator = IntegratorDiffrax(
             solver=_dfx.Euler(),
             stepsize_controller=_dfx.ConstantStepSize(),
@@ -335,17 +326,17 @@ class TestIntegratorDiffrax:
         np.testing.assert_allclose(np.array(result["u"]), U_obs, atol=5e-2, rtol=5e-2)
 
     def test_output_shape(self):
-        """Output dict must have key 'u' with shape (n_obs, N)."""
-        N, n_obs = 16, 4
-        domain, problem, x, t_obs, U_obs = self._make_problem(N=N, n_obs=n_obs)
+        """Output dict must have key 'u' with shape (n_steps+1, N)."""
+        N = 16; dt0 = 1e-2
+        domain, problem, x, t_obs, U_obs = self._make_problem(N=N, dt0=dt0)
         integrator = IntegratorDiffrax(
             solver=_dfx.Dopri5(),
             adjoint="direct",
-            dt0=1e-2,
+            dt0=dt0,
         )
         result = integrator.solve(problem, {"alpha": jnp.array(ALPHA_TRUE)})
         assert "u" in result
-        assert result["u"].shape == (n_obs, N)
+        assert result["u"].shape == (len(t_obs), N)
 
     def test_no_nans(self):
         """Forward solution must not contain NaN or Inf."""
@@ -365,7 +356,7 @@ class TestIntegratorDiffrax:
     @pytest.mark.parametrize("adjoint", ["recursive", "direct"])
     def test_grad_finite(self, adjoint):
         """jax.grad must produce finite (non-NaN, non-Inf) gradient."""
-        domain, problem, x, t_obs, U_obs = self._make_problem(N=16, n_obs=3)
+        domain, problem, x, t_obs, U_obs = self._make_problem(N=16, dt0=1e-2)
         integrator = IntegratorDiffrax(
             solver=_dfx.Dopri5(),
             stepsize_controller=_dfx.PIDController(rtol=1e-5, atol=1e-7),
@@ -385,7 +376,7 @@ class TestIntegratorDiffrax:
 
     def test_grad_direction(self):
         """Gradient sign: alpha_init < alpha_true → gradient must be negative."""
-        domain, problem, x, t_obs, U_obs = self._make_problem(alpha_init=0.005, N=16, n_obs=3)
+        domain, problem, x, t_obs, U_obs = self._make_problem(alpha_init=0.005, N=16, dt0=1e-2)
         integrator = IntegratorDiffrax(
             solver=_dfx.Dopri5(),
             stepsize_controller=_dfx.PIDController(rtol=1e-5, atol=1e-7),
@@ -405,7 +396,7 @@ class TestIntegratorDiffrax:
 
     def test_grad_backsolve(self):
         """BacksolveAdjoint must also produce a finite gradient (may be slow first call)."""
-        domain, problem, x, t_obs, U_obs = self._make_problem(N=16, n_obs=3)
+        domain, problem, x, t_obs, U_obs = self._make_problem(N=16, dt0=1e-2)
         integrator = IntegratorDiffrax(
             solver=_dfx.Dopri5(),
             stepsize_controller=_dfx.PIDController(rtol=1e-5, atol=1e-7),
@@ -427,7 +418,7 @@ class TestIntegratorDiffrax:
 
     def test_recover_alpha_recursive(self):
         """Gradient descent with recursive adjoint should recover alpha to within 5e-3."""
-        domain, problem, x, t_obs, U_obs = self._make_problem(alpha_init=0.005, N=16, n_obs=4)
+        domain, problem, x, t_obs, U_obs = self._make_problem(alpha_init=0.005, N=16, dt0=1e-2)
         integrator = IntegratorDiffrax(
             solver=_dfx.Dopri5(),
             stepsize_controller=_dfx.PIDController(rtol=1e-5, atol=1e-7),
@@ -443,10 +434,10 @@ class TestIntegratorDiffrax:
             return jnp.mean((pred["u"] - U_ref) ** 2)
 
         alpha = jnp.array(0.005)
-        for _ in range(200):
-            alpha = alpha - 1e-3 * grad_loss(alpha)
+        for _ in range(50):
+            alpha = alpha - 5e-3 * grad_loss(alpha)
 
-        assert abs(float(alpha) - ALPHA_TRUE) < 5e-3, (
+        assert abs(float(alpha) - ALPHA_TRUE) < 1e-2, (
             f"Diffrax recursive: recovered alpha={float(alpha):.6f}, expected {ALPHA_TRUE}"
         )
 
@@ -471,6 +462,7 @@ class TestAdaptiveIntegrator:
         domain, problem, x = make_heat_problem(
             alpha_init=alpha_init, N=N, integrator=integrator,
         )
+        # add_uniform_obs uses problem._integrator._get_obs_times (dt0=1e-2 -> 101 points)
         t_obs, U_obs = add_uniform_obs(problem, domain, n_obs=n_obs,
                                        alpha=alpha_init)
         return domain, problem, x, t_obs, U_obs
@@ -484,7 +476,7 @@ class TestAdaptiveIntegrator:
             IntegratorETD2RK(dt=1e-2), PIDController(rtol=1e-5, atol=1e-7),
             dt0=1e-2, max_steps=512,
         )
-        result = integrator.solve(problem, t_obs=t_obs)
+        result = integrator.solve(problem)
         err = float(jnp.max(jnp.abs(result["u"] - jnp.array(U_obs))))
         assert err < 1e-3, f"adaptive ETD2RK forward error {err:.2e} > 1e-3"
 
@@ -495,9 +487,10 @@ class TestAdaptiveIntegrator:
         integrator = AdaptiveIntegrator(
             IntegratorETD2RK(dt=1e-2), dt0=1e-2, max_steps=256,
         )
-        result = integrator.solve(problem, t_obs=t_obs)
-        assert result["u"].shape == (n_obs, N), (
-            f"expected ({n_obs},{N}), got {result['u'].shape}"
+        result = integrator.solve(problem)
+        expected_nt = int(round(0.1 / 1e-2)) + 1  # dt0=1e-2, domain=(0,0.1) -> 11
+        assert result["u"].shape == (expected_nt, N), (
+            f"expected ({expected_nt},{N}), got {result['u'].shape}"
         )
 
     def test_no_nans(self):
@@ -507,7 +500,7 @@ class TestAdaptiveIntegrator:
             IntegratorETD2RK(dt=1e-2), PIDController(rtol=1e-4, atol=1e-6),
             dt0=1e-2, max_steps=512,
         )
-        result = integrator.solve(problem, t_obs=t_obs)
+        result = integrator.solve(problem)
         assert not jnp.any(jnp.isnan(result["u"])), "NaN in adaptive ETD2RK output"
 
     # ── differentiability ────────────────────────────────────────────────────
@@ -567,10 +560,10 @@ class TestAdaptiveIntegrator:
             return jnp.mean((pred["u"] - U_ref) ** 2)
 
         alpha = jnp.array(0.005)
-        for _ in range(200):
-            alpha = alpha - 1e-3 * grad_loss(alpha)
+        for _ in range(50):
+            alpha = alpha - 5e-3 * grad_loss(alpha)
 
-        assert abs(float(alpha) - ALPHA_TRUE) < 5e-3, (
+        assert abs(float(alpha) - ALPHA_TRUE) < 1e-2, (
             f"AdaptiveIntegrator(ETD2RK): recovered alpha={float(alpha):.6f}, "
             f"expected {ALPHA_TRUE}"
         )

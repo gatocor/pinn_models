@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 import jax.numpy as jnp
 
-from .integrator_base import Integrator
+from .integrator_base import Integrator, _apply_L
 from .stepsize_controller import PIDController
 
 __all__ = ["IntegratorTsit5"]
@@ -95,6 +95,11 @@ class IntegratorTsit5(Integrator):
         self.max_steps  = int(max_steps)
         self.checkpoint = checkpoint
 
+    @property
+    def dt(self) -> float:
+        """Alias for ``dt0``, required by :meth:`_get_obs_times`."""
+        return self.dt0
+
     def _one_step(self, problem, state_hat, t, dt, L, params):
         """Single Tsitouras step.
 
@@ -105,8 +110,8 @@ class IntegratorTsit5(Integrator):
         state_names = problem.state_names
 
         def _rhs(sh):
-            Nhat = problem._nonlinear_op(sh, params)
-            return {name: L[name] * sh[name] + Nhat[name] for name in state_names}
+            Nhat = problem._call_nonlinear_op(sh, params)
+            return {name: _apply_L(L[name], sh[name]) + Nhat[name] for name in state_names}
 
         k1 = _rhs(state_hat)
         k2 = _rhs({
@@ -171,7 +176,6 @@ class IntegratorTsit5(Integrator):
         self,
         problem,
         inferred_params=None,
-        t_obs=None,
     ):
         """Adaptive-step solve using Tsitouras 4(5)."""
         controller = PIDController(
@@ -181,7 +185,6 @@ class IntegratorTsit5(Integrator):
         return self._adaptive_solve(
             problem, inferred_params, controller,
             dt0=self.dt0, max_steps=self.max_steps, checkpoint=self.checkpoint,
-            t_obs=t_obs,
         )
 
     def __repr__(self) -> str:

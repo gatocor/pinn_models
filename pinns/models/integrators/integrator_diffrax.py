@@ -46,7 +46,7 @@ from typing import Any, Dict, Optional
 import jax
 import jax.numpy as jnp
 
-from .integrator_base import Integrator
+from .integrator_base import Integrator, _apply_L
 
 __all__ = ["IntegratorDiffrax"]
 
@@ -121,6 +121,15 @@ class IntegratorDiffrax(Integrator):
                 "Choose 'backsolve', 'recursive', or 'direct'."
             )
 
+    @property
+    def dt(self) -> float:
+        """Alias for ``dt0``, required by :meth:`_get_obs_times`."""
+        return self.dt0
+
+    @dt.setter
+    def dt(self, value: float):
+        self.dt0 = float(value)
+
     # ──────────────────────────────────────────────────────────────────── #
     #  Public API                                                          #
     # ──────────────────────────────────────────────────────────────────── #
@@ -129,14 +138,12 @@ class IntegratorDiffrax(Integrator):
         self,
         problem,
         inferred_params: Optional[Dict[str, Any]] = None,
-        t_obs=None,
     ) -> Dict[str, Any]:
         """Forward-simulate and return states at observation times.
 
         Args:
             problem:         A fully-configured :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params: Dict of JAX-differentiable parameter values.
-            t_obs:           1-D array of snapshot times.
 
         Returns:
             Dict ``{state_name: array(n_obs, *shape)}`` in physical space.
@@ -149,14 +156,13 @@ class IntegratorDiffrax(Integrator):
         t0          = float(problem._t_min)
         t1          = float(problem._t_max)
 
-        resolved_t_obs = self._resolve_obs_times(problem, t_obs)
+        resolved_t_obs = self._get_obs_times(problem)
 
         # ── Build params (gradient flows through inferred_params) ──────────
         params = problem._build_params(inferred_params)
-        K2     = problem.K2
 
         # ── Initial state in spectral space ───────────────────────────────
-        y0_hat = problem.get_initial_hat()
+        y0_hat = problem.get_initial_state()
 
         # ── Split complex → real/imag to avoid diffrax complex-dtype warning.
         # For each state we store two real arrays: "{name}_re" and "{name}_im".
@@ -192,11 +198,11 @@ class IntegratorDiffrax(Integrator):
         # arrays through `args`, which would trigger diffrax's complex-dtype warning.
         def rhs(t, y_real, args):
             _params = args
-            _L = problem._linear_op(K2, _params)
+            _L = problem._call_linear_op(_params)
             y_hat = _to_complex(y_real)
-            N_hat = problem._nonlinear_op(y_hat, _params)
+            N_hat = problem._call_nonlinear_op(y_hat, _params)
             dydt_hat = {
-                name: _L[name] * y_hat[name] + N_hat[name]
+                name: _apply_L(_L[name], y_hat[name]) + N_hat[name]
                 for name in state_names
             }
             return _to_real(dydt_hat)
@@ -231,10 +237,7 @@ class IntegratorDiffrax(Integrator):
             )
             for name in state_names
         }
-        result = {
-            name: jax.vmap(problem.inverse)(ys_hat[name])
-            for name in state_names
-        }
+        result = problem._to_physical_batch(ys_hat)
 
         self._store_result(problem, result, resolved_t_obs)
         return result

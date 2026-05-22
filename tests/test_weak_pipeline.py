@@ -287,7 +287,7 @@ try:
     params = net.params
 
     def _u_and_grad(p, xy):
-        def u_s(z): return net.apply(p, z[None])[0, 0]
+        def u_s(z): return net.apply(z[None], p)[0, 0]
         return jax.value_and_grad(u_s)(xy)
 
     loss_fn2 = problem_test.make_loss_fn(_u_and_grad)

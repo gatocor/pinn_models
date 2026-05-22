@@ -594,7 +594,7 @@ class ProblemWeak(BaseProblem):
     ``domain`` and ``output_names``, then register terms with
     :meth:`add_inner`, :meth:`add_dirichlet`, :meth:`add_neumann`, attach
     observables with :meth:`add_observable`, and set the reference solution
-    with :meth:`add_solution`.
+    with :meth:`set_solution`.
 
     Parameters
     ----------
@@ -614,7 +614,7 @@ class ProblemWeak(BaseProblem):
         Fixed problem parameters in flat ``params`` dict.
     solution : callable or None
         Reference solution for error tracking (can also be set via
-        :meth:`add_solution`).
+        :meth:`set_solution`).
 
     Examples
     --------
@@ -623,7 +623,7 @@ class ProblemWeak(BaseProblem):
         problem = ProblemWeak(domain, output_names=["u"], cubature_order=3)
         problem.add_inner(volume_fn, name="pde")
         problem.add_dirichlet(0.0, name="bottom", region="bottom")
-        problem.add_solution(lambda xy: np.sin(np.pi * xy[:, 0]))
+        problem.set_solution(lambda xy: np.sin(np.pi * xy[:, 0]))
     """
 
     def __init__(
@@ -1024,7 +1024,7 @@ class ProblemWeak(BaseProblem):
             )
         return self
 
-    def make_residual_fn(self, network):
+    def make_residual_fn(self, network, fit_problem_parameters=None):
         """Return ``fn(params, sample_data) -> dict[str, jnp.ndarray]``.
 
         Assembles the per-free-node Galerkin residual for every registered inner
@@ -1039,7 +1039,9 @@ class ProblemWeak(BaseProblem):
         Parameters
         ----------
         network :
-            JAX network supporting ``network.apply(params, x, params_dict)``.
+            JAX network supporting ``network.apply(x, params, params_dict)``.
+        fit_problem_parameters : list[str], optional
+            Names of problem parameters to treat as trainable.
 
         Returns
         -------
@@ -1055,7 +1057,8 @@ class ProblemWeak(BaseProblem):
         from .terms import TermDirichletBC as _TermDirichletBC
         from .terms import TermInitial as _TermInitial
 
-        _weak_params_dict = self._build_params()
+        _fit_prob_params = fit_problem_parameters
+        _static_weak_pd = self._build_params()
         _n_out = self.n_outputs
 
         cd            = self.cubature_data
@@ -1224,8 +1227,18 @@ class ProblemWeak(BaseProblem):
         def residual_fn(params, sample_data=None):
             result = {}
 
+            # Dynamic problem parameter override (fit_problem_parameters)
+            if _fit_prob_params:
+                _prob_vals = params.get('__problem_params__', {})
+                _weak_params_dict = {
+                    **_static_weak_pd,
+                    'parameter': {**_static_weak_pd['parameter'], **_prob_vals},
+                }
+            else:
+                _weak_params_dict = _static_weak_pd
+
             def _net(x):
-                return network.apply(params, x, _weak_params_dict)
+                return network.apply(x, params, _weak_params_dict)
 
             # ── Assembly mode is selected at build time, not inside jit ──────────
             # _has_time_col is a Python bool captured from the enclosing scope.

@@ -9,6 +9,135 @@ import jax
 import jax.numpy as jnp
 
 
+def _apply_L(A, v):
+    """Apply linear operator ``A`` to state array ``v``.
+
+    Dispatch rules:
+
+    * **List** ``[L₀, L₁, …]`` — Kronecker-sum (e.g. 2-D+ Chebyshev).
+      Applies each matrix along its own axis and sums:
+      ``L(u) = L₀ @ u  +  u @ L₁ᵀ  + …``
+    * **Same shape** — diagonal / Fourier eigenvalue grid: elementwise ``A * v``.
+    * **Dense matrix** — Chebyshev 1-D: ``(A @ v).real``.
+    """
+    if isinstance(A, list):
+        result = jnp.zeros_like(v)
+        for i, M in enumerate(A):
+            r = jnp.tensordot(M, v, axes=[[1], [i]])
+            result = result + jnp.moveaxis(r, 0, i)
+        return result
+    if A.shape == v.shape:
+        return A * v
+    return (A @ v).real
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+#  Kronecker-sum matrix-function helpers (2-D+ Chebyshev)                    #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+def _broadcast_eig(e, axis, ndim):
+    """Reshape 1-D eigenvalue array ``e`` for broadcasting along ``axis`` in ``ndim``-D."""
+    shape = [1] * ndim
+    shape[axis] = -1
+    return e.reshape(shape)
+
+
+def _build_kronecker_matrix(mat_list):
+    """Assemble the full Kronecker-sum matrix from per-dimension operators.
+
+    For a list ``[L₀, L₁, …, L_{d-1}]`` of per-dimension ``(Nᵢ, Nᵢ)`` matrices,
+    returns the ``(N_total, N_total)`` matrix
+
+    .. math::
+
+        C = \\sum_{i=0}^{d-1}
+            I_{N_0} \\otimes \\cdots \\otimes L_i \\otimes \\cdots \\otimes I_{N_{d-1}}
+
+    where ``N_total = N₀ \u00d7 N₁ \u00d7 \u2026 \u00d7 N_{d-1}``.
+
+    Args:
+        mat_list: List of per-dimension matrices.
+
+    Returns:
+        JAX array of shape ``(N_total, N_total)``.
+    """
+    dims  = [M.shape[0] for M in mat_list]
+    N     = 1
+    for d in dims:
+        N *= d
+    dtype  = mat_list[0].dtype
+    result = jnp.zeros((N, N), dtype=dtype)
+    for i, Li in enumerate(mat_list):
+        left  = 1
+        for j in range(i):
+            left *= dims[j]
+        right = N // (left * dims[i])
+        Il = jnp.eye(left,  dtype=dtype)
+        Ir = jnp.eye(right, dtype=dtype)
+        result = result + jnp.kron(jnp.kron(Il, Li), Ir)
+    return result
+
+
+class _KronMatApplicator:
+    """Wraps a full Kronecker-sum matrix for use with :func:`_apply`.
+
+    Attributes
+    ----------
+    mat : JAX array of shape ``(N_total, N_total)``
+        The full Kronecker-sum (or its function value), already assembled.
+    spatial_shape : tuple of ints
+        The spatial shape of the state tensor, e.g. ``(Nx, Ny)``.
+        Used to reshape the flattened result back to the working basis.
+    """
+    __slots__ = ("mat", "spatial_shape")
+
+    def __init__(self, mat, spatial_shape):
+        self.mat           = mat
+        self.spatial_shape = spatial_shape
+
+
+def _kron_func_apply(outer_fn_vals, v, Qs, Qinvs):
+    """Apply a Kronecker-sum matrix function ``f(\u2211ᵢ Lᵢ \u2297 \u2026)`` to tensor ``v``
+    via per-dimension eigendecompositions.
+
+    Arguments
+    ---------
+    outer_fn_vals : JAX array of shape ``(N₀, N₁, \u2026, N_{d-1})``
+        Scalar function values at each outer-eigenvalue-sum grid point.
+    v : JAX array of same shape.
+    Qs, Qinvs : lists of ``(Nᵢ, Nᵢ)`` matrices.
+
+    .. note::
+        Requires ``jnp.linalg.eig`` eigenvectors, which are **not**
+        differentiable in JAX.  Use :class:`_KronMatApplicator` when
+        gradients are needed.
+    """
+    r = v.astype(jnp.complex64)
+    for i, Q_inv in enumerate(Qinvs):
+        r = jnp.tensordot(Q_inv, r, axes=[[1], [i]])
+        r = jnp.moveaxis(r, 0, i)
+    r = r * outer_fn_vals
+    for i, Q in enumerate(Qs):
+        r = jnp.tensordot(Q, r, axes=[[1], [i]])
+        r = jnp.moveaxis(r, 0, i)
+    return r.real
+
+
+class _KronOuter:
+    """Precomputed scalar-function values on the eigenvalue outer-sum grid.
+
+    .. note::
+        Kept for non-differentiable helper paths.
+        For differentiable integrators prefer :class:`_KronMatApplicator`.
+    """
+    __slots__ = ("outer", "Qs", "Qinvs")
+
+    def __init__(self, outer, Qs, Qinvs):
+        self.outer  = outer
+        self.Qs     = Qs
+        self.Qinvs  = Qinvs
+
+
 class Integrator(ABC):
     """Abstract base class for spectral time integrators.
 
@@ -54,27 +183,30 @@ class Integrator(ABC):
             )
         problem._validate()
 
-    def _resolve_obs_times(self, problem, t_obs):
-        """Return observation times, preferring the ``t_obs`` argument.
+    def _get_obs_times(self, problem):
+        """Compute observation times from the domain bounds and ``self.dt``.
+
+        Returns a uniform grid ``[t_min, t_min+dt, ..., t_max]`` with one
+        snapshot per integration step.  Both endpoints are included.
 
         Args:
             problem: A :class:`~pinns.models.ModelSpectralSolver`.
-            t_obs:   Optional array of observation times passed directly to
-                     ``solve()``.  If ``None``, falls back to the times
-                     registered via ``problem.add_observations()``.
 
         Raises:
-            RuntimeError: If neither source provides observation times.
+            RuntimeError: If the domain or integrator does not provide the
+                          required information.
         """
         import numpy as np
-        if t_obs is not None:
-            return np.asarray(t_obs)
-        if problem._obs_times is not None:
-            return problem._obs_times
-        raise RuntimeError(
-            "No observation times available.  Either call "
-            "problem.add_observations() or pass t_obs= to solve()."
-        )
+        t_min = getattr(problem, '_t_min', None)
+        t_max = getattr(problem, '_t_max', None)
+        dt    = getattr(self, 'dt', None)
+        if t_min is None or t_max is None or dt is None:
+            raise RuntimeError(
+                "Cannot determine observation times: domain must have a time "
+                "axis and the integrator must define 'dt'."
+            )
+        n_steps = max(1, int(round((t_max - t_min) / dt)))
+        return np.linspace(t_min, t_max, n_steps + 1)
 
     # ──────────────────────────────────────────────────────────────────── #
     #  Single-step interface (override in adaptive-capable integrators)   #
@@ -118,7 +250,6 @@ class Integrator(ABC):
         dt0: float,
         max_steps: int,
         checkpoint: bool = False,
-        t_obs=None,
     ) -> Dict[str, Any]:
         """Adaptive-step loop driven by *controller*.
 
@@ -149,11 +280,13 @@ class Integrator(ABC):
         self._check_problem(problem)
 
         state_names = problem.state_names
-        t0 = jnp.float32(problem._t_min)
-        t1 = jnp.float32(problem._t_max)
+        t0_py = float(problem._t_min)
+        t1_py = float(problem._t_max)
+        t0 = jnp.float32(t0_py)
+        t1 = jnp.float32(t1_py)
 
         # Observation times as a JAX array (static length, traced values)
-        resolved_t_obs = self._resolve_obs_times(problem, t_obs)
+        resolved_t_obs = self._get_obs_times(problem)
         import numpy as np
         t_obs_np  = np.asarray(resolved_t_obs, dtype=np.float32)
         n_obs     = len(t_obs_np)
@@ -173,13 +306,12 @@ class Integrator(ABC):
 
         def _core(inferred):
             params = problem._build_params(inferred)
-            K2     = problem.K2
-            L      = problem._linear_op(K2, params)
+            L      = problem._call_linear_op(params)
 
             t_obs_jax = jnp.array(t_obs_np)  # (n_obs,) — traced but static shape
 
-            # Initial spectral state
-            sh0 = problem.get_initial_hat()
+            # Initial state in the model's working basis
+            sh0 = problem.get_initial_state()
 
             # Observation buffer — shape (n_obs, *mode_shape) per state
             # Initialised to zeros; will be filled as integration proceeds.
@@ -191,7 +323,7 @@ class Integrator(ABC):
                     (n_obs,) + sh0[name].shape, dtype=sh0[name].dtype
                 )
                 for i, t_i in enumerate(t_obs_np):
-                    if abs(float(t_i) - float(t0)) < 1e-12 * max(abs(float(t1) - float(t0)), 1e-30):
+                    if abs(float(t_i) - t0_py) < 1e-12 * max(abs(t1_py - t0_py), 1e-30):
                         buf = buf.at[i].set(sh0[name])
                 obs_buf[name] = buf
 
@@ -306,11 +438,8 @@ class Integrator(ABC):
                 body, init_carry, None, length=max_steps
             )
 
-            # Convert Fourier-space snapshots to physical space
-            return {
-                name: jax.vmap(problem.inverse)(obs_buf_final[name])
-                for name in state_names
-            }
+            # Convert basis-space snapshots to physical space
+            return problem._to_physical_batch(obs_buf_final)
 
         result = jax.jit(_core)(inferred_params)
         self._store_result(problem, result, resolved_t_obs)

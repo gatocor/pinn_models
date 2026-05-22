@@ -402,7 +402,7 @@ class _FakeNet:
         self.fn = fn
         self.params = {}
 
-    def apply(self, params, x, pdict=None):
+    def apply(self, x, params=None, pdict=None):
         return self.fn(x).reshape(-1, 1)
 
 

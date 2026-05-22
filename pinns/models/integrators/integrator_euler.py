@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 import jax
 import jax.numpy as jnp
 
-from .integrator_base import Integrator
+from .integrator_base import Integrator, _apply_L
 
 __all__ = ["IntegratorEuler"]
 
@@ -45,9 +45,9 @@ class IntegratorEuler(Integrator):
     def _one_step(self, problem, state_hat, t, dt, L, params):
         """Single Euler step; error estimate is zero (no embedded method)."""
         state_names = problem.state_names
-        Nhat = problem._nonlinear_op(state_hat, params)
+        Nhat = problem._call_nonlinear_op(state_hat, params)
         sh_new = {
-            name: state_hat[name] + dt * (L[name] * state_hat[name] + Nhat[name])
+            name: state_hat[name] + dt * (_apply_L(L[name], state_hat[name]) + Nhat[name])
             for name in state_names
         }
         err_abs = {name: jnp.zeros_like(sh_new[name]) for name in state_names}
@@ -57,7 +57,6 @@ class IntegratorEuler(Integrator):
         self,
         problem,
         inferred_params: Optional[Dict[str, Any]] = None,
-        t_obs=None,
     ) -> Dict[str, Any]:
         """Forward-simulate using forward Euler and return states at obs times."""
         self._check_problem(problem)
@@ -67,7 +66,7 @@ class IntegratorEuler(Integrator):
         checkpoint  = self.checkpoint
 
         t0 = problem._t_min
-        resolved_t_obs = self._resolve_obs_times(problem, t_obs)
+        resolved_t_obs = self._get_obs_times(problem)
         obs_steps = [int(round((t - t0) / dt)) for t in resolved_t_obs]
         n_obs = len(obs_steps)
         segment_lengths = [obs_steps[0]] + [
@@ -78,19 +77,18 @@ class IntegratorEuler(Integrator):
 
         def _core(inferred):
             params = problem._build_params(inferred)
-            K2 = problem.K2
-            L  = problem._linear_op(K2, params)
+            L  = problem._call_linear_op(params)
 
             def _step(sh, _):
-                Nhat = problem._nonlinear_op(sh, params)
+                Nhat = problem._call_nonlinear_op(sh, params)
                 new_sh = {
-                    name: sh[name] + dt * (L[name] * sh[name] + Nhat[name])
+                    name: sh[name] + dt * (_apply_L(L[name], sh[name]) + Nhat[name])
                     for name in state_names
                 }
                 return new_sh, None
 
             step_fn = jax.remat(_step) if checkpoint else _step
-            state_hat_0 = problem.get_initial_hat()
+            state_hat_0 = problem.get_initial_state()
 
             if uniform and n_obs > 1:
                 def _segment(sh, _):
@@ -111,10 +109,7 @@ class IntegratorEuler(Integrator):
                     for name in state_names
                 }
 
-            return {
-                name: jax.vmap(problem.inverse)(seg_states[name])
-                for name in state_names
-            }
+            return problem._to_physical_batch(seg_states)
 
         cache_key = (id(problem), tuple(obs_steps), self.checkpoint)
         if cache_key not in self._jit_cache:

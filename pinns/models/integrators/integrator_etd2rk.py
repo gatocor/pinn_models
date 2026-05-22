@@ -30,7 +30,9 @@ from typing import Any, Dict, Optional
 import jax
 import jax.numpy as jnp
 
-from .integrator_base import Integrator
+from .integrator_base import (
+    Integrator, _apply_L, _build_kronecker_matrix, _KronMatApplicator,
+)
 
 __all__ = ["IntegratorETD2RK"]
 
@@ -51,6 +53,92 @@ def _phi2(z):
     p1 = _phi1(z)
     safe_z = jnp.where(jnp.abs(z) < 1e-8, jnp.ones_like(z), z)
     return jnp.where(jnp.abs(z) < 1e-8, 0.5 + z / 6.0, (p1 - 1.0) / safe_z)
+
+
+def _phi_mats(M):
+    """Compute matrix φ₁(M) and φ₂(M) via a single augmented-matrix expm.
+
+    Uses the identity (traceable by JAX, works inside ``jax.jit``)::
+
+        exp([[M, I, 0],    =  [[e^M,  φ₁(M),  φ₂(M)],
+             [0, 0, I],        [0,    I,       I     ],
+             [0, 0, 0]])        [0,    0,       I     ]]
+
+    Args:
+        M: Square JAX array of shape ``(N, N)``.
+
+    Returns:
+        Tuple ``(φ₁(M), φ₂(M))`` — both real ``(N, N)`` JAX arrays.
+    """
+    N = M.shape[0]
+    I = jnp.eye(N, dtype=M.dtype)
+    Z = jnp.zeros((N, N), dtype=M.dtype)
+    block = jnp.block([[M, I, Z],
+                       [Z, Z, I],
+                       [Z, Z, Z]])
+    E = jax.scipy.linalg.expm(block)
+    return E[:N, N:2*N].real, E[:N, 2*N:].real
+
+
+def _phi1_mat(M):
+    """Matrix φ₁(M) = (e^M − I) M⁻¹.  Computed via augmented expm (JAX-traceable)."""
+    ph1, _ = _phi_mats(M)
+    return ph1
+
+
+def _phi2_mat(M):
+    """Matrix φ₂(M) = (φ₁(M) − I) M⁻¹.  Computed via augmented expm (JAX-traceable)."""
+    _, ph2 = _phi_mats(M)
+    return ph2
+
+
+def _compute_kron_coeffs(Ln_list, dt):
+    """Precompute ETD2RK coefficients for a Kronecker-sum linear operator.
+
+    Builds the full ``(N_total, N_total)`` Kronecker-sum matrix, then computes
+    matrix exponentials and \u03c6 functions via the augmented-block ``expm`` trick
+    (same as the 1-D Chebyshev path).  All operations are differentiable inside
+    ``jax.jit`` / ``jax.grad`` — no eigenvector decompositions needed.
+
+    Args:
+        Ln_list: List of ``(Nᵢ, Nᵢ)`` linear-op matrices, one per spatial dim.
+        dt:      Scalar time-step size.
+
+    Returns:
+        Tuple ``(E, E₂, φ₁(dt), φ₁(dt/2), φ₂(dt))`` of
+        :class:`_KronMatApplicator`.
+    """
+    spatial_shape = tuple(Li.shape[0] for Li in Ln_list)
+    C  = _build_kronecker_matrix(Ln_list)  # (N_total, N_total)
+    z  = C * dt
+    z2 = C * (dt / 2.0)
+    ph1,  ph2  = _phi_mats(z)
+    ph12, _    = _phi_mats(z2)
+    mk = lambda M: _KronMatApplicator(M, spatial_shape)  # noqa: E731
+    return (
+        mk(jax.scipy.linalg.expm(z)),   # E
+        mk(jax.scipy.linalg.expm(z2)),  # E2
+        mk(ph1),                         # ph1
+        mk(ph12),                        # ph12
+        mk(ph2),                         # ph2
+    )
+
+
+def _apply(A, v):
+    """Multiply ``A`` by ``v``.
+
+    Dispatch rules:
+
+    * :class:`_KronMatApplicator` — full Kronecker matrix path (flatten, multiply,
+      reshape); fully differentiable via ``jax.scipy.linalg.expm``.
+    * **Same shape** as ``v`` — diagonal / Fourier: elementwise ``A * v``.
+    * **Dense matrix** — 1-D Chebyshev: ``A @ v``.
+    """
+    if isinstance(A, _KronMatApplicator):
+        return (A.mat @ v.ravel()).reshape(v.shape)
+    if A.shape == v.shape:
+        return A * v          # diagonal / Fourier (any spatial dimension)
+    return A @ v              # dense matrix operator (Chebyshev, etc.)
 
 
 class IntegratorETD2RK(Integrator):
@@ -91,15 +179,14 @@ class IntegratorETD2RK(Integrator):
         self,
         problem,
         inferred_params: Optional[Dict[str, Any]] = None,
-        t_obs=None,
     ) -> Dict[str, Any]:
         """Forward-simulate using ETD2RK and return states at observation times.
+
+        Observation times are derived from the domain bounds and ``self.dt``.
 
         Args:
             problem:          A fully-configured :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params:  Dict of JAX-differentiable parameter values.
-            t_obs:            1-D array of times at which to snapshot the state.
-                              If ``None``, uses times from ``problem.add_observations()``.
 
         Returns:
             Dict ``{state_name: array(n_obs, *shape)}`` in physical space.
@@ -112,7 +199,7 @@ class IntegratorETD2RK(Integrator):
 
         # ── Python-level observation schedule (not traced by JAX) ────
         t0 = problem._t_min
-        resolved_t_obs = self._resolve_obs_times(problem, t_obs)
+        resolved_t_obs = self._get_obs_times(problem)
         obs_steps = [int(round((t - t0) / dt)) for t in resolved_t_obs]
         n_obs = len(obs_steps)
         segment_lengths = [obs_steps[0]] + [
@@ -126,39 +213,54 @@ class IntegratorETD2RK(Integrator):
         # jax.grad / jax.value_and_grad will differentiate through it.
         def _core(inferred):
             params = problem._build_params(inferred)
-            K2 = problem.K2
 
-            # Linear operator eigenvalues
-            L = problem._linear_op(K2, params)
+            # Linear operator eigenvalues (diagonal) or matrices (Chebyshev)
+            L = problem._call_linear_op(params)
 
             # ETD2RK precomputed coefficients
             coeffs = {}
             for name in state_names:
                 Ln = L[name]
-                z    = Ln * dt
-                z2   = Ln * (dt / 2.0)
-                coeffs[name] = (
-                    jnp.exp(z),      # E
-                    jnp.exp(z2),     # E2
-                    _phi1(z),        # ph1
-                    _phi1(z2),       # ph12
-                    _phi2(z),        # ph2
-                )
+                if isinstance(Ln, list):
+                    # Kronecker-sum path (2-D+ Chebyshev)
+                    coeffs[name] = _compute_kron_coeffs(Ln, dt)
+                elif Ln.ndim == 2:
+                    # Dense-matrix path (1-D Chebyshev)
+                    z    = Ln * dt
+                    z2   = Ln * (dt / 2.0)
+                    coeffs[name] = (
+                        jax.scipy.linalg.expm(z),   # E
+                        jax.scipy.linalg.expm(z2),  # E2
+                        _phi1_mat(z),               # ph1
+                        _phi1_mat(z2),              # ph12
+                        _phi2_mat(z),               # ph2
+                    )
+                else:
+                    # Diagonal path (Fourier / DST / DCT)
+                    z    = Ln * dt
+                    z2   = Ln * (dt / 2.0)
+                    coeffs[name] = (
+                        jnp.exp(z),      # E
+                        jnp.exp(z2),     # E2
+                        _phi1(z),        # ph1
+                        _phi1(z2),       # ph12
+                        _phi2(z),        # ph2
+                    )
 
-            state_hat_0 = problem.get_initial_hat()
+            state_hat_0 = problem.get_initial_state()
 
             def _step(sh, _):
-                N1 = problem._nonlinear_op(sh, params)
+                N1 = problem._call_nonlinear_op(sh, params)
                 sh_star = {
-                    name: coeffs[name][1] * sh[name]
-                           + (dt / 2.0) * coeffs[name][3] * N1[name]
+                    name: _apply(coeffs[name][1], sh[name])
+                           + (dt / 2.0) * _apply(coeffs[name][3], N1[name])
                     for name in state_names
                 }
-                N2 = problem._nonlinear_op(sh_star, params)
+                N2 = problem._call_nonlinear_op(sh_star, params)
                 new_sh = {
-                    name: coeffs[name][0] * sh[name]
-                           + dt * (coeffs[name][2] * N1[name]
-                                   + coeffs[name][4] * (N2[name] - N1[name]))
+                    name: _apply(coeffs[name][0], sh[name])
+                           + dt * (_apply(coeffs[name][2], N1[name])
+                                   + _apply(coeffs[name][4], N2[name] - N1[name]))
                     for name in state_names
                 }
                 return new_sh, None
@@ -184,10 +286,7 @@ class IntegratorETD2RK(Integrator):
                     for name in state_names
                 }
 
-            return {
-                name: jax.vmap(problem.inverse)(seg_states[name])
-                for name in state_names
-            }
+            return problem._to_physical_batch(seg_states)
 
         # ── Cache the jitted core to avoid recompiling on every call ──
         # The cache key captures all static structure that determines the
@@ -234,32 +333,45 @@ class IntegratorETD2RK(Integrator):
         coeffs = {}
         for name in state_names:
             Ln  = L[name]
-            z   = Ln * dt
-            z2  = Ln * (dt / 2.0)
-            coeffs[name] = (
-                jnp.exp(z),    # E
-                jnp.exp(z2),   # E2  (half-step)
-                _phi1(z),      # ph1
-                _phi1(z2),     # ph12
-                _phi2(z),      # ph2
-            )
+            if isinstance(Ln, list):
+                coeffs[name] = _compute_kron_coeffs(Ln, dt)
+            elif Ln.ndim == 2:
+                z   = Ln * dt
+                z2  = Ln * (dt / 2.0)
+                coeffs[name] = (
+                    jax.scipy.linalg.expm(z),   # E
+                    jax.scipy.linalg.expm(z2),  # E2  (half-step)
+                    _phi1_mat(z),               # ph1
+                    _phi1_mat(z2),              # ph12
+                    _phi2_mat(z),               # ph2
+                )
+            else:
+                z   = Ln * dt
+                z2  = Ln * (dt / 2.0)
+                coeffs[name] = (
+                    jnp.exp(z),    # E
+                    jnp.exp(z2),   # E2  (half-step)
+                    _phi1(z),      # ph1
+                    _phi1(z2),     # ph12
+                    _phi2(z),      # ph2
+                )
 
-        N1 = problem._nonlinear_op(state_hat, params)
+        N1 = problem._call_nonlinear_op(state_hat, params)
         sh_star = {
             name: (
-                coeffs[name][1] * state_hat[name]
-                + (dt / 2.0) * coeffs[name][3] * N1[name]
+                _apply(coeffs[name][1], state_hat[name])
+                + (dt / 2.0) * _apply(coeffs[name][3], N1[name])
             )
             for name in state_names
         }
-        N2 = problem._nonlinear_op(sh_star, params)
+        N2 = problem._call_nonlinear_op(sh_star, params)
 
         sh_new = {
             name: (
-                coeffs[name][0] * state_hat[name]
+                _apply(coeffs[name][0], state_hat[name])
                 + dt * (
-                    coeffs[name][2] * N1[name]
-                    + coeffs[name][4] * (N2[name] - N1[name])
+                    _apply(coeffs[name][2], N1[name])
+                    + _apply(coeffs[name][4], N2[name] - N1[name])
                 )
             )
             for name in state_names
@@ -267,7 +379,7 @@ class IntegratorETD2RK(Integrator):
 
         # Error = φ₂ correction = difference between ETD2 and ETD1
         err_abs = {
-            name: jnp.abs(dt * coeffs[name][4] * (N2[name] - N1[name]))
+            name: jnp.abs(dt * _apply(coeffs[name][4], N2[name] - N1[name]))
             for name in state_names
         }
 

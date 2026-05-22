@@ -591,11 +591,11 @@ class GNNFeatures:
 
     def apply(
         self,
-        params: Dict,
         x,
+        params: Dict = None,
         params_dict=None,
     ):
-        """ModelBase-protocol alias: apply(params, x) → forward pass."""
+        """ModelBase-protocol alias: apply(x, params) → forward pass."""
         return self.__call__(params, x, params_dict)
 
     # ── Trainer-compatible API ─────────────────────────────────────────── #

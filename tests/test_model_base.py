@@ -157,19 +157,19 @@ class TestModelForward:
     def test_output_shape_default(self, domain, xy):
         m = Model(domain, output_dim=1)
         params = m.init(RNG)
-        y = m.apply(params, xy)
+        y = m.apply(xy, params)
         assert y.shape == (BATCH, 1)
 
     def test_output_shape_multi_output(self, domain, xy):
         m = Model(domain, output_dim=3)
         params = m.init(RNG)
-        y = m.apply(params, xy)
+        y = m.apply(xy, params)
         assert y.shape == (BATCH, 3)
 
     def test_output_finite(self, domain, xy):
         m = Model(domain, output_dim=1)
         params = m.init(RNG)
-        y = m.apply(params, xy)
+        y = m.apply(xy, params)
         assert jnp.all(jnp.isfinite(y))
 
     def test_output_range_respected(self, domain, xy):
@@ -180,7 +180,7 @@ class TestModelForward:
         # After tanh activation + Denormalize, roughly in range.
         params = m.init(RNG)
         # After 1000 uninitialised outputs in tanh ~ [-1,1] → Denormalize → [10, 20].
-        y = m.apply(params, xy)
+        y = m.apply(xy, params)
         # Just check output is finite and shape is correct.
         assert y.shape == (BATCH, 1)
         assert jnp.all(jnp.isfinite(y))
@@ -188,28 +188,28 @@ class TestModelForward:
     def test_without_normalize(self, domain, xy):
         m = Model(domain, output_dim=1, normalize=False)
         params = m.init(RNG)
-        y = m.apply(params, xy)
+        y = m.apply(xy, params)
         assert y.shape == (BATCH, 1)
         assert jnp.all(jnp.isfinite(y))
 
     def test_time_domain_forward(self, domain_time, xyt):
         m = Model(domain_time, output_dim=1)
         params = m.init(RNG)
-        y = m.apply(params, xyt)
+        y = m.apply(xyt, params)
         assert y.shape == (BATCH, 1)
         assert jnp.all(jnp.isfinite(y))
 
     def test_resnet_core_forward(self, domain, xy):
         m = Model(domain, output_dim=1, core=ResNet(hidden_dim=32))
         params = m.init(RNG)
-        y = m.apply(params, xy)
+        y = m.apply(xy, params)
         assert y.shape == (BATCH, 1)
         assert jnp.all(jnp.isfinite(y))
 
     def test_piratenet_core_forward(self, domain, xy):
         m = Model(domain, output_dim=1, core=PirateNet(hidden_dim=32))
         params = m.init(RNG)
-        y = m.apply(params, xy)
+        y = m.apply(xy, params)
         assert y.shape == (BATCH, 1)
         assert jnp.all(jnp.isfinite(y))
 
@@ -255,7 +255,7 @@ class TestModelAddConstraint:
         m = Model(domain, output_dim=1)
         m.add_constraint(value=0.0)
         params = m.init(RNG)
-        y = m.apply(params, xy)
+        y = m.apply(xy, params)
         assert y.shape == (BATCH, 1)
         assert jnp.all(jnp.isfinite(y))
 
@@ -367,7 +367,7 @@ _KEY        = jax.random.PRNGKey(42)
 
 def _fwd(net: ModelBase) -> jnp.ndarray:
     params = net.init(_KEY)
-    return net.apply(params, jnp.ones((8, 2)))
+    return net.apply(jnp.ones((8, 2)), params)
 
 
 class TestFNNOutputDim:

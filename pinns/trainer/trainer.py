@@ -72,7 +72,8 @@ class Trainer:
         self.problem = problem
         self.dataset  = dataset
         self.solution = None  # optional analytical / reference solution
-        self._parameter_solutions: dict = {}  # {param_name: true_value}
+        self._model_parameter_solutions: dict = {}   # {param_name: true_value} for fit_model_parameters
+        self._problem_parameter_solutions: dict = {} # {param_name: true_value} for fit_problem_parameters
         
         # Training history
         self.history = {
@@ -235,6 +236,9 @@ class Trainer:
         # For ModelSpectralSolver: list of parameter names to optimise.
         # All other model parameters are frozen via stop_gradient.
         fit_model_parameters: Optional[List[str]] = None,
+        # For problem parameters: list of parameter names (added via
+        # problem.add_parameter) to optimise jointly with network weights.
+        fit_problem_parameters: Optional[List[str]] = None,
     ):
         """
         Configure training parameters.
@@ -260,8 +264,9 @@ class Trainer:
                 schedule the learning rate.
             show: A :class:`~pinns.TrainPlotter` instance controlling all plot
                 behaviour.  Pass ``TrainPlotter()`` to display with defaults, or
-                ``TrainPlotter(save="./out", style={"theme": "dark"}, ...)`` for
-                custom plots.  ``None`` (default) disables all plotting.
+                ``TrainPlotter(save_to="./out/run", style={"theme": "dark"}, ...)``
+                to save each epoch plot to ``./out/run_epoch00100.png``, etc.
+                ``None`` (default) disables all plotting.
             epochs_by_time_step: Time-step curriculum for BPTT rollout mode.
                 When set to an integer N, ``train()`` runs N epochs with 1 rollout
                 step, then N epochs with 2 rollout steps, …, up to
@@ -341,6 +346,12 @@ class Trainer:
         self._fit_model_parameters = fit_model_parameters
         if fit_model_parameters != old_fit:
             optimizer_changed = True
+
+        # fit_problem_parameters: controls which problem parameters are optimised.
+        old_fit_prob = getattr(self, '_fit_problem_parameters', None)
+        self._fit_problem_parameters = fit_problem_parameters
+        if fit_problem_parameters != old_fit_prob:
+            optimizer_changed = True
         
         if self.optimizer is None or optimizer_changed:
             self.optimizer = self._create_optimizer()
@@ -391,7 +402,7 @@ class Trainer:
         params = self.model.params
 
         def _infer_batch(x_batch):
-            out = self.model.apply(params, jnp.asarray(x_batch, dtype=jnp.float32), params_dict)
+            out = self.model.apply(jnp.asarray(x_batch, dtype=jnp.float32), params, params_dict)
             return np.array(out)
 
         if batch_size is None or batch_size >= len(x):
@@ -430,8 +441,8 @@ class Trainer:
     # ==================== Network call helper ====================
 
     def _call_network(self, x, params_dict):
-        """Call the JAX network via network.apply(params, x, params_dict)."""
-        return self.model.apply(self.model.params, x, params_dict)
+        """Call the JAX network via network.apply(x, params, params_dict)."""
+        return self.model.apply(x, self.model.params, params_dict)
 
     # ==================== PDE Loss (Common Implementation) ====================
     
@@ -1000,7 +1011,7 @@ class Trainer:
             return False
 
     def _call_solution(self, x: np.ndarray) -> np.ndarray:
-        """Call the analytical solution registered via :meth:`add_solution`."""
+        """Call the analytical solution registered via :meth:`set_solution`."""
         if self.solution is None:
             return None
         return self.solution(x)
@@ -1111,7 +1122,7 @@ class Trainer:
         """Use soft (filtered) names for plot labels."""
         return self._get_soft_bc_names()
 
-    def add_solution(self, fn) -> 'Trainer':
+    def set_solution(self, fn) -> 'Trainer':
         """Register an analytical / reference solution for plotting and error tracking.
 
         The function ``fn`` must accept a single argument ``x`` of shape
@@ -1126,12 +1137,11 @@ class Trainer:
         self.solution = fn
         return self
 
-    def add_parameter_solution(self, name: str, value: float) -> 'Trainer':
-        """Register the true value of an inferred parameter for display on plots.
+    def set_solution_parameter_model(self, name: str, value: float) -> 'Trainer':
+        """Register the true value of an inferred **model** parameter for plot reference lines.
 
-        When a parameter is being inferred via ``fit_model_parameters``, this
-        method registers its ground-truth value so that a horizontal reference
-        line is drawn on the parameter-history plot during training.
+        Use this when the parameter is being inferred via ``fit_model_parameters``
+        (e.g. a ``ModelSpectralSolver`` coefficient).
 
         Args:
             name:  Parameter name (must be in ``fit_model_parameters``).
@@ -1140,12 +1150,28 @@ class Trainer:
         Returns:
             self (for method chaining).
         """
-        self._parameter_solutions[name] = float(value)
+        self._model_parameter_solutions[name] = float(value)
+        return self
+
+    def set_solution_parameter_problem(self, name: str, value: float) -> 'Trainer':
+        """Register the true value of an inferred **problem** parameter for plot reference lines.
+
+        Use this when the parameter is being inferred via ``fit_problem_parameters``
+        (e.g. a PDE coefficient like ``nu``).
+
+        Args:
+            name:  Parameter name (must be in ``fit_problem_parameters``).
+            value: True / target value of the parameter.
+
+        Returns:
+            self (for method chaining).
+        """
+        self._problem_parameter_solutions[name] = float(value)
         return self
 
     @property
     def _has_solution(self) -> bool:
-        """True if a solution has been registered via :meth:`add_solution`."""
+        """True if a solution has been registered via :meth:`set_solution`."""
         return self.solution is not None
 
     def compile(
@@ -1266,6 +1292,22 @@ class Trainer:
                     k: _jnp.array(v) for k, v in self.model._params.items()
                 }
 
+        # fit_problem_parameters: merge selected problem params into the optimizable pytree.
+        _fit_prob = getattr(self, '_fit_problem_parameters', None)
+        if _fit_prob and self.problem is not None:
+            import jax.numpy as _jnp
+            _prob_param_vals = {
+                k: _jnp.array(float(self.problem._params[k]), dtype=_jnp.float32)
+                for k in _fit_prob
+                if k in self.problem._params
+            }
+            if _prob_param_vals:
+                # Merge into model.params under special key
+                if self.model.params is None:
+                    self.model.params = {}
+                self.model.params = dict(self.model.params)
+                self.model.params['__problem_params__'] = _prob_param_vals
+
         if self.optimizer_name == "lbfgs":
             # L-BFGS state is managed by jaxopt solver
             self.opt_state = None
@@ -1342,7 +1384,7 @@ class Trainer:
         """Compute PDE residual using JAX autodiff - supports both 3-arg and 4-arg PDEs,
         and ProblemStrong (which uses _terms instead of pde_fn)."""
         from pinns.problems.problem_strong import ProblemStrong as _PSResidual
-        model_apply = lambda p, xin: self.model.apply(p, xin, params_dict)
+        model_apply = lambda p, xin: self.model.apply(xin, p, params_dict)
 
         if isinstance(self.problem, _PSResidual):
             # ProblemStrong: evaluate the first 'inner' term as the PDE residual
@@ -1369,7 +1411,7 @@ class Trainer:
         if getattr(bc, 'is_weak', False):
             out_names = bc.output_names or [bc.name]
             return {oname: 0.0 for oname in out_names}
-        model_apply = lambda p, xin: self.model.apply(p, xin, params_dict)
+        model_apply = lambda p, xin: self.model.apply(xin, p, params_dict)
         deriv_fn = make_derivative_fn(model_apply, self.model.params)
         import inspect as _inspect
         sig = _inspect.signature(bc.fn)
@@ -1393,7 +1435,7 @@ class Trainer:
         """Evaluate a TermMeshCustomBC residual with full JAX autodiff."""
         if getattr(bc, 'is_weak', False):
             return 0.0
-        model_apply = lambda p, xin: self.model.apply(p, xin, params_dict)
+        model_apply = lambda p, xin: self.model.apply(xin, p, params_dict)
         deriv_fn = make_derivative_fn(model_apply, self.model.params)
         import inspect as _inspect
         sig = _inspect.signature(bc.fn)
@@ -1424,8 +1466,8 @@ class Trainer:
             return {}
         x = jnp.array(x_np)
         params_dict = self._build_params()
-        model_apply = lambda p, xin: self.model.apply(p, xin, params_dict)
-        y = self.model.apply(self.model.params, x, params_dict)
+        model_apply = lambda p, xin: self.model.apply(xin, p, params_dict)
+        y = self.model.apply(x, self.model.params, params_dict)
         deriv_fn = make_derivative_fn(model_apply, self.model.params)
         try:
             sig = _inspect.signature(obs_fn)
@@ -1450,7 +1492,7 @@ class Trainer:
     def _compute_directional_derivative(self, x, component: int, dim: int, params_dict):
         """Compute derivative of y[component] w.r.t. x[dim] using JAX JVP."""
         params = self.model.params
-        model_apply = lambda p, xin: self.model.apply(p, xin, params_dict)
+        model_apply = lambda p, xin: self.model.apply(xin, p, params_dict)
         
         n_dims = x.shape[1]
         eye = jnp.eye(n_dims)
@@ -1477,7 +1519,7 @@ class Trainer:
         _pd = params_dict
 
         def _model_apply_metric(p, x):
-            return network.apply(p, x, _pd)
+            return network.apply(x, p, _pd)
 
         return make_derivative_fn(_model_apply_metric, params)
 
@@ -1505,7 +1547,10 @@ class Trainer:
         _relative_weights  = relative_weights
         _net_losses = list(getattr(self.model, 'network_losses', []))
         if self.problem is not None:
-            _residual_fn = self.problem.make_residual_fn(self.model)
+            _residual_fn = self.problem.make_residual_fn(
+                self.model,
+                fit_problem_parameters=getattr(self, '_fit_problem_parameters', None),
+            )
         else:
             # Dataset-only / ModelSpectralSolver mode — no PDE residuals.
             _residual_fn = lambda params, data: {}
@@ -1581,7 +1626,7 @@ class Trainer:
                 _x_d = train_data.get(_dt.name) if train_data else None
                 if _x_d is None:
                     continue
-                _y_d = _network_apply(params, _x_d, _params_dict_for_dataset)
+                _y_d = _network_apply(_x_d, params, _params_dict_for_dataset)
                 _w_d = _resolve_weight(_dt.name)
                 for k, comp in enumerate(_dt.components):
                     _tgt, _comp = _dataset_targets[(_dt.name, k)]
@@ -1711,13 +1756,16 @@ class Trainer:
 
     # ==================== Shared training helpers ====================
 
-    def _setup_training_plot(self, show_plots, save_plots):
+    def _setup_training_plot(self):
         """Build auto-save path, recreate figure if needed, show epoch-0 plot.
 
         Returns auto_save_path (str or None).
         """
+        _plotter_save_to = getattr(self._plotter, 'save_to', None) if self._plotter is not None else None
+        _has_plotter = self._plotter is not None
+
         auto_save_path = None
-        if show_plots and not save_plots and not is_notebook():
+        if _has_plotter and not _plotter_save_to and not is_notebook():
             import glob as _gl
             import os as _os
             existing = _gl.glob('./pinn_progress_*.png')
@@ -1735,7 +1783,7 @@ class Trainer:
                 next_num = 0
             auto_save_path = f'./pinn_progress_{next_num}.png'
 
-        if show_plots and self._plotter is not None:
+        if (_has_plotter or _plotter_save_to) and self._plotter is not None:
             p = self._plotter
             n_zoom_regions = len(p.regions)
             needs_recreation = p._fig is None
@@ -1753,7 +1801,7 @@ class Trainer:
 
     def _log_epoch(self, epoch_key, epoch_display, ep_total, reported_loss,
                    elapsed, weights, params_dict,
-                   show_plots, save_plots, auto_save_path,
+                   auto_save_path,
                    metrics_batch_size=1000, stage_prefix='',
                    callback=None, do_plot=True):
         """Record history for one epoch and print/optionally plot progress.
@@ -1827,6 +1875,19 @@ class Trainer:
                     _pval = float(self.model.params[_pname])
                     self.history['params'].setdefault(_pname, []).append(_pval)
 
+        # Track inferred problem parameters (fit_problem_parameters)
+        _fit_prob = getattr(self, '_fit_problem_parameters', None)
+        if _fit_prob and hasattr(self.model, 'params') and self.model.params is not None:
+            _pp = self.model.params.get('__problem_params__', {})
+            for _pname in _fit_prob:
+                if _pname in _pp:
+                    _pval = float(_pp[_pname])
+                    self.history['params'].setdefault(_pname, []).append(_pval)
+                    # Sync back to problem so _build_params() uses current value
+                    if self.problem is not None and _pname in self.problem._params:
+                        import jax.numpy as _jnp
+                        self.problem._params[_pname] = _jnp.array(_pval)
+
         msg = (stage_prefix +
                f"Epoch {epoch_display}/{ep_total} | "
                f"Loss: {_loss_to_record:.2e} | "
@@ -1852,9 +1913,14 @@ class Trainer:
         if callback is not None:
             callback(epoch_display, self)
 
-        if do_plot and (show_plots or save_plots):
-            if save_plots:
-                plot_path = f"{save_plots}_epoch{epoch_key:05d}.png"
+        _plotter_save_to = getattr(self._plotter, 'save_to', None) if self._plotter is not None else None
+        if do_plot and (self._plotter is not None or _plotter_save_to):
+            if _plotter_save_to:
+                # '{}' in the path → insert epoch number; otherwise overwrite same file
+                if '{}' in _plotter_save_to:
+                    plot_path = _plotter_save_to.format(epoch_key)
+                else:
+                    plot_path = _plotter_save_to
             elif auto_save_path:
                 plot_path = auto_save_path
             else:
@@ -2177,15 +2243,13 @@ class Trainer:
 
         epochs = self._epochs
         print_each = self._print_each
-        show_plots = self._plotter is not None
-        save_plots = self._plotter.save if self._plotter else None
         
         params_dict = self._build_params()
         weights = self.weights
 
         # Optimizer-specific loop (e.g. L-BFGS) — returns True if handled
         if self._optimizer_obj.train_loop(
-                self, epochs, print_each, show_plots, save_plots, params_dict, weights):
+                self, epochs, print_each, params_dict, weights):
             return
         
         result, is_full_jit, _ = self._make_jit_train_step(weights, params_dict)
@@ -2214,7 +2278,7 @@ class Trainer:
         start_time = time.time()
         start_epoch = self._global_epoch
         
-        auto_save_path = self._setup_training_plot(show_plots, save_plots)
+        auto_save_path = self._setup_training_plot()
         
         # Initialize RNG key for shuffling
         shuffle_key = jax.random.PRNGKey(self.rng.integers(0, 2**31))
@@ -2230,7 +2294,7 @@ class Trainer:
             _ep_total   = _tot_epochs if _tot_epochs is not None else epochs
             self._log_epoch(
                 start_epoch, start_epoch, _ep_total, None, 0.0,
-                weights, params_dict, show_plots, save_plots, auto_save_path,
+                weights, params_dict, auto_save_path,
                 metrics_batch_size=metrics_batch_size, stage_prefix=_stage_pfx,
                 do_plot=False,
             )
@@ -2379,10 +2443,10 @@ class Trainer:
                 _ep_total   = _tot_epochs if _tot_epochs is not None else epochs + start_epoch
                 self._log_epoch(
                     global_epoch, global_epoch + 1, _ep_total, float(loss), elapsed,
-                    weights, params_dict, show_plots, save_plots, auto_save_path,
+                    weights, params_dict, auto_save_path,
                     metrics_batch_size=metrics_batch_size, stage_prefix=_stage_pfx,
-callback=self._plotter.callback if self._plotter else None,
-            )
+                    callback=self._plotter.callback if self._plotter else None,
+                )
         
         self._global_epoch += epochs
         _total_elapsed = time.time() - start_time
@@ -2403,7 +2467,7 @@ callback=self._plotter.callback if self._plotter else None,
         self._curriculum_restore()
         
         # Close figure to prevent duplicate display in notebooks
-        if is_notebook() and show_plots and self._plotter is not None and self._plotter._fig is not None:
+        if is_notebook() and self._plotter is not None and self._plotter._fig is not None:
             plt.close(self._plotter._fig)
 
     def _curriculum_restore(self):

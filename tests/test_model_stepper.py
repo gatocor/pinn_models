@@ -107,7 +107,7 @@ class TestBaseModelSetContext:
         m.set_context(1, [(0.0, 1.0)])
         # x: (batch, 1 spatial + 1 time + 1 context) = (batch, 3)
         x = jnp.ones((BATCH, 3))
-        y = m.apply(params, x)
+        y = m.apply(x, params)
         assert y.shape == (BATCH, 1)
 
     def test_set_context_bad_range_length(self, domain_1d):
@@ -236,7 +236,7 @@ class TestStepperModelApply:
         # x: spatial (1) + time (1) = 2
         x = jnp.ones((BATCH, 2))
         prev = jnp.zeros((BATCH, 2))
-        y = s.apply(params, x, prev)
+        y = s.apply(x, prev, params)
         assert y.shape == (BATCH, 2)
 
     def test_apply_different_prev(self, model_and_stepper):
@@ -247,8 +247,8 @@ class TestStepperModelApply:
         x = jnp.ones((BATCH, 2))
         prev1 = jnp.zeros((BATCH, 2))
         prev2 = jnp.ones((BATCH, 2))
-        y1 = s.apply(params, x, prev1)
-        y2 = s.apply(params, x, prev2)
+        y1 = s.apply(x, prev1, params)
+        y2 = s.apply(x, prev2, params)
         # With normalisation the outputs should differ.
         assert not jnp.allclose(y1, y2)
 
@@ -285,7 +285,7 @@ class TestStepperModelRollout:
         traj = stepper.rollout(params, x_s, t, u0)
         # Step 0 output comes from apply(x_spatial | t[0], u0)
         x0 = jnp.concatenate([x_s, jnp.full((BATCH, 1), 0.0)], axis=-1)
-        y0_ref = stepper.apply(params, x0, u0)
+        y0_ref = stepper.apply(x0, u0, params)
         np.testing.assert_allclose(np.array(traj[0]), np.array(y0_ref), atol=1e-5)
 
     def test_rollout_t_values_none_raises(self, stepper):

@@ -23,9 +23,50 @@ from typing import Any, Dict, Optional
 import jax
 import jax.numpy as jnp
 
-from .integrator_base import Integrator
+from .integrator_base import (
+    Integrator, _apply_L, _broadcast_eig, _build_kronecker_matrix,
+    _kron_func_apply,
+)
 
 __all__ = ["IntegratorIMEX"]
+
+
+def _scale_L(dt_val, L_name):
+    """Scale a linear-op by ``dt_val``, handling the Kronecker-list case."""
+    if isinstance(L_name, list):
+        return [dt_val * Li for Li in L_name]
+    return dt_val * L_name
+
+
+def _imex_apply_inv(dtL, rhs):
+    """Apply ``(I - dtL)^{-1}`` to ``rhs``.
+
+    Three dispatch paths:
+
+    * **List** ``[dt·L₀, dt·L₁, …]`` — Kronecker-sum (2-D+ Chebyshev):
+      Inverts ``I − dt·(L₀ ⊗ I + I ⊗ L₁ + …)`` via joint eigendecomposition.
+    * **Diagonal** (``dtL.ndim == 1``): element-wise ``rhs / (1 - dtL)``.
+    * **Dense matrix** (``dtL.ndim == 2``): direct solve ``(I − dtL) x = rhs``.
+
+    Args:
+        dtL: Scaled operator — list, 1-D or 2-D JAX array.
+        rhs: Right-hand side array of matching shape.
+
+    Returns:
+        Solution array of the same shape as ``rhs``.
+    """
+    if isinstance(dtL, list):
+        # Kronecker-sum: build full (N_total×N_total) matrix and solve directly.
+        # jnp.linalg.solve is fully differentiable — no eigenvector issues.
+        C      = _build_kronecker_matrix(dtL)
+        N      = C.shape[0]
+        I      = jnp.eye(N, dtype=C.dtype)
+        u_flat = jnp.linalg.solve(I - C, rhs.ravel())
+        return u_flat.reshape(rhs.shape)
+    if dtL.ndim == 1:
+        return rhs / (1.0 - dtL)
+    I = jnp.eye(dtL.shape[0], dtype=dtL.dtype)
+    return jnp.linalg.solve(I - dtL, rhs)
 
 
 class IntegratorIMEX(Integrator):
@@ -60,15 +101,14 @@ class IntegratorIMEX(Integrator):
         self,
         problem,
         inferred_params: Optional[Dict[str, Any]] = None,
-        t_obs=None,
     ) -> Dict[str, Any]:
         """Forward-simulate using IMEX Euler and return states at observation times.
+
+        Observation times are derived from the domain bounds and ``self.dt``.
 
         Args:
             problem:         A fully-configured :class:`~pinns.models.ModelSpectralSolver`.
             inferred_params: Dict of JAX-differentiable parameter values.
-            t_obs:           1-D array of snapshot times.  If ``None``, uses
-                             times from ``problem.add_observations()``.
 
         Returns:
             Dict ``{state_name: array(n_obs, *shape)}`` in physical space.
@@ -81,7 +121,7 @@ class IntegratorIMEX(Integrator):
 
         # ── Python-level observation schedule (not traced by JAX) ────
         t0 = problem._t_min
-        resolved_t_obs = self._resolve_obs_times(problem, t_obs)
+        resolved_t_obs = self._get_obs_times(problem)
         obs_steps = [int(round((t - t0) / dt)) for t in resolved_t_obs]
         n_obs = len(obs_steps)
         segment_lengths = [obs_steps[0]] + [
@@ -93,20 +133,19 @@ class IntegratorIMEX(Integrator):
         # ── JIT-compiled core: takes inferred params as explicit arg ──
         def _core(inferred):
             params = problem._build_params(inferred)
-            K2 = problem.K2
-            L = problem._linear_op(K2, params)
-            denom = {name: 1.0 - dt * L[name] for name in state_names}
+            L = problem._call_linear_op(params)
+            dtL = {name: _scale_L(dt, L[name]) for name in state_names}
 
             def _step(sh, _):
-                Nhat = problem._nonlinear_op(sh, params)
+                Nhat = problem._call_nonlinear_op(sh, params)
                 new_sh = {
-                    name: (sh[name] + dt * Nhat[name]) / denom[name]
+                    name: _imex_apply_inv(dtL[name], sh[name] + dt * Nhat[name])
                     for name in state_names
                 }
                 return new_sh, None
 
             step_fn = jax.remat(_step) if checkpoint else _step
-            state_hat_0 = problem.get_initial_hat()
+            state_hat_0 = problem.get_initial_state()
 
             if uniform and n_obs > 1:
                 def _segment(sh, _):
@@ -127,10 +166,7 @@ class IntegratorIMEX(Integrator):
                     for name in state_names
                 }
 
-            return {
-                name: jax.vmap(problem.inverse)(seg_states[name])
-                for name in state_names
-            }
+            return problem._to_physical_batch(seg_states)
 
         cache_key = (id(problem), tuple(obs_steps), self.checkpoint)
         if cache_key not in self._jit_cache:
@@ -169,23 +205,23 @@ class IntegratorIMEX(Integrator):
         state_names = problem.state_names
 
         # ── full step ────────────────────────────────────────────────────
-        Nhat   = problem._nonlinear_op(state_hat, params)
-        denom  = {name: jnp.float32(1.0) - dt * L[name] for name in state_names}
+        Nhat   = problem._call_nonlinear_op(state_hat, params)
+        dtL    = {name: _scale_L(dt, L[name]) for name in state_names}
         sh_full = {
-            name: (state_hat[name] + dt * Nhat[name]) / denom[name]
+            name: _imex_apply_inv(dtL[name], state_hat[name] + dt * Nhat[name])
             for name in state_names
         }
 
         # ── two half-steps (Richardson) ──────────────────────────────────
         dt2     = dt / jnp.float32(2.0)
-        denom2  = {name: jnp.float32(1.0) - dt2 * L[name] for name in state_names}
+        dtL2    = {name: _scale_L(dt2, L[name]) for name in state_names}
         sh_mid  = {
-            name: (state_hat[name] + dt2 * Nhat[name]) / denom2[name]
+            name: _imex_apply_inv(dtL2[name], state_hat[name] + dt2 * Nhat[name])
             for name in state_names
         }
-        Nhat2   = problem._nonlinear_op(sh_mid, params)
+        Nhat2   = problem._call_nonlinear_op(sh_mid, params)
         sh_fine = {
-            name: (sh_mid[name] + dt2 * Nhat2[name]) / denom2[name]
+            name: _imex_apply_inv(dtL2[name], sh_mid[name] + dt2 * Nhat2[name])
             for name in state_names
         }
 

@@ -67,8 +67,6 @@ class BaseOptimizer(ABC):
         trainer,
         epochs: int,
         print_each: int,
-        show_plots: bool,
-        save_plots,
         params_dict,
         weights,
     ) -> bool:

@@ -188,8 +188,8 @@ class Lifting:
 
     def apply(
         self,
-        params: dict,
         x: jnp.ndarray,
+        params: dict = None,
         params_dict: Optional[dict] = None,
     ) -> jnp.ndarray:
         """Apply the lifting transform.

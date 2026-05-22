@@ -115,9 +115,9 @@ class RandomFourierFeatures:
             return {"B": self.B}
         return {}
 
-    def apply(self, params: dict, x, params_dict=None):
+    def apply(self, x, params: dict = None, params_dict=None):
         """ModelBase-protocol forward pass."""
-        B = params["B"] if self.adaptive else None
+        B = params["B"] if (self.adaptive and params) else None
         return self._forward(x, params_dict, B=B)
 
     # ── Forward pass ───────────────────────────────────────────────────────── #

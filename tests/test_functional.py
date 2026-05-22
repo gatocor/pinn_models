@@ -28,7 +28,7 @@ def _model(fn):
         def apply(self, params, x):
             return fn(x).reshape(-1, 1)
     m = _M()
-    return lambda params, x: m.apply(params, x), {}
+    return lambda params, x: m.apply(x, params), {}
 
 
 def _pts(*cols):

@@ -83,7 +83,7 @@ class Normalize:
     def init(self, rng) -> Dict:
         return {}
 
-    def apply(self, params: Dict, x: jnp.ndarray, params_dict=None) -> jnp.ndarray:
+    def apply(self, x: jnp.ndarray, params: Dict = None, params_dict=None) -> jnp.ndarray:
         coords   = x[:, : self._n_coord]
         coords_n = (
             2.0 * (coords - self._coords_min)
@@ -136,7 +136,7 @@ class Denormalize:
     def init(self, rng) -> Dict:
         return {}
 
-    def apply(self, params: Dict, x: jnp.ndarray, params_dict=None) -> jnp.ndarray:
+    def apply(self, x: jnp.ndarray, params: Dict = None, params_dict=None) -> jnp.ndarray:
         if self._out_min is None:
             return x
         return (x + 1.0) / 2.0 * (self._out_max - self._out_min) + self._out_min

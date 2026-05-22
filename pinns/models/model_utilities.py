@@ -116,7 +116,7 @@ def create_model(
 
         m = create_model(domain, output_dim=1)
         params = m.init(jax.random.PRNGKey(0))
-        y = m.apply(params, x)
+        y = m.apply(x, params)
 
     FB-PINN with spatial domain decomposition::
 

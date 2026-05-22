@@ -284,7 +284,7 @@ class ProblemStrong(BaseProblem):
         """
         return r
 
-    def make_residual_fn(self, network):
+    def make_residual_fn(self, network, fit_problem_parameters=None):
         """Return ``fn(params, data) -> dict[str, jnp.ndarray]``.
 
         Each key is a term name; each value is the per-point (or per-sample)
@@ -294,7 +294,11 @@ class ProblemStrong(BaseProblem):
         Parameters
         ----------
         network :
-            The JAX network.  Must support ``network.apply(params, x, params_dict)``.
+            The JAX network.  Must support ``network.apply(x, params, params_dict)``.
+        fit_problem_parameters : list[str], optional
+            Names of problem parameters to treat as trainable (pulled from
+            ``params["__problem_params__"]`` during JAX tracing so that
+            gradients flow to the optimizer).
 
         Returns
         -------
@@ -307,11 +311,12 @@ class ProblemStrong(BaseProblem):
         from pinns.functional import make_derivative_fn
 
         _terms = list(self._terms)
-        _params_dict = self._build_params()
+        _fit_prob_params = fit_problem_parameters
+        _static_pd = self._build_params()
         _problem = self
 
-        def _model_apply(params, x):
-            return network.apply(params, x, _params_dict)
+        def _model_apply(params, x, pd=None):
+            return network.apply(x, params, pd if pd is not None else _static_pd)
 
         def _call_fn(fn, x, u, deriv_fn, _p):
             """Dispatch fn(x,u[,params_dict[,deriv_fn]]) → tuple of residuals.
@@ -374,6 +379,16 @@ class ProblemStrong(BaseProblem):
             return {f"{name}_{i}": r[:, i:i+1] for i in range(K)}
 
         def residual_fn(params, data):
+            # Dynamic problem parameter override (fit_problem_parameters)
+            if _fit_prob_params:
+                _prob_vals = params.get('__problem_params__', {})
+                _base_pd = {
+                    **_static_pd,
+                    'parameter': {**_static_pd['parameter'], **_prob_vals},
+                }
+            else:
+                _base_pd = _static_pd
+
             # Merge any dynamic fixed-param overrides passed through train_data.
             # Keys prefixed '__fixed__' carry per-sample arrays that must be
             # explicit JIT arguments so JAX sees updated values after every
@@ -382,17 +397,18 @@ class ProblemStrong(BaseProblem):
                           for k in data if k.startswith('__fixed__')
                           and not k.startswith('__fixed_domain__')}
             if _dyn_fixed:
-                _p = {**_params_dict, 'parameter': {**_params_dict['parameter'], **_dyn_fixed}}
+                _p = {**_base_pd, 'parameter': {**_base_pd['parameter'], **_dyn_fixed}}
             else:
-                _p = _params_dict
+                _p = _base_pd
 
+            _maf = lambda p, x: _model_apply(p, x, _p)
             result = {}
-            deriv_fn = make_derivative_fn(_model_apply, params)
+            deriv_fn = make_derivative_fn(_maf, params)
             for term in _terms:
                 if term.name not in data:
                     continue
                 x = data[term.name]
-                u = _model_apply(params, x)
+                u = _maf(params, x)
                 kind = term.kind
 
                 # Per-term domain data (e.g. surface normals for 3-D mesh domains).
@@ -453,7 +469,7 @@ class ProblemStrong(BaseProblem):
                     _half  = _pts_p.shape[0] // 2
                     x_a, x_b = _pts_p[:_half], _pts_p[_half:]
                     # One forward pass for both halves — halves model evals per term.
-                    _u_ab = _model_apply(params, _pts_p)
+                    _u_ab = _maf(params, _pts_p)
                     u_a, u_b = _u_ab[:_half], _u_ab[_half:]
                     _comps_p = ([term.component] if term.component is not None
                                 else list(range(u_a.shape[1])))
@@ -471,7 +487,7 @@ class ProblemStrong(BaseProblem):
 
                         def _nth_deriv(c, order, xi, tangent=_tangent):
                             """Compute the *order*-th JVP of model[:,c] at xi."""
-                            f = lambda xin: _model_apply(params, xin)[:, c]
+                            f = lambda xin: _maf(params, xin)[:, c]
                             for _ in range(order):
                                 f = lambda xin, _f=f: jax.jvp(_f, (xin,), (tangent,))[1]
                             return f(xi)

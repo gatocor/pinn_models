@@ -18,7 +18,7 @@ Usage::
     net.add(Denormalize())
 
     params = net.init(jax.random.PRNGKey(0))
-    y = net.apply(params, x)
+    y = net.apply(x, params)
 
 Layer protocol
 --------------
@@ -31,7 +31,7 @@ Any object with the following three methods can be added to a ModelBase:
 ``init(rng) -> dict``
     Return a JAX pytree of trainable parameters (return ``{}`` if none).
 
-``apply(params, x, params_dict=None) -> jnp.ndarray``
+``apply(x, params=None, params_dict=None) -> jnp.ndarray``
     Forward pass.
 """
 
@@ -158,7 +158,7 @@ class ModelBase:
         net.add(Denormalize())
 
         params = net.init(jax.random.PRNGKey(0))
-        y      = net.apply(params, x_with_context)
+        y      = net.apply(x_with_context, params)
     """
 
     def __init__(
@@ -317,13 +317,13 @@ class ModelBase:
         params_dict.setdefault('_x_orig', x)  # original coords before Normalize etc.
         for name, layer in zip(self._layer_names, self._layers):
             sub_params = params.get(name, {})
-            x = layer.apply(sub_params, x, params_dict)
+            x = layer.apply(x, sub_params, params_dict)
         return x
 
     def apply(
         self,
-        params: Dict,
         x: jnp.ndarray,
+        params: Dict = None,
         params_dict: Optional[Dict] = None,
     ) -> jnp.ndarray:
         """Forward pass through all layers."""
